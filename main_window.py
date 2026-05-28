@@ -2530,21 +2530,53 @@ class HotelApp(ctk.CTk):
                 else:
                     _cur = _os_mu.path.abspath(__file__)
                 cur_size = _os_mu.path.getsize(_cur) if _os_mu.path.exists(_cur) else 0
-                if remote_size > 0 and remote_size != cur_size:
-                    def _show_banner():
+
+                # Порівнюємо: спочатку по версії (якщо є), потім по розміру
+                has_update = False
+                update_info = ""
+                try:
+                    import re as _rver
+                    # Шукаємо версію в завантаженому файлі
+                    remote_ver = None
+                    if sm_size and raw:
+                        vm = _rver.search(rb'APP_VERSION[^=]*=[^"]*"([^"]+)"', raw)
+                        if vm: remote_ver = vm.group(1).decode('utf-8', errors='ignore')
+                    # Шукаємо версію в поточному файлі
+                    cur_ver = None
+                    try:
+                        if _os_mu.path.exists(_cur):
+                            with open(_cur, 'rb') as _cf:
+                                _ch = _cf.read(4000)
+                            cvm = _rver.search(rb'APP_VERSION[^=]*=[^"]*"([^"]+)"', _ch)
+                            if cvm: cur_ver = cvm.group(1).decode('utf-8', errors='ignore')
+                    except Exception: pass
+
+                    if remote_ver and cur_ver and remote_ver != cur_ver:
+                        has_update = True
+                        update_info = f"v{cur_ver} → v{remote_ver}"
+                    elif remote_size > 0 and remote_size != cur_size:
+                        has_update = True
+                        update_info = f"{cur_size//1024} КБ → {remote_size//1024} КБ"
+                except Exception:
+                    if remote_size > 0 and remote_size != cur_size:
+                        has_update = True
+                        update_info = f"{cur_size//1024} КБ → {remote_size//1024} КБ"
+
+                if has_update:
+                    def _show_banner(info=update_info):
                         try:
                             if hasattr(self, "_upd_banner"):
                                 try: self._upd_banner.destroy()
                                 except Exception: pass
                             self._upd_banner = ctk.CTkFrame(self, fg_color="#1a3a1a", height=38)
-                            self._upd_banner.place(relx=0.5, y=2, anchor="n", relwidth=0.65)
+                            self._upd_banner.place(relx=0.5, y=2, anchor="n", relwidth=0.7)
                             tk.Label(self._upd_banner,
-                                text="  🆕 Доступне оновлення програми (" + str(remote_size//1024) + " KB)  ",
+                                text=f"  🆕 Доступне оновлення ({info})  ",
                                 font=("Segoe UI", 11), fg="#aaffaa", bg="#1a3a1a").pack(side="left", padx=10, pady=7)
-                            ctk.CTkButton(self._upd_banner, text="⬇️ Дивитись",
+                            ctk.CTkButton(self._upd_banner, text="⬇️ Оновити",
                                 command=lambda: self._show_frame("settings"),
                                 fg_color="#27ae60", hover_color="#1e8449",
-                                font=("Segoe UI", 11), height=26, width=160).pack(side="left", padx=4)
+                                font=("Segoe UI", 11), height=26, width=140).pack(side="left", padx=4)
                             ctk.CTkButton(self._upd_banner, text="✕",
                                 command=lambda: self._upd_banner.place_forget(),
                                 fg_color="transparent", hover_color="#333",
@@ -19390,7 +19422,8 @@ class SettingsFrame(tk.Frame):
 
         _sc = ctk.CTkScrollableFrame(p, fg_color=C['bg']); _sc.pack(fill='both', expand=True)
         f = tk.Frame(_sc, bg=C['bg']); f.pack(fill='both', expand=True, padx=15, pady=10)
-        lbl(f, "🔄  Оновлення програми", 15, True).pack(anchor='w', pady=(0,8))
+        lbl(f, "🔄  Оновлення програми", 15, True).pack(anchor='w', pady=(0,4))
+        lbl(f, f"Поточна версія: v{APP_VERSION}", 11, color=C['text2']).pack(anchor='w', pady=(0,6))
 
         # ── Посилання на оновлення — читаємо/зберігаємо в конфіг ──
         _UPD_CFG_KEY = 'update_url'
@@ -19408,9 +19441,15 @@ class SettingsFrame(tk.Frame):
             except Exception: pass
 
         def _to_direct_url(url):
-            """Конвертує посилання Google Drive/Dropbox/OneDrive у пряме для завантаження."""
+            """Конвертує посилання у пряме для завантаження."""
             import re as _reu
             url = url.strip()
+            # GitHub blob → raw (найнадійніший)
+            if 'github.com' in url and '/blob/' in url:
+                return url.replace('github.com', 'raw.githubusercontent.com').replace('/blob/', '/')
+            # Pastebin: /p/id → /raw/id
+            if 'pastebin.com' in url and '/raw/' not in url:
+                return url.replace('pastebin.com/', 'pastebin.com/raw/')
             # Google Drive: /file/d/{ID}/view → /uc?export=download&id={ID}
             m = _reu.search(r'drive\.google\.com/file/d/([a-zA-Z0-9_-]+)', url)
             if m:
@@ -19465,8 +19504,10 @@ class SettingsFrame(tk.Frame):
             _ms_lbl.configure(text="Збережено", text_color=C['green'])
         btn(url_row, "Зберегти", _save_url_click, C['accent'], 90, height=32).pack(side='left')
 
-        lbl(mc, "  Підтримується: MEGA, Google Drive (пряме), Dropbox, власний сервер, будь-який URL що повертає .py файл",
-            10, color=C['text2']).pack(anchor='w', padx=12, pady=(0,4))
+        lbl(mc, "  ✅ Працює: GitHub Raw, власний сервер, Pastebin (raw), Dropbox (dl=1)",
+            10, color=C['green']).pack(anchor='w', padx=12, pady=(0,2))
+        lbl(mc, "  ⚠️ Google Drive блокує .py файли — використайте GitHub або власний сервер",
+            10, color=C['yellow']).pack(anchor='w', padx=12, pady=(0,4))
 
         mb = tk.Frame(mc, bg=C['card']); mb.pack(fill='x', padx=12, pady=(0,4))
         _mi_lbl = lbl(mb, "Натисніть «Перевірити» щоб порівняти версії", 11, color=C['text2'])
@@ -19576,7 +19617,7 @@ class SettingsFrame(tk.Frame):
                                 text="Сервер: " + rn + " (" + str(rs//1024) + " КБ)  |  Поточний: " + str(cs//1024) + " КБ  |  " + sign + str(diff//1024) + " КБ\nЗавантажте файл через «Відкрити в браузері», потім «Вибрати файл»",
                                 text_color=C['green'])
                         elif rs == cs and rs > 0:
-                            _ms_lbl.configure(text="Версія актуальна", text_color=C['green'])
+                            _ms_lbl.configure(text="Версія актуальна v" + APP_VERSION, text_color=C['green'])
                             _mi_lbl.configure(text="Файл на сервері (" + str(rs//1024) + " КБ) збігається з поточним.", text_color=C['text2'])
                         else:
                             _ms_lbl.configure(text="Не вдалось перевірити", text_color=C['yellow'])
@@ -19584,9 +19625,23 @@ class SettingsFrame(tk.Frame):
                     try: f.after(0, _ui)
                     except Exception: pass
                 except Exception as _eu:
-                    def _err():
-                        _ms_lbl.configure(text="Помилка", text_color=C['red'])
-                        _mi_lbl.configure(text="Помилка: " + str(_eu), text_color=C['red'])
+                    _eu_str = str(_eu)
+                    def _err(e=_eu_str):
+                        _ms_lbl.configure(text="Помилка з'єднання", text_color=C['red'])
+                        # Підказка залежно від типу помилки
+                        if '403' in e:
+                            _hint = ("❌ 403 Forbidden — файл заблоковано хостингом (Google Drive блокує .py)\n"
+                                     "\n📋 Альтернативи:\n"
+                                     "  1. GitHub: завантажте файл → Settings → Raw посилання\n"
+                                     "  2. Власний сервер: будь-який URL що віддає .py\n"
+                                     "  3. Pastebin: вставте код → отримайте raw.pastebin.com посилання")
+                        elif '404' in e:
+                            _hint = "❌ 404 — файл не знайдено. Перевірте посилання."
+                        elif 'timeout' in e.lower():
+                            _hint = "❌ Таймаут — немає з'єднання або сервер не відповідає."
+                        else:
+                            _hint = "❌ Помилка: " + e
+                        _mi_lbl.configure(text=_hint, text_color=C['red'])
                         _mb_check.configure(state='normal')
                     try: f.after(0, _err)
                     except Exception: pass
