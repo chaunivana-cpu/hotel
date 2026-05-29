@@ -14421,15 +14421,72 @@ class ReportsFrame(tk.Frame):
             rows = []; cols = []; headers = []; widths = []  # вже відрендерили вручну
             return
         elif rt=='Заїзди':
-            rows=report_arrivals(df) or []
-            cols=['room_number','guest_name','phone','check_out']
-            headers=['Номер','Гість','Телефон','Виїзд']
-            widths=[80,220,150,110]
+            try:
+                from app.utils.db import get_conn as _gc_arr
+                with _gc_arr() as _c_arr:
+                    with _c_arr.cursor() as _cur_arr:
+                        _cur_arr.execute("""
+                            SELECT r.number AS room_number,
+                                   COALESCE(g.name, b.guest_name, '—') AS guest_name,
+                                   COALESCE(g.phone, '—') AS phone,
+                                   b.check_in, b.check_out,
+                                   (b.check_out - b.check_in) AS nights,
+                                   COALESCE(b.total_amount, 0) AS total
+                            FROM bookings b
+                            JOIN rooms r ON b.room_id = r.id
+                            LEFT JOIN guests g ON b.guest_id = g.id
+                            WHERE b.check_in BETWEEN %s AND %s
+                              AND b.status IN ('checked_in','confirmed','completed','checked_out')
+                            ORDER BY b.check_in, r.number
+                        """, (df, dt))
+                        _rc2 = [d[0] for d in _cur_arr.description]
+                        rows = [dict(zip(_rc2, r)) for r in _cur_arr.fetchall()]
+            except Exception as _ea:
+                log_error("report_arrivals_custom", _ea)
+                rows = report_arrivals(df) or []
+            cols=['room_number','guest_name','phone','check_in','check_out','nights','total']
+            headers=['Номер','Гість','Телефон','Заїзд','Виїзд','Ночей','Сума']
+            widths=[80,200,130,100,100,65,100]
         elif rt=='Виїзди':
-            rows=report_departures(df) or []
-            cols=['room_number','guest_name','phone','debt']
-            headers=['Номер','Гість','Телефон','Борг']
-            widths=[80,220,150,110]
+            try:
+                from app.utils.db import get_conn as _gc_dep
+                with _gc_dep() as _c_dep:
+                    with _c_dep.cursor() as _cur_dep:
+                        _cur_dep.execute("""
+                            SELECT r.number AS room_number,
+                                   COALESCE(g.name, b.guest_name, '—') AS guest_name,
+                                   COALESCE(g.phone, '—') AS phone,
+                                   b.check_in, b.check_out,
+                                   (b.check_out - b.check_in) AS nights,
+                                   COALESCE(b.total_amount, 0) AS total,
+                                   COALESCE(
+                                       (SELECT SUM(p.amount) FROM payments p
+                                        WHERE p.booking_id = b.id AND p.amount > 0
+                                          AND COALESCE(p.note,'') NOT LIKE 'Залог%%'), 0
+                                   ) AS paid,
+                                   GREATEST(0, COALESCE(b.total_amount,0) -
+                                       COALESCE(
+                                           (SELECT SUM(p2.amount) FROM payments p2
+                                            WHERE p2.booking_id = b.id AND p2.amount > 0
+                                              AND COALESCE(p2.note,'') NOT LIKE 'Залог%%'), 0
+                                       )
+                                   ) AS debt,
+                                   b.status
+                            FROM bookings b
+                            JOIN rooms r ON b.room_id = r.id
+                            LEFT JOIN guests g ON b.guest_id = g.id
+                            WHERE b.check_out BETWEEN %s AND %s
+                              AND b.status IN ('checked_out','completed','checked_in')
+                            ORDER BY b.check_out, r.number
+                        """, (df, dt))
+                        _rc3 = [d[0] for d in _cur_dep.description]
+                        rows = [dict(zip(_rc3, r)) for r in _cur_dep.fetchall()]
+            except Exception as _ed:
+                log_error("report_departures_custom", _ed)
+                rows = report_departures(df) or []
+            cols=['room_number','guest_name','phone','check_in','check_out','nights','total','paid','debt']
+            headers=['Номер','Гість','Телефон','Заїзд','Виїзд','Ночей','Сума','Сплачено','Борг']
+            widths=[80,190,120,100,100,60,90,90,80]
         elif rt=='Прибирання':
             from app.modules.logic import report_cleaning
             import json as _jcl2
