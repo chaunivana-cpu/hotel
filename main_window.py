@@ -3034,6 +3034,7 @@ class HotelApp(ctk.CTk):
             ("🔥","Бані","sauna"),
             ("📊","Звіти","reports"),
             ("👥","Відвідувачі","visitors"),
+            ("📋","База гостей","guestdb"),
             ("⚙️","Налаштування","settings"),
         ]:
             b = ctk.CTkButton(sb_nav, text=f"  {icon}  {name}", anchor='w',
@@ -3095,6 +3096,7 @@ class HotelApp(ctk.CTk):
             'sauna': SaunaFrame,
             'reports': ReportsFrame,
             'visitors': VisitorsFrame,
+            'guestdb': GuestDatabaseFrame,
             'settings': SettingsFrame,
         }
 
@@ -5678,6 +5680,113 @@ class RoomsFrame(tk.Frame):
         btn(bf,"✖ Скасувати",win.destroy,C['red'],140,height=42).pack(side='left',padx=5)
 
 
+def _attach_guest_autocomplete(e_name, e_phone=None, e_series=None, e_pnum=None, parent_win=None):
+    _popup = [None]
+
+    def _close_popup():
+        if _popup[0]:
+            try: _popup[0].destroy()
+            except Exception: pass
+            _popup[0] = None
+
+    def _on_select(guest):
+        _close_popup()
+        e_name.delete(0, 'end'); e_name.insert(0, guest['name'])
+        if e_phone and guest.get('phone') and guest['phone'] != '—':
+            e_phone.delete(0, 'end'); e_phone.insert(0, guest['phone'])
+        passport = guest.get('passport', '')
+        if passport and passport != '—':
+            parts = str(passport).strip().split()
+            if e_series and e_pnum:
+                if len(parts) >= 2:
+                    e_series.delete(0,'end'); e_series.insert(0, parts[0])
+                    e_pnum.delete(0,'end');   e_pnum.insert(0, ' '.join(parts[1:]))
+                else:
+                    import re as _re
+                    m = _re.match(r'^([A-Za-zА-ЯҐЄІЇа-яґєії]{2})(.+)$', parts[0])
+                    if m and e_series:
+                        e_series.delete(0,'end'); e_series.insert(0, m.group(1).upper())
+                        e_pnum.delete(0,'end');   e_pnum.insert(0, m.group(2).strip())
+                    elif e_pnum:
+                        e_pnum.delete(0,'end'); e_pnum.insert(0, parts[0])
+        e_name.focus_set()
+
+    def _show_popup(guests):
+        _close_popup()
+        if not guests: return
+        try:
+            x = e_name.winfo_rootx()
+            y = e_name.winfo_rooty() + e_name.winfo_height() + 2
+            w = max(e_name.winfo_width(), 340)
+        except Exception: return
+        pop = tk.Toplevel(e_name)
+        pop.overrideredirect(True)
+        pop.geometry(f"{w}x{min(len(guests)*36+4, 300)}+{x}+{y}")
+        pop.configure(bg=C['card'])
+        pop.lift()
+        _popup[0] = pop
+        cv = tk.Canvas(pop, bg=C['card'], highlightthickness=0)
+        sb = tk.Scrollbar(pop, orient='vertical', command=cv.yview)
+        inner = tk.Frame(cv, bg=C['card'])
+        cv.configure(yscrollcommand=sb.set)
+        sb.pack(side='right', fill='y'); cv.pack(side='left', fill='both', expand=True)
+        cv.create_window((0,0), window=inner, anchor='nw')
+        inner.bind('<Configure>', lambda e: cv.configure(scrollregion=cv.bbox('all')))
+        for g in guests:
+            rf = tk.Frame(inner, bg=C['card2'], cursor='hand2')
+            rf.pack(fill='x', padx=2, pady=1)
+            tk.Label(rf, text=g['name'], font=('Segoe UI',11,'bold'),
+                     fg=C['text'], bg=C['card2'], anchor='w').pack(side='left', padx=8, pady=5)
+            info = "📞" + g.get('phone','—')
+            if g.get('passport','—') != '—': info += "  🪪" + g['passport']
+            v = int(g.get('visits',0) or 0)
+            if v > 1: info += f"  ⭐{v}в"
+            tk.Label(rf, text=info, font=('Segoe UI',10), fg=C['text2'],
+                     bg=C['card2'], anchor='e').pack(side='right', padx=8)
+            def _cb(guest=g):
+                return lambda e: _on_select(guest)
+            for w2 in [rf]+list(rf.winfo_children()):
+                try:
+                    w2.bind('<Button-1>', _cb(g))
+                    w2.bind('<Enter>', lambda e, f=rf: f.configure(bg=C['accent']))
+                    w2.bind('<Leave>', lambda e, f=rf: f.configure(bg=C['card2']))
+                except Exception: pass
+
+    def _on_key(event):
+        if event.keysym in ('Up','Down','Return','Tab','Escape'):
+            if event.keysym == 'Escape': _close_popup()
+            return
+        q = e_name.get().strip().lower()
+        if len(q) < 2: _close_popup(); return
+        import threading
+        def _search():
+            try:
+                from app.utils.db import query as _q
+                rows = _q("""
+                    SELECT g.id AS guest_id, g.name,
+                        COALESCE(NULLIF(trim(g.phone),''),'—') AS phone,
+                        COALESCE(
+                            (SELECT trim(regexp_replace(substring(b2.notes FROM E'Паспорт: ([^\\n]+)'),E'\\s+',' ','g'))
+                             FROM bookings b2 WHERE b2.guest_id=g.id AND b2.notes LIKE '%%Паспорт%%'
+                             ORDER BY b2.check_in DESC LIMIT 1), '—') AS passport,
+                        COUNT(b.id) AS visits
+                    FROM guests g LEFT JOIN bookings b ON b.guest_id=g.id
+                    WHERE lower(g.name) LIKE %s OR lower(g.phone) LIKE %s
+                    GROUP BY g.id,g.name,g.phone ORDER BY COUNT(b.id) DESC,g.name LIMIT 10
+                """, (f'%{q}%', f'%{q}%')) or []
+                guests = [{'guest_id':int(r['guest_id']),'name':r['name'] or '—',
+                           'phone':str(r['phone'] or '—'),'passport':str(r['passport'] or '—'),
+                           'visits':r['visits'] or 0} for r in rows]
+            except Exception: guests = []
+            try: e_name.after(0, lambda g=guests: _show_popup(g) if e_name.get().strip().lower()==q else None)
+            except Exception: pass
+        threading.Thread(target=_search, daemon=True).start()
+
+    e_name.bind('<KeyRelease>', _on_key)
+    e_name.bind('<FocusOut>', lambda e: e_name.after(200, _close_popup))
+
+
+
 def _open_booking_dlg(parent, room, click_date, on_save=None):
     """Відкриває BookingDlg з попередньо заповненим номером та датою."""
     dlg = BookingDlg(parent, on_save=on_save)
@@ -6011,6 +6120,7 @@ def _open_checkin_existing(parent, b, room, on_save=None):
     e_series = ent(gf, "АА", w=100); e_series.grid(row=2,column=1,padx=8,pady=3,sticky='w')
     lbl(gf, "Номер паспорта:", 11, color=C['text2']).grid(row=3,column=0,sticky='w',pady=3)
     e_pnum  = ent(gf, "123456", w=160); e_pnum.grid(row=3,column=1,padx=8,pady=3,sticky='w')
+    _attach_guest_autocomplete(e_name, e_phone, e_series, e_pnum)
 
     # Аванс при бронюванні (вже сплачений)
     _adv_paid_ex = 0.0
@@ -6670,6 +6780,7 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
     lbl(gf,"Номер паспорта:",11,color=C['text2']).grid(row=3,column=0,sticky='w',pady=3)
     e_pass_num = ent(gf, "123456", w=180); e_pass_num.grid(row=3,column=1,padx=8,pady=3,sticky='w')
 
+    _attach_guest_autocomplete(e_name, e_phone, e_pass_series, e_pass_num)
     # Дати
     d_card = card(sc); d_card.pack(fill='x', padx=12, pady=5)
     lbl(d_card, "📅  Дати проживання", 13, True).pack(anchor='w', padx=12, pady=(10,5))
@@ -12832,6 +12943,7 @@ def _open_sauna_checkin_dlg(parent, room, on_save=None, booking=None):
     lbl(gf,"Телефон:",11,color=C['text2']).grid(row=1,column=0,sticky='w',pady=3)
     e_phone = ent(gf, "+380...", w=280); e_phone.grid(row=1,column=1,padx=8,pady=3)
     # Підставляємо дані з бронювання
+    _attach_guest_autocomplete(e_name, e_phone)
     if booking:
         _gname = booking.get('guest_name') or booking.get('name') or ''
         _gphone = booking.get('phone') or booking.get('guest_phone') or ''
@@ -13227,6 +13339,7 @@ def _open_sauna_booking_dlg(parent, room, on_save=None):
     e_phone = ent(gf,"+380...",w=280); e_phone.grid(row=1,column=1,padx=8,pady=3)
 
     # ── Дата і час ──────────────────────────────────────
+    _attach_guest_autocomplete(e_name, e_phone)
     t_card = card(sc); t_card.pack(fill='x', padx=12, pady=5)
     lbl(t_card, "📅  Дата та час", 13, True).pack(anchor='w', padx=12, pady=(10,5))
     tf = tk.Frame(t_card, bg=C['card']); tf.pack(fill='x', padx=12, pady=(0,10))
@@ -16370,6 +16483,316 @@ def _run_test_mode_cleanup(on_done=None, on_error=None):
 # ══════════════════════════════════════════════════════
 # НАЛАШТУВАННЯ
 # ══════════════════════════════════════════════════════
+
+class GuestDatabaseFrame(tk.Frame):
+    def __init__(self, parent, user):
+        super().__init__(parent, bg=C['bg'])
+        self.user = user
+        self._all_rows = []; self._filtered = []
+        self._sort_col = 'last_visit'; self._sort_rev = True
+        self._loading = False; self._expanded = None; self._child_iids = []; self._checks = {}
+        lbl(self, '⏳ Завантаження...', 14, color=C['text2']).pack(pady=60)
+        self.after(30, self._build)
+
+    def _build(self):
+        try:
+            for w in self.winfo_children(): w.destroy()
+        except Exception: pass
+        tb = ctk.CTkFrame(self, fg_color=C['card']); tb.pack(fill='x', padx=15, pady=(15,4))
+        lbl(tb, '📋  База гостей', 18, True).pack(side='left', padx=15, pady=10)
+        refresh_btn(tb, self._load, side='left', padx=4, pady=8)
+        self._total_lbl = lbl(tb, '', 11, color=C['text2']); self._total_lbl.pack(side='right', padx=15)
+        sf = ctk.CTkFrame(self, fg_color=C['card']); sf.pack(fill='x', padx=15, pady=3)
+        lbl(sf, '🔍', 13).pack(side='left', padx=(10,2), pady=8)
+        self._search = ent(sf, "Пошук за ПІБ, телефоном...", w=280); self._search.pack(side='left', pady=8)
+        self._search.bind('<KeyRelease>', lambda e: self._filter())
+        lbl(sf, 'Візитів:', 11, color=C['text2']).pack(side='left', padx=(14,4))
+        self._vis_var = tk.StringVar(value='всі')
+        for lv, vv in [('всі','всі'),('1','1'),('2+','2+'),('5+','5+')]:
+            ctk.CTkRadioButton(sf, text=lv, variable=self._vis_var, value=vv,
+                               font=('Segoe UI',11), text_color=C['text'], fg_color=C['accent']).pack(side='left', padx=3)
+        self._vis_var.trace_add('write', lambda *a: self._filter())
+        btn(sf, '📊 Excel', self._export_excel, C['green'], 100, height=32).pack(side='right', padx=(4,12), pady=8)
+        btn(sf, '☑ Всі',  self._select_all,   C['card2'],  80, height=32).pack(side='right', padx=4, pady=8)
+        btn(sf, '☐ Зняти', self._deselect_all, C['card2'],  80, height=32).pack(side='right', padx=4, pady=8)
+        self._count_lbl = lbl(sf, '', 11, color=C['text2']); self._count_lbl.pack(side='right', padx=8)
+        cols = ('check','num','name','visits')
+        ff, self._tree = mktree(self, cols, 16, [30,45,400,80])
+        for c in ('check','num'): self._tree.column(c, anchor='center', stretch=False)
+        self._tree.column('name', anchor='w')
+        self._tree.heading('check', text='✓'); self._tree.heading('num', text='#')
+        self._tree.heading('name', text='ПІБ гостя', command=lambda: self._sort('name'))
+        self._tree.heading('visits', text='Візитів', command=lambda: self._sort('visits'))
+        ff.pack(fill='both', expand=True, padx=15, pady=(3,8))
+        self._tree.bind('<ButtonRelease-1>', self._on_click)
+        self._tree.bind('<<TreeviewSelect>>', self._guard_select)
+        self._load()
+
+    def _load_data_async(self): self._load()
+
+    def _load(self):
+        if self._loading: return
+        self._loading = True
+        import threading
+        threading.Thread(target=self._load_bg, daemon=True).start()
+
+    def _load_bg(self):
+        try:
+            from app.utils.db import query
+            rows = query("""
+                SELECT g.id AS guest_id, g.name,
+                    COALESCE(NULLIF(trim(g.phone),''),'—') AS phone,
+                    COALESCE(NULLIF(trim(g.phone),''),'')  AS phone_key,
+                    COALESCE(
+                        (SELECT trim(regexp_replace(substring(b2.notes FROM E'Паспорт: ([^\\n]+)'),E'\\s+',' ','g'))
+                         FROM bookings b2 WHERE b2.guest_id=g.id AND b2.notes LIKE '%%Паспорт%%'
+                         ORDER BY b2.check_in DESC LIMIT 1),'—') AS passport,
+                    COUNT(b.id) AS visits,
+                    MIN(b.check_in) AS first_visit, MAX(b.check_in) AS last_visit,
+                    COALESCE(SUM(b.check_out-b.check_in),0) AS total_nights,
+                    COALESCE(SUM(b.total_amount),0) AS total_paid,
+                    STRING_AGG(DISTINCT r.number::text,', ' ORDER BY r.number::text) AS rooms_list
+                FROM guests g
+                LEFT JOIN bookings b ON b.guest_id=g.id
+                LEFT JOIN rooms r ON b.room_id=r.id
+                GROUP BY g.id,g.name,g.phone ORDER BY MAX(b.check_in) DESC NULLS LAST,g.id
+            """) or []
+            from collections import defaultdict
+            groups = defaultdict(list); no_phone = []
+            for r in rows:
+                pk = str(r['phone_key'] or '').strip()
+                if pk: groups[pk].append(r)
+                else:  no_phone.append(r)
+            merged = []
+            for pk, grp in groups.items():
+                best = max(grp, key=lambda x: len(str(x['name'] or '')))
+                all_ids = [int(x['guest_id']) for x in grp]
+                passport = next((str(x['passport']) for x in grp if x['passport'] and str(x['passport'])!='—'),'—')
+                tv = sum(int(x['visits'] or 0) for x in grp)
+                tn = sum(int(x['total_nights'] or 0) for x in grp)
+                tp = sum(float(x['total_paid'] or 0) for x in grp)
+                firsts = [str(x['first_visit']) for x in grp if x['first_visit'] and str(x['first_visit']) not in ('—','None','')]
+                lasts  = [str(x['last_visit'])  for x in grp if x['last_visit']  and str(x['last_visit'])  not in ('—','None','')]
+                rooms = ', '.join(sorted({rm.strip() for x in grp for rm in str(x['rooms_list'] or '').split(',') if rm.strip() and rm.strip()!='—'})) or '—'
+                merged.append({'guest_id':int(best['guest_id']),'all_ids':all_ids,'name':str(best['name'] or '—'),
+                    'phone':str(best['phone'] or '—'),'passport':passport,'visits':str(tv),
+                    'first_visit':min(firsts) if firsts else '—','last_visit':max(lasts) if lasts else '—',
+                    'total_nights':str(tn),'total_paid':f"{tp:.0f}₴",'rooms_list':rooms})
+            for r in no_phone:
+                merged.append({'guest_id':int(r['guest_id']),'all_ids':[int(r['guest_id'])],
+                    'name':str(r['name'] or '—'),'phone':'—','passport':str(r['passport'] or '—'),
+                    'visits':str(r['visits'] or 0),'first_visit':str(r['first_visit'] or '—'),
+                    'last_visit':str(r['last_visit'] or '—'),'total_nights':str(r['total_nights'] or 0),
+                    'total_paid':f"{float(r['total_paid'] or 0):.0f}₴",'rooms_list':str(r['rooms_list'] or '—')})
+            def _ms(x):
+                lv = x['last_visit']
+                if lv and lv != '—':
+                    try:
+                        import datetime as _dt2
+                        return (0, str(_dt2.date.fromisoformat(lv)))
+                    except Exception: return (0, str(lv))
+                return (1, '')
+            merged.sort(key=_ms, reverse=True)
+            self._all_rows = merged
+            try: self.after(0, self._filter)
+            except Exception: pass
+        except Exception as e:
+            log_error('GuestDatabaseFrame._load_bg', e)
+        finally:
+            self._loading = False
+
+    def _filter(self):
+        self._collapse()
+        try: q = self._search.get().lower().strip()
+        except Exception: q = ''
+        try: vf = self._vis_var.get()
+        except Exception: vf = 'всі'
+        def _vis_ok(r):
+            v = int(r['visits'] or 0)
+            return (vf=='всі' or (vf=='1' and v==1) or (vf=='2+' and v>=2) or (vf=='5+' and v>=5))
+        self._filtered = [r for r in self._all_rows if
+                         (not q or any(q in str(r[k]).lower() for k in ('name','phone','passport','rooms_list')))
+                         and _vis_ok(r)]
+        def _sk(r):
+            v = r.get(self._sort_col,'')
+            try: return (0, float(str(v).replace('₴','')))
+            except Exception: pass
+            try:
+                import datetime as _dtf
+                return (0, str(_dtf.date.fromisoformat(str(v))))
+            except Exception: pass
+            return (1, str(v).lower())
+        self._filtered.sort(key=_sk, reverse=self._sort_rev)
+        self._tree.delete(*self._tree.get_children())
+        self._checks = {}
+        for i, r in enumerate(self._filtered):
+            gid = r['guest_id']; v = int(r['visits'] or 0)
+            tag = 'vip' if v>=5 else ('repeat' if v>=2 else ('odd' if i%2 else 'even'))
+            self._tree.insert('','end',iid=f'g{gid}',tags=(tag,),values=[
+                '☑' if self._checks.get(gid) else '☐', i+1, r['name'], r['visits']])
+        self._tree.tag_configure('even',   background=C['card'])
+        self._tree.tag_configure('odd',    background=C['card2'])
+        self._tree.tag_configure('repeat', background='#1a3a1a')
+        self._tree.tag_configure('vip',    background='#1a2a3a')
+        self._tree.tag_configure('det_hdr',background='#222233')
+        self._tree.tag_configure('det',    background=C['bg'])
+        try: self._count_lbl.configure(text=f"Знайдено: {len(self._filtered)}")
+        except Exception: pass
+        try:
+            rep = sum(1 for r in self._all_rows if int(r['visits'] or 0) >= 2)
+            self._total_lbl.configure(text=f"Всього: {len(self._all_rows)} | Постійних: {rep}")
+        except Exception: pass
+
+    def _sort(self, col):
+        if self._sort_col == col: self._sort_rev = not self._sort_rev
+        else: self._sort_col = col; self._sort_rev = False
+        self._filter()
+
+    def _guard_select(self, event=None):
+        sel = self._tree.selection()
+        bad = [s for s in sel if s.startswith('d_')]
+        if bad: self._tree.selection_remove(bad)
+
+    def _on_click(self, event):
+        col = self._tree.identify_column(event.x)
+        iid = self._tree.identify_row(event.y)
+        if not iid or iid.startswith('d_'): return
+        gid_str = iid[1:]
+        if not gid_str.isdigit(): return
+        gid = int(gid_str)
+        if col == '#1':
+            self._checks[gid] = not self._checks.get(gid, False)
+            vals = list(self._tree.item(iid,'values'))
+            vals[0] = '☑' if self._checks[gid] else '☐'
+            self._tree.item(iid, values=vals)
+        else:
+            if iid == self._expanded: self._collapse()
+            else: self._expand(iid)
+
+    def _collapse(self):
+        if self._expanded:
+            for c in self._child_iids:
+                try: self._tree.delete(c)
+                except Exception: pass
+            self._child_iids = []; self._expanded = None
+
+    def _expand(self, iid):
+        self._collapse(); self._expanded = iid
+        gid = int(iid[1:])
+        row = next((r for r in self._all_rows if r['guest_id']==gid), None)
+        if not row: return
+        for idx, (label, val) in enumerate([
+            ('📞 Телефон', row['phone']), ('🪪 Паспорт', row['passport']),
+            ('📅 Перший', row['first_visit']), ('📅 Останній', row['last_visit']),
+            ('🌙 Ночей', row['total_nights']), ('💰 Сплачено', row['total_paid']),
+        ]):
+            ii = f'd_info_{gid}_{idx}'
+            self._tree.insert(iid,'end',iid=ii,tags=('det_hdr',),values=['','',f'    {label}:',f'  {val}'])
+            self._child_iids.append(ii)
+        sep = f'd_sep_{gid}'
+        self._tree.insert(iid,'end',iid=sep,tags=('det',),values=['','','    ─── Бронювання ───',''])
+        self._child_iids.append(sep)
+        hdr = f'd_hdr_{gid}'
+        self._tree.insert(iid,'end',iid=hdr,tags=('det_hdr',),values=['','','    Кімната  |  Заїзд → Виїзд  |  Ночей  |  Сума','    Статус'])
+        self._child_iids.append(hdr)
+        liid = f'd_load_{gid}'
+        self._tree.insert(iid,'end',iid=liid,tags=('det',),values=['','','    ⏳ завантаження...',''])
+        self._child_iids.append(liid)
+        self._tree.item(iid, open=True)
+        import threading
+        threading.Thread(target=self._load_bookings_bg, args=(gid,row['all_ids'],liid,iid), daemon=True).start()
+
+    def _load_bookings_bg(self, gid, all_ids, load_iid, parent_iid):
+        brows = []
+        try:
+            from app.utils.db import query as _q
+            ids_t = tuple(all_ids)
+            if len(ids_t) == 1:
+                where = f"b.guest_id = {ids_t[0]}"; params = ()
+            else:
+                where = f"b.guest_id IN ({','.join(['%s']*len(ids_t))})"; params = ids_t
+            brows = _q(f"""
+                SELECT r.number AS room, b.status, b.check_in, b.check_out,
+                    (b.check_out-b.check_in) AS nights, COALESCE(b.total_amount,0) AS amount,
+                    COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.booking_id=b.id AND p.amount>0),0) AS paid_total,
+                    COALESCE(NULLIF(trim(b.guest_name),''),'—') AS note
+                FROM bookings b JOIN rooms r ON b.room_id=r.id
+                WHERE {where} ORDER BY b.check_in DESC
+            """, params) or []
+        except Exception as _e:
+            log_error('GuestDatabaseFrame._load_bookings_bg', _e)
+
+        def _fill():
+            try:
+                try: self._tree.delete(load_iid)
+                except Exception: pass
+                if load_iid in self._child_iids: self._child_iids.remove(load_iid)
+                if not brows:
+                    ei = f'd_empty_{gid}'
+                    self._tree.insert(parent_iid,'end',iid=ei,tags=('det',),values=['','','    — немає бронювань —',''])
+                    self._child_iids.append(ei); return
+                for i, br in enumerate(brows):
+                    bi = f'd_{gid}_{i}'
+                    left = f"    {br['room'] or '—'}   {br['check_in'] or '—'} \u2192 {br['check_out'] or '—'}   {br['nights'] or 0} ніч   {float(br['amount'] or 0):.0f}\u20b4 / {float(br['paid_total'] or 0):.0f}\u20b4"
+                    right = f"  {STATUS_UA.get(br['status'], br['status'] or '—')}"
+                    self._tree.insert(parent_iid,'end',iid=bi,tags=('det',),values=['','',left,right])
+                    self._child_iids.append(bi)
+                tn = sum(int(br['nights'] or 0) for br in brows)
+                tp = sum(float(br['paid_total'] or 0) for br in brows)
+                si = f'd_sum_{gid}'
+                self._tree.insert(parent_iid,'end',iid=si,tags=('det_hdr',),
+                    values=['','',f"    📊 {len(brows)} бронювань  |  {tn} ніч  |  {tp:.0f}₴",''])
+                self._child_iids.append(si)
+            except Exception: pass
+        try: self.after(0, _fill)
+        except Exception: pass
+
+    def _select_all(self):
+        for r in self._filtered: self._checks[r['guest_id']] = True
+        self._redraw_checks()
+
+    def _deselect_all(self):
+        self._checks.clear(); self._redraw_checks()
+
+    def _redraw_checks(self):
+        for r in self._filtered:
+            gid = r['guest_id']
+            try:
+                vals = list(self._tree.item(f'g{gid}','values'))
+                vals[0] = '☑' if self._checks.get(gid) else '☐'
+                self._tree.item(f'g{gid}', values=vals)
+            except Exception: pass
+
+    def _export_excel(self):
+        selected = [r for r in self._filtered if self._checks.get(r['guest_id'])]
+        data = selected if selected else self._filtered
+        if not data:
+            import tkinter.messagebox as _mb; _mb.showinfo('Експорт','Немає даних'); return
+        import tkinter.filedialog as _fd, datetime as _dte, os as _os2
+        fname = f'guests_{_dte.date.today().isoformat()}.xlsx'
+        desktop = _os2.path.join(_os2.path.expanduser('~'),'Desktop')
+        if not _os2.path.isdir(desktop): desktop = _os2.path.expanduser('~')
+        fpath = _fd.asksaveasfilename(title='Зберегти базу гостей',initialdir=desktop,
+            initialfile=fname,defaultextension='.xlsx',filetypes=[('Excel','*.xlsx'),('Всі','*.*')])
+        if not fpath: return
+        import threading
+        threading.Thread(target=self._do_export, args=(data,fpath), daemon=True).start()
+
+    def _do_export(self, data, fname):
+        try:
+            headers = ['#','ПІБ гостя','Телефон','Паспорт','Візитів','Перший','Останній','Ночей','Сплачено','Кімнати']
+            col_w = [5,28,16,16,8,13,13,7,12,28]
+            rows = [[i+1,r['name'],r['phone'],r['passport'],int(r['visits'] or 0),
+                     r['first_visit'],r['last_visit'],int(r['total_nights'] or 0),
+                     r['total_paid'],r['rooms_list']] for i,r in enumerate(data)]
+            SettingsFrame._make_xlsx(rows, headers, fname, col_widths=col_w)
+            self.after(0, lambda f=fname: __import__('tkinter.messagebox',fromlist=['showinfo']).showinfo('✅ Готово',f'Збережено {len(data)} записів:\n{f}'))
+        except Exception as _e:
+            log_error('GuestDatabaseFrame._do_export', _e)
+            self.after(0, lambda e=_e: __import__('tkinter.messagebox',fromlist=['showerror']).showerror('Помилка',str(e)))
+
+
+
 class SettingsFrame(tk.Frame):
     def __init__(self, parent, user):
         super().__init__(parent, bg=C['bg'])
