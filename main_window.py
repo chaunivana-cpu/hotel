@@ -98,6 +98,7 @@ import time as _time_mod
 import queue as _queue_mod
 import traceback as _tb_mod
 
+APP_VERSION = "1.0.0"  # Версія — змінюйте при кожному оновленні
 SYNC_INTERVAL = 60    # секунд між автосинхронізаціями
 
 
@@ -2495,6 +2496,69 @@ class HotelApp(ctk.CTk):
         except Exception:
             pass
 
+    def _run_update(self, src_path):
+        """Копіює src_path у всі цільові файли і перезапускає програму."""
+        import os as _ou, shutil as _shu, sys as _syu, subprocess as _spu
+        import tkinter.messagebox as _mbu
+
+        # Перевіряємо що файл справжній Python-скрипт
+        try:
+            with open(src_path, 'r', encoding='utf-8', errors='ignore') as _tf:
+                _head = _tf.read(500)
+            if 'import' not in _head and 'def ' not in _head and 'class ' not in _head:
+                _mbu.showerror("Помилка оновлення", "Завантажений файл не є Python-скриптом. Оновлення скасовано.")
+                return
+        except Exception as _ve:
+            _mbu.showerror("Помилка", f"Не вдалось перевірити файл: {_ve}"); return
+        # Знаходимо куди копіювати
+        _targets = []
+        try:
+            if getattr(_syu, 'frozen', False):
+                _base = _ou.path.dirname(_syu.executable)
+                for _rel in ('app/ui/main_window.py', '../app/ui/main_window.py'):
+                    _t = _ou.path.normpath(_ou.path.join(_base, _rel))
+                    if _ou.path.exists(_ou.path.dirname(_t)):
+                        _targets.append(_t)
+            else:
+                _targets.append(_ou.path.abspath(__file__))
+                # Також dist якщо існує
+                _dist = _ou.path.normpath(_ou.path.join(
+                    _ou.path.dirname(_ou.path.abspath(__file__)),
+                    '..', '..', 'dist', 'HotelPMS', 'app', 'ui', 'main_window.py'))
+                if _ou.path.exists(_ou.path.dirname(_dist)):
+                    _targets.append(_dist)
+        except Exception: pass
+
+        if not _targets:
+            _mbu.showerror("Помилка", "Не знайдено цільових файлів для оновлення."); return
+
+        # Копіюємо
+        _errors = []
+        for _tgt in _targets:
+            try:
+                _ou.makedirs(_ou.path.dirname(_tgt), exist_ok=True)
+                # Backup
+                _bak = _tgt + '.bak'
+                if _ou.path.exists(_tgt):
+                    _shu.copy2(_tgt, _bak)
+                _shu.copy2(src_path, _tgt)
+            except Exception as _ce:
+                _errors.append(f"{_tgt}: {_ce}")
+
+        if _errors:
+            _mbu.showerror("Помилка копіювання", "\n".join(_errors)); return
+
+        # Перезапуск
+        if _mbu.askyesno("Оновлено!", f"Файл оновлено у {len(_targets)} місцях. Перезапустити програму зараз?"):
+            try:
+                if getattr(_syu, 'frozen', False):
+                    _spu.Popen([_syu.executable] + _syu.argv[1:])
+                else:
+                    _spu.Popen([_syu.executable] + _syu.argv)
+                self.destroy()
+            except Exception as _re:
+                _mbu.showinfo("Оновлено", "Оновлення встановлено. Перезапустіть програму вручну.")
+
     def _check_mega_update_bg(self):
         """Фонова перевірка оновлень на MEGA при запуску."""
         import threading as _thr_mu
@@ -2563,24 +2627,74 @@ class HotelApp(ctk.CTk):
                         update_info = f"{cur_size//1024} КБ → {remote_size//1024} КБ"
 
                 if has_update:
-                    def _show_banner(info=update_info):
+                    def _show_banner(info=update_info, dl_url=MEGA, dl_raw=raw if sm_size else None):
                         try:
                             if hasattr(self, "_upd_banner"):
                                 try: self._upd_banner.destroy()
                                 except Exception: pass
-                            self._upd_banner = ctk.CTkFrame(self, fg_color="#1a3a1a", height=38)
-                            self._upd_banner.place(relx=0.5, y=2, anchor="n", relwidth=0.7)
+                            self._upd_banner = ctk.CTkFrame(self, fg_color="#1a3a1a", height=42)
+                            self._upd_banner.place(relx=0.5, y=2, anchor="n", relwidth=0.75)
                             tk.Label(self._upd_banner,
-                                text=f"  🆕 Доступне оновлення ({info})  ",
-                                font=("Segoe UI", 11), fg="#aaffaa", bg="#1a3a1a").pack(side="left", padx=10, pady=7)
-                            ctk.CTkButton(self._upd_banner, text="⬇️ Оновити",
-                                command=lambda: self._show_frame("settings"),
+                                text=f"  🆕 Доступне оновлення програми ({info})  ",
+                                font=("Segoe UI", 11), fg="#aaffaa", bg="#1a3a1a").pack(side="left", padx=10, pady=8)
+
+                            def _do_install_now():
+                                """Встановити зараз — без переходу в налаштування."""
+                                import threading as _thi, os as _osi, tempfile as _tmpi
+                                try: self._upd_banner.place_forget()
+                                except Exception: pass
+
+                                # Якщо файл вже є в пам'яті (завантажили раніше)
+                                if dl_raw and len(dl_raw) > 10000:
+                                    _tmp = _os_mu.path.join(_tmpi.gettempdir(), 'main_window_update.py')
+                                    with open(_tmp, 'wb') as _tf: _tf.write(dl_raw)
+                                    self._run_update(_tmp)
+                                    return
+
+                                # Інакше — завантажуємо і встановлюємо
+                                _prog = ctk.CTkToplevel(self)
+                                _prog.title("Оновлення")
+                                _prog.geometry("380x110")
+                                _prog.configure(fg_color=C['bg'])
+                                _prog.grab_set()
+                                _lbl_p = lbl(_prog, "⬇️ Завантаження оновлення...", 12)
+                                _lbl_p.pack(pady=(20,8))
+                                _bar = ctk.CTkProgressBar(_prog, width=320)
+                                _bar.pack(pady=4); _bar.set(0); _bar.start()
+
+                                def _dl_bg():
+                                    try:
+                                        import urllib.request as _ur_i
+                                        opener = _ur_i.build_opener(_ur_i.HTTPCookieProcessor())
+                                        req_i = _ur_i.Request(dl_url, headers={"User-Agent":"Mozilla/5.0"})
+                                        with opener.open(req_i, timeout=30) as _r:
+                                            _data = _r.read()
+                                        _tmp = _os_mu.path.join(_tmpi.gettempdir(), 'main_window_update.py')
+                                        with open(_tmp, 'wb') as _tf: _tf.write(_data)
+                                        def _done():
+                                            try: _prog.destroy()
+                                            except Exception: pass
+                                            self._run_update(_tmp)
+                                        self.after(0, _done)
+                                    except Exception as _de:
+                                        def _err():
+                                            try: _bar.stop(); _lbl_p.configure(text=f"❌ Помилка: {_de}")
+                                            except Exception: pass
+                                        self.after(0, _err)
+                                _thi.Thread(target=_dl_bg, daemon=True).start()
+
+                            ctk.CTkButton(self._upd_banner, text="⬇️ Встановити зараз",
+                                command=_do_install_now,
                                 fg_color="#27ae60", hover_color="#1e8449",
-                                font=("Segoe UI", 11), height=26, width=140).pack(side="left", padx=4)
+                                font=("Segoe UI", 11, "bold"), height=28, width=180).pack(side="left", padx=4)
+                            ctk.CTkButton(self._upd_banner, text="Пізніше",
+                                command=lambda: self._show_frame("settings"),
+                                fg_color="#444", hover_color="#555",
+                                font=("Segoe UI", 10), height=28, width=90).pack(side="left", padx=2)
                             ctk.CTkButton(self._upd_banner, text="✕",
                                 command=lambda: self._upd_banner.place_forget(),
                                 fg_color="transparent", hover_color="#333",
-                                font=("Segoe UI", 11), height=26, width=30).pack(side="right", padx=4)
+                                font=("Segoe UI", 11), height=28, width=30).pack(side="right", padx=4)
                         except Exception: pass
                     try: self.after(0, _show_banner)
                     except Exception: pass
@@ -19423,7 +19537,11 @@ class SettingsFrame(tk.Frame):
         _sc = ctk.CTkScrollableFrame(p, fg_color=C['bg']); _sc.pack(fill='both', expand=True)
         f = tk.Frame(_sc, bg=C['bg']); f.pack(fill='both', expand=True, padx=15, pady=10)
         lbl(f, "🔄  Оновлення програми", 15, True).pack(anchor='w', pady=(0,4))
-        lbl(f, f"Поточна версія: v{APP_VERSION}", 11, color=C['text2']).pack(anchor='w', pady=(0,6))
+        try:
+            _cur_ver_str = APP_VERSION
+        except NameError:
+            _cur_ver_str = '—'
+        lbl(f, f"Поточна версія: {_cur_ver_str}", 11, color=C['text2']).pack(anchor='w', pady=(0,6))
 
         # ── Посилання на оновлення — читаємо/зберігаємо в конфіг ──
         _UPD_CFG_KEY = 'update_url'
