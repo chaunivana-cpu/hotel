@@ -2497,7 +2497,7 @@ class HotelApp(ctk.CTk):
             pass
 
     def _run_update(self, src_path):
-        """Копіює src_path у всі цільові файли і перезапускає програму."""
+        """Копіює src_path у всі цільові файли (ті самі що в ручному оновленні) і перезапускає."""
         import os as _ou, shutil as _shu, sys as _syu, subprocess as _spu
         import tkinter.messagebox as _mbu
 
@@ -2506,58 +2506,67 @@ class HotelApp(ctk.CTk):
             with open(src_path, 'r', encoding='utf-8', errors='ignore') as _tf:
                 _head = _tf.read(500)
             if 'import' not in _head and 'def ' not in _head and 'class ' not in _head:
-                _mbu.showerror("Помилка оновлення", "Завантажений файл не є Python-скриптом. Оновлення скасовано.")
+                _mbu.showerror("Помилка оновлення", "Завантажений файл не є Python-скриптом.")
                 return
         except Exception as _ve:
-            _mbu.showerror("Помилка", f"Не вдалось перевірити файл: {_ve}"); return
-        # Знаходимо куди копіювати
-        _targets = []
-        try:
-            if getattr(_syu, 'frozen', False):
-                _base = _ou.path.dirname(_syu.executable)
-                for _rel in ('app/ui/main_window.py', '../app/ui/main_window.py'):
-                    _t = _ou.path.normpath(_ou.path.join(_base, _rel))
-                    if _ou.path.exists(_ou.path.dirname(_t)):
-                        _targets.append(_t)
-            else:
-                _targets.append(_ou.path.abspath(__file__))
-                # Також dist якщо існує
-                _dist = _ou.path.normpath(_ou.path.join(
-                    _ou.path.dirname(_ou.path.abspath(__file__)),
-                    '..', '..', 'dist', 'HotelPMS', 'app', 'ui', 'main_window.py'))
-                if _ou.path.exists(_ou.path.dirname(_dist)):
-                    _targets.append(_dist)
-        except Exception: pass
+            _mbu.showerror("Помилка", "Не вдалось перевірити файл: " + str(_ve)); return
 
-        if not _targets:
-            _mbu.showerror("Помилка", "Не знайдено цільових файлів для оновлення."); return
+        # Ті самі цільові шляхи що й у ручному оновленні
+        def _get_targets():
+            _ts = []
+            FIXED = [
+                'C:\\hotel2\\app\\ui\\main_window.py',
+                'C:\\hotel2\\dist\\HotelPMS\\app\\ui\\main_window.py',
+            ]
+            for fw in FIXED:
+                _n = _ou.path.normpath(fw)
+                if _n not in _ts: _ts.append(_n)
+            _cur = _ou.path.abspath(__file__)
+            if _cur not in _ts: _ts.append(_cur)
+            _base = _cur
+            for _ in range(6):
+                _base = _ou.path.dirname(_base)
+                for _extra in [
+                    _ou.path.join(_base, 'dist', 'HotelPMS', 'app', 'ui', 'main_window.py'),
+                    _ou.path.join(_base, 'dist', 'HotelPMS', '_internal', 'app', 'ui', 'main_window.py'),
+                ]:
+                    _nrm = _ou.path.normpath(_extra)
+                    if _nrm not in _ts and _ou.path.exists(_nrm): _ts.append(_nrm)
+            return _ts
 
-        # Копіюємо
-        _errors = []
+        _targets = _get_targets()
+        _ts_str = "\n".join("  " + chr(8226) + " " + t for t in _targets)
+        _sz = _ou.path.getsize(src_path) // 1024
+
+        if not _mbu.askyesno("Замінити файл програми?",
+            "Звідки: main_window.py  (" + str(_sz) + " КБ)\n\nКуди:\n" + _ts_str +
+            "\n\nФайл буде замінено і програма перезапуститься автоматично.\n"
+            "Збірка EXE НЕ потрібна " + chr(8212) + " просто перезапуск."):
+            return
+
+        _errors = []; _ok = 0
         for _tgt in _targets:
             try:
                 _ou.makedirs(_ou.path.dirname(_tgt), exist_ok=True)
-                # Backup
-                _bak = _tgt + '.bak'
-                if _ou.path.exists(_tgt):
-                    _shu.copy2(_tgt, _bak)
-                _shu.copy2(src_path, _tgt)
+                if _ou.path.exists(_tgt): _shu.copy2(_tgt, _tgt + '.bak')
+                _shu.copy2(src_path, _tgt); _ok += 1
             except Exception as _ce:
-                _errors.append(f"{_tgt}: {_ce}")
+                _errors.append(_ou.path.basename(_tgt) + ": " + str(_ce))
 
+        if _errors and _ok == 0:
+            _mbu.showerror("Помилка", "Не вдалось скопіювати:\n" + "\n".join(_errors)); return
         if _errors:
-            _mbu.showerror("Помилка копіювання", "\n".join(_errors)); return
+            _mbu.showwarning("Частково", "Оновлено " + str(_ok) + " файлів.\n" + "\n".join(_errors))
 
-        # Перезапуск
-        if _mbu.askyesno("Оновлено!", f"Файл оновлено у {len(_targets)} місцях. Перезапустити програму зараз?"):
-            try:
-                if getattr(_syu, 'frozen', False):
-                    _spu.Popen([_syu.executable] + _syu.argv[1:])
-                else:
-                    _spu.Popen([_syu.executable] + _syu.argv)
-                self.destroy()
-            except Exception as _re:
-                _mbu.showinfo("Оновлено", "Оновлення встановлено. Перезапустіть програму вручну.")
+        try:
+            if getattr(_syu, 'frozen', False):
+                _spu.Popen([_syu.executable] + _syu.argv[1:])
+            else:
+                _spu.Popen([_syu.executable] + _syu.argv)
+            self.after(500, self.destroy)
+        except Exception:
+            _mbu.showinfo("Оновлено", "Оновлено " + str(_ok) + " файлів.\nПерезапустіть програму вручну.")
+
 
     def _check_mega_update_bg(self):
         """Фонова перевірка оновлень на MEGA при запуску."""
