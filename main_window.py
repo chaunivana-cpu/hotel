@@ -16558,13 +16558,45 @@ class GuestDatabaseFrame(tk.Frame):
                 GROUP BY g.id,g.name,g.phone ORDER BY MAX(b.check_in) DESC NULLS LAST,g.id
             """) or []
             from collections import defaultdict
-            groups = defaultdict(list); no_phone = []
+            import re as _re_merge
+
+            def _normalize_name(n):
+                """Нормалізує ім'я: нижній регістр, тільки літери і пробіли."""
+                return _re_merge.sub(r'\s+', ' ', str(n or '').strip().lower())
+
+            # Ключ: якщо є телефон → телефон; інакше нормалізоване ім'я
+            groups = defaultdict(list); no_key = []
             for r in rows:
                 pk = str(r['phone_key'] or '').strip()
-                if pk: groups[pk].append(r)
-                else:  no_phone.append(r)
-            merged = []
+                name_key = _normalize_name(r['name'])
+                if pk:
+                    groups[pk].append(r)
+                elif name_key and len(name_key) > 2:
+                    groups['name:' + name_key].append(r)
+                else:
+                    no_key.append(r)
+            # Додатково об'єднуємо по імені в рамках тієї самої phone-групи
+            # (якщо в різних phone-групах однакові нормалізовані імена → злити)
+            # Об'єднуємо групи з однаковим нормалізованим іменем
+            name_to_key = {}
+            final_groups = defaultdict(list)
             for pk, grp in groups.items():
+                # Берем нормалізоване ім'я найкращого запису
+                best_nk = _normalize_name(max(grp, key=lambda x: len(str(x['name'] or '')))['name'])
+                if not pk.startswith('name:') and best_nk and best_nk in name_to_key:
+                    # Є вже група з таким іменем — зливаємо
+                    final_groups[name_to_key[best_nk]].extend(grp)
+                else:
+                    if best_nk and not pk.startswith('name:'):
+                        name_to_key[best_nk] = pk
+                    # Також кожне ім'я з групи реєструємо
+                    for r in grp:
+                        nk = _normalize_name(r['name'])
+                        if nk and nk not in name_to_key:
+                            name_to_key[nk] = pk
+                    final_groups[pk].extend(grp)
+            merged = []
+            for pk, grp in final_groups.items():
                 best = max(grp, key=lambda x: len(str(x['name'] or '')))
                 all_ids = [int(x['guest_id']) for x in grp]
                 passport = next((str(x['passport']) for x in grp if x['passport'] and str(x['passport'])!='—'),'—')
@@ -16578,7 +16610,7 @@ class GuestDatabaseFrame(tk.Frame):
                     'phone':str(best['phone'] or '—'),'passport':passport,'visits':str(tv),
                     'first_visit':min(firsts) if firsts else '—','last_visit':max(lasts) if lasts else '—',
                     'total_nights':str(tn),'total_paid':f"{tp:.0f}₴",'rooms_list':rooms})
-            for r in no_phone:
+            for r in no_key:
                 merged.append({'guest_id':int(r['guest_id']),'all_ids':[int(r['guest_id'])],
                     'name':str(r['name'] or '—'),'phone':'—','passport':str(r['passport'] or '—'),
                     'visits':str(r['visits'] or 0),'first_visit':str(r['first_visit'] or '—'),
@@ -16677,48 +16709,177 @@ class GuestDatabaseFrame(tk.Frame):
             self._child_iids = []; self._expanded = None
 
     def _expand(self, iid):
-        self._collapse(); self._expanded = iid
+        """Відкриває повну картку гостя у окремому вікні."""
+        self._collapse()
         gid = int(iid[1:])
         row = next((r for r in self._all_rows if r['guest_id']==gid), None)
         if not row: return
-        for idx, (label, val) in enumerate([
-            ('📞 Телефон', row['phone']), ('🪪 Паспорт', row['passport']),
-            ('📅 Перший', row['first_visit']), ('📅 Останній', row['last_visit']),
-            ('🌙 Ночей', row['total_nights']), ('💰 Сплачено', row['total_paid']),
-        ]):
-            ii = f'd_info_{gid}_{idx}'
-            self._tree.insert(iid,'end',iid=ii,tags=('det_hdr',),values=['','',f'    {label}:',f'  {val}'])
-            self._child_iids.append(ii)
-        sep = f'd_sep_{gid}'
-        self._tree.insert(iid,'end',iid=sep,tags=('det',),values=['','','    ─── Бронювання ───',''])
-        self._child_iids.append(sep)
-        hdr = f'd_hdr_{gid}'
-        self._tree.insert(iid,'end',iid=hdr,tags=('det_hdr',),values=['','','    Кімната  |  Заїзд → Виїзд  |  Ночей  |  Сума','    Статус'])
-        self._child_iids.append(hdr)
-        liid = f'd_load_{gid}'
-        self._tree.insert(iid,'end',iid=liid,tags=('det',),values=['','','    ⏳ завантаження...',''])
-        self._child_iids.append(liid)
-        self._tree.item(iid, open=True)
+        self._open_guest_card(gid, row)
+
+    def _open_guest_card(self, gid, row):
         import threading
-        threading.Thread(target=self._load_bookings_bg, args=(gid,row['all_ids'],liid,iid), daemon=True).start()
+        win = ctk.CTkToplevel(self)
+        win.title(f"Гість: {row['name']}")
+        win.geometry('1000x640')
+        win.configure(fg_color=C['bg'])
+        win.grab_set()
+        win.lift()
+
+        # ── Шапка ──
+        hdr_f = ctk.CTkFrame(win, fg_color=C['card'], corner_radius=10)
+        hdr_f.pack(fill='x', padx=14, pady=(14,6))
+        lbl(hdr_f, f"👤  {row['name']}", 20, True, C['accent']).pack(anchor='w', padx=16, pady=(12,4))
+        info_row = tk.Frame(hdr_f, bg=C['card']); info_row.pack(fill='x', padx=16, pady=(0,12))
+        for i, (ico, label, val) in enumerate([
+            ('📞','Телефон',   row['phone']),
+            ('🪪','Паспорт',   row['passport']),
+            ('📅','Перший візит', row['first_visit']),
+            ('📅','Останній',  row['last_visit']),
+        ]):
+            info_row.columnconfigure(i, weight=1)
+            cf = tk.Frame(info_row, bg=C['card2'], relief='flat')
+            cf.grid(row=0, column=i, padx=4, pady=2, sticky='ew', ipady=4)
+            lbl(cf, f"{ico} {label}", 9, color=C['text2']).pack(anchor='w', padx=8, pady=(4,1))
+            lbl(cf, val, 12, True).pack(anchor='w', padx=8, pady=(0,4))
+
+        # ── Статистика ──
+        st_row = tk.Frame(win, bg=C['bg']); st_row.pack(fill='x', padx=14, pady=4)
+        for i, (title, val, clr) in enumerate([
+            ('Візитів',       row['visits'],       C['accent']),
+            ('Ночей всього',  row['total_nights'],  C['green']),
+            ('Сплачено',      row['total_paid'],    '#9b59b6'),
+        ]):
+            st_row.columnconfigure(i, weight=1)
+            cf = ctk.CTkFrame(st_row, fg_color=C['card'], corner_radius=10)
+            cf.grid(row=0, column=i, padx=5, pady=4, sticky='ew', ipady=8)
+            lbl(cf, val, 22, True, clr).pack(pady=(8,2))
+            lbl(cf, title, 10, color=C['text2']).pack(pady=(0,8))
+
+        # ── Таблиця бронювань ──
+        lbl(win, '📋  Всі бронювання', 13, True).pack(anchor='w', padx=18, pady=(6,3))
+
+        tbl_frame = tk.Frame(win, bg=C['bg']); tbl_frame.pack(fill='both', expand=True, padx=14, pady=(0,10))
+        tbl_frame.rowconfigure(0, weight=1); tbl_frame.columnconfigure(0, weight=1)
+
+        import tkinter.ttk as _ttb
+        _vsb = tk.Scrollbar(tbl_frame, orient='vertical')
+        _hsb = tk.Scrollbar(tbl_frame, orient='horizontal')
+        _sty = _ttb.Style()
+        _sty.configure('Guest.Treeview', background=C['card'], foreground=C['text'],
+            fieldbackground=C['card'], rowheight=26, font=('Segoe UI', 11))
+        _sty.configure('Guest.Treeview.Heading', background=C['card2'],
+            foreground=C['accent'], font=('Segoe UI', 11, 'bold'))
+        _sty.map('Guest.Treeview', background=[('selected', C['accent'])])
+
+        _cols = ('room','check_in','check_out','nights','amount','paid','debt','status')
+        _tv = _ttb.Treeview(tbl_frame, columns=_cols, show='headings',
+            style='Guest.Treeview', yscrollcommand=_vsb.set, xscrollcommand=_hsb.set)
+        _vsb.config(command=_tv.yview); _hsb.config(command=_tv.xview)
+        _tv.grid(row=0, column=0, sticky='nsew')
+        _vsb.grid(row=0, column=1, sticky='ns')
+        _hsb.grid(row=1, column=0, sticky='ew')
+
+        for c, h, w in zip(_cols,
+            ['Кімната','Заїзд','Виїзд','Ночей','Сума','Сплачено','Борг','Статус'],
+            [110, 110, 110, 70, 100, 100, 90, 120]):
+            _tv.heading(c, text=h); _tv.column(c, width=w, minwidth=60, anchor='center')
+        _tv.column('room', anchor='w')
+
+        _tv.tag_configure('even', background=C['card'])
+        _tv.tag_configure('odd',  background=C['card2'])
+        _tv.tag_configure('debt', background='#2a1010')
+        _tv.tag_configure('active', background='#0a2a0a')
+
+        _loading_lbl = lbl(win, '⏳ Завантаження бронювань...', 11, color=C['text2'])
+        _loading_lbl.place(relx=0.5, rely=0.85, anchor='center')
+
+        def _load_brows():
+            try:
+                from app.utils.db import get_conn as _gc_card
+                ids_t = tuple(int(x) for x in row['all_ids'])
+                placeholders = ','.join(['%s']*len(ids_t))
+                with _gc_card() as _c2:
+                    with _c2.cursor() as _cur2:
+                        _cur2.execute(f"""
+                            SELECT r.number AS room, b.check_in, b.check_out,
+                                (b.check_out-b.check_in) AS nights,
+                                COALESCE(b.total_amount,0) AS amount,
+                                COALESCE((SELECT SUM(p.amount) FROM payments p
+                                    WHERE p.booking_id=b.id AND p.amount>0
+                                    AND COALESCE(p.note,'') NOT LIKE 'Залог%%'),0) AS paid,
+                                b.status
+                            FROM bookings b
+                            JOIN rooms r ON b.room_id=r.id
+                            WHERE b.guest_id IN ({placeholders})
+                            ORDER BY b.check_in DESC
+                        """, ids_t)
+                        rc2 = [d[0] for d in _cur2.description]
+                        brows = [dict(zip(rc2, r)) for r in _cur2.fetchall()]
+            except Exception as _be:
+                log_error('guest_card._load_brows', _be); brows = []
+
+            def _fill():
+                try: _loading_lbl.place_forget()
+                except Exception: pass
+                if not brows:
+                    lbl(win, '— немає бронювань —', 11, color=C['text2']).pack()
+                    return
+                total_n = 0; total_p = 0; total_d = 0
+                for i, br in enumerate(brows):
+                    amt   = float(br['amount'] or 0)
+                    paid  = float(br['paid'] or 0)
+                    debt  = max(amt - paid, 0)
+                    nights = int(br['nights'] or 0)
+                    total_n += nights; total_p += paid; total_d += debt
+                    status = STATUS_UA.get(br['status'], br['status'] or '—')
+                    tag = 'active' if br['status']=='checked_in' else ('debt' if debt>0 else ('odd' if i%2 else 'even'))
+                    _tv.insert('','end',tags=(tag,),values=[
+                        str(br['room'] or '—'),
+                        str(br['check_in'] or '—'),
+                        str(br['check_out'] or '—'),
+                        str(nights),
+                        f"{amt:.0f}₴",
+                        f"{paid:.0f}₴",
+                        f"{debt:.0f}₴" if debt>0 else '—',
+                        status,
+                    ])
+                # Підсумок
+                _tv.insert('','end',tags=('even',),values=[
+                    '━━ Разом', '', '', str(total_n),
+                    '', f"{total_p:.0f}₴",
+                    f"{total_d:.0f}₴" if total_d>0 else '—', f"{len(brows)} бронювань"
+                ])
+            try: win.after(0, _fill)
+            except Exception: pass
+
+        threading.Thread(target=_load_brows, daemon=True).start()
+        btn(win, '✕  Закрити', win.destroy, C['card2'], 140, height=36).pack(pady=(0,10))
 
     def _load_bookings_bg(self, gid, all_ids, load_iid, parent_iid):
         brows = []
         try:
-            from app.utils.db import query as _q
-            ids_t = tuple(all_ids)
-            if len(ids_t) == 1:
-                where = f"b.guest_id = {ids_t[0]}"; params = ()
-            else:
-                where = f"b.guest_id IN ({','.join(['%s']*len(ids_t))})"; params = ids_t
-            brows = _q(f"""
-                SELECT r.number AS room, b.status, b.check_in, b.check_out,
-                    (b.check_out-b.check_in) AS nights, COALESCE(b.total_amount,0) AS amount,
-                    COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.booking_id=b.id AND p.amount>0),0) AS paid_total,
-                    COALESCE(NULLIF(trim(b.guest_name),''),'—') AS note
-                FROM bookings b JOIN rooms r ON b.room_id=r.id
-                WHERE {where} ORDER BY b.check_in DESC
-            """, params) or []
+            from app.utils.db import get_conn as _gc_gb
+            ids_t = tuple(int(x) for x in all_ids)
+            placeholders = ','.join(['%s'] * len(ids_t))
+            with _gc_gb() as _c_gb:
+                with _c_gb.cursor() as _cur_gb:
+                    _cur_gb.execute(f"""
+                        SELECT r.number AS room, b.status, b.check_in, b.check_out,
+                            (b.check_out - b.check_in) AS nights,
+                            COALESCE(b.total_amount, 0) AS amount,
+                            COALESCE((SELECT SUM(p.amount) FROM payments p
+                                      WHERE p.booking_id=b.id AND p.amount>0
+                                      AND COALESCE(p.note,'') NOT LIKE 'Залог%%'), 0) AS paid_total,
+                            COALESCE(NULLIF(trim(b.guest_name),''), '—') AS note,
+                            g.name AS guest_name
+                        FROM bookings b
+                        JOIN rooms r ON b.room_id = r.id
+                        LEFT JOIN guests g ON b.guest_id = g.id
+                        WHERE b.guest_id IN ({placeholders})
+                        ORDER BY b.check_in DESC
+                    """, ids_t)
+                    _rc = [d[0] for d in _cur_gb.description]
+                    brows = [dict(zip(_rc, r)) for r in _cur_gb.fetchall()]
         except Exception as _e:
             log_error('GuestDatabaseFrame._load_bookings_bg', _e)
 
