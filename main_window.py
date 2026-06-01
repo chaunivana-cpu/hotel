@@ -3613,10 +3613,31 @@ class DashboardFrame(tk.Frame):
                 pass
         self.after(200, _check_test_mode_dash)
 
-        # Статистичні картки — будуємо одразу з placeholder-ами
+        # Статистичні картки — будуємо одразу зі статичним скелетом
         self._st = tk.Frame(self, bg=C['bg']); self._st.pack(fill='x', padx=20, pady=5)
-        self._loading_lbl = lbl(self._st, "⏳ Завантаження даних...", 13, color=C['text2'])
-        self._loading_lbl.pack(pady=10)
+        self._loading_lbl = lbl(self._st, "", 11, color=C['text2'])
+        self._loading_lbl.pack()
+
+        # Stat картки — одразу видимі з "—" поки грузяться дані
+        _STAT_DEFS = [
+            ('total',    'Всього',      C['card'],   '0'),
+            ('free',     'Вільних',     C['green'],  '0'),
+            ('occupied', 'Зайнятих',    C['red'],    '0'),
+            ('reserved', 'Заброньовано',C['accent'],  '0'),
+            ('cleaning', 'Прибирання',  '#e67e22',   '0'),
+            ('repair',   'Ремонт',      '#7f8c8d',   '0'),
+            ('arrivals', 'Заїзди',      '#9b59b6',   '0'),
+            ('departures','Виїзди',     '#1abc9c',   '0'),
+        ]
+        self._stat_card_lbls = {}
+        _st_cols = tk.Frame(self._st, bg=C['bg']); _st_cols.pack(fill='x', pady=4)
+        for i, (key, title, clr, val) in enumerate(_STAT_DEFS):
+            _st_cols.columnconfigure(i, weight=1)
+            cf = ctk.CTkFrame(_st_cols, fg_color=clr, corner_radius=12)
+            cf.grid(row=0, column=i, padx=4, pady=4, sticky='ew', ipady=4)
+            num_lbl = lbl(cf, val, 26, True, 'white'); num_lbl.pack(pady=(6,2))
+            ttl_lbl = lbl(cf, title, 10, color='white'); ttl_lbl.pack(pady=(0,6))
+            self._stat_card_lbls[key] = (num_lbl, ttl_lbl)
 
         lbl(self, "🗺️  Статус номерів", 15, True).pack(anchor='w', padx=20, pady=(12,4))
         # ── Placeholder для банера прострочених — прямо над сіткою плиток ──
@@ -3868,10 +3889,64 @@ class DashboardFrame(tk.Frame):
             self._loading = False
 
     def _render_error(self, msg):
+        """При помилці БД — рендеримо з кешу SQLite."""
+        import threading
+        threading.Thread(target=self._fetch_from_cache, args=(msg,), daemon=True).start()
+
+    def _fetch_from_cache(self, err_msg):
+        """Завантажує дані з SQLite кешу і рендерить дашборд в офлайн-режимі."""
         try:
-            self._loading_lbl.configure(text=f"❌ Помилка: {msg}", text_color=C['red'])
-        except Exception:
-            pass
+            from datetime import date as _date_c
+            today = _date_c.today()
+            # Номери з кешу
+            rooms = []
+            try: rooms = _get_rooms_cached() or []
+            except Exception: pass
+            # Статуси з SQLite
+            try:
+                _sq_rooms = _sqlite_select("SELECT id, status FROM rooms") or []
+                db_statuses = {int(r['id']): r.get('status','free') for r in _sq_rooms}
+                _sq_ci = _sqlite_select("SELECT DISTINCT room_id FROM bookings WHERE status='checkedin'") or []
+                checkedin_ids = {int(r['room_id']) for r in _sq_ci}
+                _sq_cf = _sqlite_select("SELECT DISTINCT room_id FROM bookings WHERE status='confirmed'") or []
+                confirmed_ids = {int(r['room_id']) for r in _sq_cf}
+                for r in rooms:
+                    rid = int(r.get('id',0))
+                    if rid in checkedin_ids: r['status'] = 'checkedin'
+                    elif rid in confirmed_ids: r['status'] = 'confirmed'
+                    else: r['status'] = db_statuses.get(rid, r.get('status','free')) or 'free'
+            except Exception: pass
+            # Прострочені
+            overdue = []
+            try:
+                _sq_ov = _sqlite_select(
+                    "SELECT b.id,r.number as room_number,g.name as guest_name,b.check_out "
+                    "FROM bookings b JOIN rooms r ON r.id=b.room_id "
+                    "LEFT JOIN guests g ON g.id=b.guest_id "
+                    "WHERE b.status='checkedin' AND b.check_out < ?", (str(today),)) or []
+                overdue = [dict(r) for r in _sq_ov]
+            except Exception: pass
+
+            try:
+                if self.winfo_exists():
+                    self.after(0, lambda: self._render_data(
+                        rooms, [], [], "офлайн", 0, 0, today, overdue, 0, 0))
+                    self.after(0, lambda m=err_msg: self._show_offline_badge(m))
+            except Exception: pass
+        except Exception as _ce:
+            log_error("Dashboard._fetch_from_cache", _ce)
+            try:
+                if self.winfo_exists():
+                    self.after(0, lambda: self._loading_lbl.configure(
+                        text="❌ БД офлайн. Немає кешу.", text_color=C['red']))
+            except Exception: pass
+        finally:
+            self._loading = False
+
+    def _show_offline_badge(self, msg):
+        try:
+            self._loading_lbl.configure(text="", text_color=C['text2'])
+        except Exception: pass
 
     def _render_data(self, rooms, arr, dep, shift_label, shift_paid, shift_dep, today, overdue_bookings=None, shift_card=0.0, shift_transfer=0.0):
         """Оновлює UI: при першому виклику будує, далі тільки оновлює дані."""
@@ -3910,23 +3985,26 @@ class DashboardFrame(tk.Frame):
         self._overdue_list = overdue_bookings or []
 
 
+        # Оновлюємо stat картки скелету (або будуємо нові якщо скелет відрізняється)
+        _STAT_KEY_MAP = {
+            'total':None,'free':None,'occupied':None,'reserved':None,
+            'cleaning':None,'repair':None,'arrivals':None,'departures':None
+        }
+        for key, title, val, color in stat_items:
+            if key in self._stat_card_lbls:
+                try:
+                    _lbl_ref = self._stat_card_lbls[key]
+                    # Скелет зберігає tuple (num_lbl, ttl_lbl), старий код — просто лейбл
+                    if isinstance(_lbl_ref, tuple):
+                        _lbl_ref[0].configure(text=str(val))
+                    else:
+                        _lbl_ref.configure(text=str(val))
+                except Exception: pass
+
         if self._first_render:
-            # ── Перший раз: будуємо картки і сітку ──
-            try:
-                self._loading_lbl.destroy()
-            except Exception:
-                pass
-            ncols = len(stat_items)
-            for col in range(ncols): self._st.columnconfigure(col, weight=1)
-            for idx, (key, title, val, color) in enumerate(stat_items):
-                c = ctk.CTkFrame(self._st, fg_color=color, corner_radius=12)
-                c.grid(row=0, column=idx, padx=3, pady=3, sticky='nsew', ipady=0)
-                # Звичайна картка — розпірки для центрування по висоті
-                tk.Frame(c, bg=color, height=10).pack()
-                num_l = lbl(c, str(val), 14, True, 'white'); num_l.pack(pady=(0,1))
-                lbl(c, title, 8, color='white').pack()
-                tk.Frame(c, bg=color, height=10).pack()
-                self._stat_card_lbls[key] = num_l
+            # ── Перший раз: будуємо сітку плиток ──
+            try: self._loading_lbl.configure(text="")
+            except Exception: pass
 
             # Сітка номерів — на весь екран без зовнішнього скролу
             self._main_canvas = None  # не використовується більше
