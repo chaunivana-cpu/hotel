@@ -18643,329 +18643,129 @@ class SettingsFrame(tk.Frame):
         self._exp_btn = btn(bf3, "📤 Експортувати в Excel", self._do_export, C['accent'], 220)
         self._exp_btn.pack(side='left', padx=4)
 
-        # ── Очищення каси ─────────────────────────────────
+        # ── Очищення бази для використання ──────────────────
         cc = card(scroll); cc.pack(fill='x', padx=10, pady=5)
-        lbl(cc, "🗑  Очищення каси", 14, True).pack(anchor='w', padx=12, pady=(12,5))
-        lbl(cc, "Видаляє платежі з БД за обраний період. Бронювання і гості залишаються.", 11, color=C['text2']).pack(anchor='w', padx=12, pady=(0,5))
-        lbl(cc, "⚠️ Перед очищенням зробіть резервну копію!", 11, color=C['yellow']).pack(anchor='w', padx=12, pady=(0,8))
+        lbl(cc, "🗑  Очищення бази для використання", 14, True).pack(anchor='w', padx=12, pady=(12,5))
+        lbl(cc, "Видаляє ВСІ тестові дані: бронювання, платежі, гостей, ресторан, зміни.\nНомери і налаштування залишаються.", 11, color=C['text2']).pack(anchor='w', padx=12, pady=(0,4))
+        lbl(cc, "⚠️ Перед очищенням зробіть резервну копію! Дію не можна відмінити!", 11, color=C['yellow']).pack(anchor='w', padx=12, pady=(0,8))
 
-        _cc_dr = tk.Frame(cc, bg=C['card']); _cc_dr.pack(fill='x', padx=12, pady=4)
-        lbl(_cc_dr, "Від:", 11, color=C['text2']).pack(side='left', padx=(0,4))
-        import datetime as _dt2
-        self._cc_from = ent(_cc_dr, "РРРР-ММ-ДД", w=120); self._cc_from.pack(side='left', padx=4)
-        self._cc_from.insert(0, _dt2.date.today().replace(day=1).isoformat())
-        lbl(_cc_dr, "До:", 11, color=C['text2']).pack(side='left', padx=(8,4))
-        self._cc_to = ent(_cc_dr, "РРРР-ММ-ДД", w=120); self._cc_to.pack(side='left', padx=4)
-        self._cc_to.insert(0, _dt2.date.today().isoformat())
-
-        _cc_chk = tk.Frame(cc, bg=C['card']); _cc_chk.pack(fill='x', padx=12, pady=4)
-        self._cc_pay        = ctk.BooleanVar(value=True)
-        self._cc_rest       = ctk.BooleanVar(value=True)
-        self._cc_shifts     = ctk.BooleanVar(value=False)
-        self._cc_rooms      = ctk.BooleanVar(value=False)
-        self._cc_svcs       = ctk.BooleanVar(value=False)
-        self._cc_deps       = ctk.BooleanVar(value=False)
-        self._cc_visits     = ctk.BooleanVar(value=False)
-        self._cc_checkedin  = ctk.BooleanVar(value=False)
-        self._cc_checkedout = ctk.BooleanVar(value=False)
-        self._cc_booked     = ctk.BooleanVar(value=False)
-        _chk_opts = dict(fg_color=C['red'], text_color=C['text'], font=('Segoe UI',12))
-        ctk.CTkCheckBox(_cc_chk, text="💳 Платежі бронювань", variable=self._cc_pay,   **_chk_opts).pack(side='left', padx=8)
-        ctk.CTkCheckBox(_cc_chk, text="🍽 Платежі ресторану", variable=self._cc_rest,  **_chk_opts).pack(side='left', padx=8)
-        ctk.CTkCheckBox(_cc_chk, text="📊 Скинути зміни (shifts)", variable=self._cc_shifts, **_chk_opts).pack(side='left', padx=8)
-        _cc_chk2 = tk.Frame(cc, bg=C['card']); _cc_chk2.pack(fill='x', padx=12, pady=(0,4))
-        ctk.CTkCheckBox(_cc_chk2, text="🏠 Дохід номери",   variable=self._cc_rooms,  **_chk_opts).pack(side='left', padx=8)
-        ctk.CTkCheckBox(_cc_chk2, text="🛎 Дохід послуги",  variable=self._cc_svcs,   **_chk_opts).pack(side='left', padx=8)
-        ctk.CTkCheckBox(_cc_chk2, text="🔒 Залоги",         variable=self._cc_deps,   **_chk_opts).pack(side='left', padx=8)
-        ctk.CTkCheckBox(_cc_chk2, text="👥 Відвідувачі",    variable=self._cc_visits, **_chk_opts).pack(side='left', padx=8)
-        _cc_chk3 = tk.Frame(cc, bg=C['card']); _cc_chk3.pack(fill='x', padx=12, pady=(0,6))
-        ctk.CTkCheckBox(_cc_chk3, text="🛎 Видалити заселені бронювання",  variable=self._cc_checkedin,  **_chk_opts).pack(side='left', padx=8)
-        ctk.CTkCheckBox(_cc_chk3, text="✅ Видалити виселені бронювання",  variable=self._cc_checkedout, **_chk_opts).pack(side='left', padx=8)
-        ctk.CTkCheckBox(_cc_chk3, text="📅 Видалити заброньовані",         variable=self._cc_booked,     **_chk_opts).pack(side='left', padx=8)
-
-        _cc_bf = tk.Frame(cc, bg=C['card']); _cc_bf.pack(fill='x', padx=12, pady=(4,12))
         self._cc_status = lbl(cc, "", 11, color=C['green'])
-        self._cc_status.pack(anchor='w', padx=12, pady=(0,8))
+        self._cc_status.pack(anchor='w', padx=12, pady=(0,4))
 
-        def _do_cash_clear():
-            import datetime as _dtcc, threading as _tcc
-            try:
-                d_from = _dtcc.date.fromisoformat(self._cc_from.get().strip())
-                d_to   = _dtcc.date.fromisoformat(self._cc_to.get().strip())
-            except ValueError:
-                messagebox.showerror("❌", "Невірний формат дати. Використовуйте РРРР-ММ-ДД")
+        def _do_full_db_reset():
+            import threading as _tcc
+            if not messagebox.askyesno(
+                "🗑 Очищення бази",
+                "Буде видалено ВСЕ:\n"
+                "• Всі бронювання (заселені, виселені, скасовані)\n"
+                "• Всі платежі\n"
+                "• Всі гості\n"
+                "• Всі ресторанні замовлення\n"
+                "• Всі зміни (shifts)\n"
+                "• Всі залоги\n"
+                "\nНомери, меню, категорії, налаштування — залишаться.\n\n"
+                "❗❗ Дію НЕМОЖЛИВО відмінити!\n"
+                "Резервну копію зроблено?",
+                default='no'
+            ):
                 return
-            if d_to < d_from:
-                messagebox.showerror("❌", "Дата 'До' не може бути раніше дати 'Від'")
+            if not messagebox.askyesno(
+                "⚠️ Останнє підтвердження",
+                "Ви ВПЕВНЕНІ що хочете видалити ВСІ дані?\n\nНатисніть ТАК тільки якщо впевнені.",
+                default='no'
+            ):
                 return
-            do_pay        = self._cc_pay.get()
-            do_rest       = self._cc_rest.get()
-            do_shift      = self._cc_shifts.get()
-            do_rooms      = self._cc_rooms.get()
-            do_svcs       = self._cc_svcs.get()
-            do_deps       = self._cc_deps.get()
-            do_visits     = self._cc_visits.get()
-            do_checkedin  = self._cc_checkedin.get()
-            do_checkedout = self._cc_checkedout.get()
-            do_booked     = self._cc_booked.get()
-            if not any([do_pay, do_rest, do_shift, do_rooms, do_svcs, do_deps, do_visits,
-                        do_checkedin, do_checkedout, do_booked]):
-                messagebox.showwarning("", "Оберіть хоча б один тип даних для очищення")
-                return
-            parts = []
-            if do_pay:        parts.append("платежі бронювань")
-            if do_rest:       parts.append("платежі ресторану")
-            if do_rooms:      parts.append("дохід номери")
-            if do_svcs:       parts.append("дохід послуги")
-            if do_deps:       parts.append("залоги")
-            if do_visits:     parts.append("відвідувачі")
-            if do_shift:      parts.append("зміни (shifts)")
-            if do_checkedin:  parts.append("заселені бронювання (checkedin)")
-            if do_checkedout: parts.append("виселені бронювання (checkedout)")
-            if do_booked:     parts.append("заброньовані (confirmed/booked)")
-            if not messagebox.askyesno("🗑 Очистити касу",
-                f"Видалити з бази:\n• " + "\n• ".join(parts) +
-                f"\n\nза {d_from} — {d_to}?\n\n❗ Дію не можна відмінити!\nРезервну копію зроблено?"):
-                return
-            self._cc_status.configure(text="⏳ Очищення...", text_color=C['yellow'])
+
+            self._cc_status.configure(text="⏳ Очищення бази...", text_color=C['yellow'])
             _cc_clear_btn.configure(state='disabled')
 
-            # Анімований тікер щоб UI не здавався замороженим під час роботи БД
-            _ticks = ['⏳ Очищення.  ', '⏳ Очищення.. ', '⏳ Очищення...']
-            _tick_idx = [0]
-            def _tick():
-                try:
-                    self._cc_status.configure(text=_ticks[_tick_idx[0] % 3], text_color=C['yellow'])
-                    _tick_idx[0] += 1
-                    self._cc_tick_id = self.after(600, _tick)
-                except Exception:
-                    pass
-            self._cc_tick_id = self.after(600, _tick)
-
-            def _stop_tick():
-                try: self.after_cancel(self._cc_tick_id)
-                except Exception: pass
-
             def _bg():
+                results = {}
                 try:
-                    import psycopg2 as _pg, os as _occ, json as _jcc
-                    _db_json = None
-                    for _cp in [
-                        _occ.path.join(_occ.path.dirname(_occ.path.abspath(__file__)), '..', '..', 'config', 'db.json'),
-                        _occ.path.join(_occ.path.dirname(_occ.path.abspath(__file__)), '..', 'config', 'db.json'),
-                    ]:
-                        if _occ.path.exists(_cp): _db_json = _cp; break
-                    if not _db_json: raise RuntimeError("config/db.json не знайдено")
-                    with open(_db_json) as _ff: _cfg2 = _jcc.load(_ff)
-                    _conn = _pg.connect(
-                        host=_cfg2.get('host','localhost'), port=int(_cfg2.get('port',5432)),
-                        dbname=_cfg2.get('dbname', _cfg2.get('database','hotel')), user=_cfg2.get('user','hotel'),
-                        password=_cfg2.get('password',''), connect_timeout=15,
-                        options="-c statement_timeout=60000")  # 60с максимум на запит
+                    # Використовуємо get_conn — найнадійніший спосіб
+                    from app.utils.db import get_conn as _gc_rst
+                    _conn = _gc_rst()
                     _conn.autocommit = False
-                    _del_pay = _del_rest = _del_shifts = 0
-                    _del_rooms = _del_svcs = _del_deps = _del_visits = 0
-                    _del_checkedin = _del_checkedout = _del_booked = 0
                     try:
                         with _conn.cursor() as _cur:
-                            # Блокуємо автосинхронізацію кешу на час очищення
-                            _cur.execute("SET lock_timeout = '10s'")
-
-                            # ── Платежі бронювань ──
-                            # Видаляємо платежі виселених/скасованих бронювань (не чіпаємо активні)
-                            if do_pay:
-                                _cur.execute("""DELETE FROM payments
-                                    WHERE DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Kyiv')
-                                          BETWEEN %s AND %s
-                                      AND booking_id IS NOT NULL
-                                      AND NOT EXISTS (
-                                          SELECT 1 FROM bookings b
-                                          WHERE b.id = payments.booking_id
-                                            AND b.status IN ('checkedin','confirmed','booked')
-                                      )""",
-                                    (d_from, d_to))
-                                _del_pay = _cur.rowcount
-
-                            # ── Платежі ресторану ──
-                            if do_rest:
-                                _cur.execute("""DELETE FROM payments
-                                    WHERE DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Kyiv')
-                                          BETWEEN %s AND %s
-                                      AND booking_id IS NULL
-                                      AND (note ILIKE '%%ресторан%%' OR note ILIKE '%%restaurant%%'
-                                           OR note ILIKE '%%замовлення%%')""",
-                                    (d_from, d_to))
-                                _del_rest = _cur.rowcount
-                                # Ресторанні замовлення (спочатку items, потім orders — FK)
-                                _cur.execute("""DELETE FROM restaurant_order_items WHERE order_id IN (
-                                    SELECT id FROM restaurant_orders
-                                    WHERE status='closed'
-                                      AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Kyiv')
-                                          BETWEEN %s AND %s)""", (d_from, d_to))
-                                _cur.execute("""DELETE FROM restaurant_orders
-                                    WHERE status='closed'
-                                      AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Kyiv')
-                                          BETWEEN %s AND %s""", (d_from, d_to))
-
-                            # ── Скинути зміни (обнулити opening_deposits) ──
-                            if do_shift:
-                                _cur.execute("""UPDATE shifts SET opening_deposits=0
-                                    WHERE status='closed'
-                                      AND DATE(opened_at AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Kyiv')
-                                          BETWEEN %s AND %s""", (d_from, d_to))
-                                _del_shifts = _cur.rowcount
-
-                            # ── Дохід номери ──
-                            # Тільки якщо do_pay=False — інакше платежі вже видалені вище
-                            if do_rooms and not do_pay:
-                                _cur.execute("""DELETE FROM payments
-                                    WHERE DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Kyiv')
-                                          BETWEEN %s AND %s
-                                      AND booking_id IS NOT NULL
-                                      AND amount > 0
-                                      AND (note IS NULL OR (
-                                          note NOT ILIKE '%%залог%%' AND note NOT ILIKE '%%deposit%%'
-                                          AND note NOT ILIKE '%%послуг%%' AND note NOT ILIKE '%%service%%'))
-                                      AND NOT EXISTS (
-                                          SELECT 1 FROM bookings b
-                                          WHERE b.id = payments.booking_id
-                                            AND b.status IN ('checkedin','confirmed','booked'))""",
-                                    (d_from, d_to))
-                                _del_rooms = _cur.rowcount
-
-                            # ── Дохід послуги ──
-                            # Тільки якщо do_pay=False — щоб не дублювати
-                            if do_svcs and not do_pay:
-                                _cur.execute("""DELETE FROM payments
-                                    WHERE DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Kyiv')
-                                          BETWEEN %s AND %s
-                                      AND booking_id IS NULL
-                                      AND amount > 0
-                                      AND (note ILIKE '%%послуг%%' OR note ILIKE '%%service%%'
-                                           OR note ILIKE '%%баня%%' OR note ILIKE '%%бесідк%%'
-                                           OR note ILIKE '%%басейн%%')
-                                      AND NOT (note ILIKE '%%ресторан%%' OR note ILIKE '%%restaurant%%'
-                                               OR note ILIKE '%%замовлення%%')""",
-                                    (d_from, d_to))
-                                _del_svcs = _cur.rowcount
-
-                            # ── Залоги ──
-                            if do_deps:
-                                _cur.execute("""DELETE FROM payments
-                                    WHERE DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Kyiv')
-                                          BETWEEN %s AND %s
-                                      AND (note ILIKE '%%залог%%' OR note ILIKE '%%deposit%%'
-                                           OR note ILIKE '%%повернення залог%%')""",
-                                    (d_from, d_to))
-                                _del_deps = _cur.rowcount
-
-                            # ── Відвідувачі ──
-                            # Дані зберігаються у таблиці bookings (окремої таблиці visitors немає).
-                            # Видаляємо лише виселені/скасовані бронювання без платежів за період.
-                            if do_visits:
-                                _cur.execute("""DELETE FROM bookings
-                                    WHERE status IN ('checkedout','cancelled')
-                                      AND DATE(COALESCE(check_out, check_in)
-                                              AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Kyiv')
-                                          BETWEEN %s AND %s
-                                      AND NOT EXISTS (
-                                          SELECT 1 FROM payments p WHERE p.booking_id = bookings.id
-                                      )""",
-                                    (d_from, d_to))
-                                _del_visits = _cur.rowcount
-
-                            # ── Заселені бронювання (checkedin) ──
-                            if do_checkedin:
-                                _cur.execute(
-                                    "DELETE FROM payments WHERE booking_id IN ("
-                                    "SELECT id FROM bookings WHERE status = 'checkedin'"
-                                    " AND DATE(check_in AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Kyiv')"
-                                    " BETWEEN %s AND %s)",
-                                    (d_from, d_to))
-                                _cur.execute(
-                                    "DELETE FROM bookings WHERE status = 'checkedin'"
-                                    " AND DATE(check_in AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Kyiv')"
-                                    " BETWEEN %s AND %s",
-                                    (d_from, d_to))
-                                _del_checkedin = _cur.rowcount
-
-                            # ── Виселені бронювання (checkedout) ──
-                            if do_checkedout:
-                                _cur.execute(
-                                    "DELETE FROM payments WHERE booking_id IN ("
-                                    "SELECT id FROM bookings WHERE status = 'checkedout'"
-                                    " AND DATE(check_out AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Kyiv')"
-                                    " BETWEEN %s AND %s)",
-                                    (d_from, d_to))
-                                _cur.execute(
-                                    "DELETE FROM bookings WHERE status = 'checkedout'"
-                                    " AND DATE(check_out AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Kyiv')"
-                                    " BETWEEN %s AND %s",
-                                    (d_from, d_to))
-                                _del_checkedout = _cur.rowcount
-
-                            # ── Заброньовані (confirmed / booked) ──
-                            if do_booked:
-                                _cur.execute(
-                                    "DELETE FROM payments WHERE booking_id IN ("
-                                    "SELECT id FROM bookings WHERE status IN ('confirmed','booked')"
-                                    " AND DATE(check_in AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Kyiv')"
-                                    " BETWEEN %s AND %s)",
-                                    (d_from, d_to))
-                                _cur.execute(
-                                    "DELETE FROM bookings WHERE status IN ('confirmed','booked')"
-                                    " AND DATE(check_in AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Kyiv')"
-                                    " BETWEEN %s AND %s",
-                                    (d_from, d_to))
-                                _del_booked = _cur.rowcount
-
+                            # Знімаємо обмеження FK тимчасово через порядок видалення
+                            try: _cur.execute("DELETE FROM restaurant_order_items"); results['ресторан позиції'] = _cur.rowcount
+                            except Exception: _conn.rollback(); _conn.autocommit = False
+                            try: _cur.execute("DELETE FROM restaurant_orders"); results['ресторан замовлення'] = _cur.rowcount
+                            except Exception: pass
+                            try: _cur.execute("DELETE FROM payments"); results['платежі'] = _cur.rowcount
+                            except Exception: pass
+                            try: _cur.execute("DELETE FROM bookings"); results['бронювання'] = _cur.rowcount
+                            except Exception: pass
+                            try: _cur.execute("DELETE FROM guests"); results['гості'] = _cur.rowcount
+                            except Exception: pass
+                            try: _cur.execute("DELETE FROM shifts"); results['зміни'] = _cur.rowcount
+                            except Exception: pass
+                            try:
+                                _cur.execute("UPDATE rooms SET status='free' WHERE status != 'free'")
+                                results['номери скинуто'] = _cur.rowcount
+                            except Exception: pass
+                            for _tbl in ('cleaning_log', 'cleaning_tasks', 'cleanings'):
+                                try: _cur.execute(f"DELETE FROM {_tbl}"); results['прибирання'] = _cur.rowcount; break
+                                except Exception: pass
                         _conn.commit()
                     except Exception as _ce:
-                        _conn.rollback(); raise _ce
+                        try: _conn.rollback()
+                        except Exception: pass
+                        raise _ce
                     finally:
-                        _conn.close()
-                    # Оновити кеш
+                        try: _conn.close()
+                        except Exception: pass
+
+                    # Очищаємо SQLite кеш
                     try:
-                        from app.utils.db_cache import _cache_instance as _ci
-                        if _ci: import threading; threading.Thread(target=_ci.full_sync, daemon=True).start()
+                        import sqlite3 as _sq3, os as _osq
+                        for _sp in [
+                            _occ.path.join(_occ.path.dirname(_occ.path.abspath(__file__)), '..', '..', '_internal', 'data', 'hotel_local_cache.db'),
+                            _occ.path.join(_occ.path.dirname(_occ.path.abspath(__file__)), '..', '_internal', 'data', 'hotel_local_cache.db'),
+                        ]:
+                            if _osq.path.exists(_sp):
+                                _sqc = _sq3.connect(_sp)
+                                for _t in ('bookings','payments','guests','restaurant_orders','restaurant_order_items','shifts'):
+                                    try: _sqc.execute(f"DELETE FROM {_t}")
+                                    except Exception: pass
+                                _sqc.commit(); _sqc.close()
+                                results['SQLite кеш'] = 'очищено'
+                                break
                     except Exception: pass
-                    _summary = []
-                    if _del_pay:        _summary.append(f"платежів: {_del_pay}")
-                    if _del_rest:       _summary.append(f"ресторан: {_del_rest}")
-                    if _del_rooms:      _summary.append(f"дохід номери: {_del_rooms}")
-                    if _del_svcs:       _summary.append(f"послуги: {_del_svcs}")
-                    if _del_deps:       _summary.append(f"залоги: {_del_deps}")
-                    if _del_visits:     _summary.append(f"відвідувачі: {_del_visits}")
-                    if _del_shifts:     _summary.append(f"змін: {_del_shifts}")
-                    if _del_checkedin:  _summary.append(f"заселені: {_del_checkedin}")
-                    if _del_checkedout: _summary.append(f"виселені: {_del_checkedout}")
-                    if _del_booked:     _summary.append(f"заброньовані: {_del_booked}")
-                    _msg = ", ".join(_summary) if _summary else "нічого не видалено"
+
+                    try:
+                        _sync_mgr._last_check = 0.0
+                    except Exception: pass
+
+                    _msg = ", ".join(f"{k}: {v}" for k, v in results.items())
                     def _done():
-                        _stop_tick()
-                        self._cc_status.configure(text=f"✓ Очищено за {d_from}–{d_to}: {_msg}", text_color=C['green'])
-                        messagebox.showinfo("✅ Касу очищено", f"Видалено: {_msg}")
+                        self._cc_status.configure(text=f"✓ Базу очищено! {_msg}", text_color=C['green'])
+                        messagebox.showinfo("✅ Готово",
+                            f"База успішно очищена!\n\n" +
+                            "\n".join(f"• {k}: {v}" for k,v in results.items()) +
+                            "\n\nПрограма готова до роботи.")
                         try: _cc_clear_btn.configure(state='normal')
                         except Exception: pass
                     self.after(0, _done)
                 except Exception as _e:
-                    log_error("_do_cash_clear", _e)
-                    def _err():
-                        _stop_tick()
-                        self._cc_status.configure(text=f"✗ Помилка: {_e}", text_color=C['red'])
-                        messagebox.showerror("Помилка", str(_e))
+                    log_error("_do_full_db_reset", _e)
+                    _e_str = str(_e)
+                    def _err(es=_e_str):
+                        try: self._cc_status.configure(text=f"✗ Помилка: {es[:60]}", text_color=C['red'])
+                        except Exception: pass
+                        messagebox.showerror("Помилка очищення бази", es)
                         try: _cc_clear_btn.configure(state='normal')
                         except Exception: pass
-                    self.after(0, _err)
+                    try: self.after(0, _err)
+                    except Exception: messagebox.showerror("Помилка", _e_str)
+
             _tcc.Thread(target=_bg, daemon=True).start()
 
-        _cc_clear_btn = btn(_cc_bf, "🗑 Очистити касу", _do_cash_clear, C['red'], 200, height=38)
+        _cc_bf = tk.Frame(cc, bg=C['card']); _cc_bf.pack(fill='x', padx=12, pady=(4,14))
+        _cc_clear_btn = btn(_cc_bf, "🗑  Очистити базу для використання", _do_full_db_reset, C['red'], 280, height=42)
         _cc_clear_btn.pack(side='left', padx=4)
 
-        # ── Тестовий режим ────────────────────────────────
-        # Тільки для адміна (роль вже перевірена на початку _backup_tab)
-        tm = card(scroll); tm.pack(fill='x', padx=10, pady=5)
-        _tm_title_row = tk.Frame(tm, bg=C['card']); _tm_title_row.pack(fill='x', padx=12, pady=(12,4))
         lbl(_tm_title_row, "🧪  Тестовий режим", 14, True).pack(side='left')
         # Живий статус-бейдж
         self._tm_badge = lbl(_tm_title_row, "", 11, color=C['yellow'])
