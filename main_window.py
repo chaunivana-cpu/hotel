@@ -1895,39 +1895,81 @@ def _ensure_qrcode():
         log_error("[QR] auto-install error", _eqi)
     return False
 
+_QRCODE_AUTOINSTALL_TRIED = [False]  # щоб не намагатись ставити бібліотеку на кожному чеку повторно
+
+def _draw_qr_matrix(canvas, url, size):
+    """Малює власне QR-матрицю на вже існуючому canvas (qrcode має бути встановлений)."""
+    import qrcode as _qrc
+    qr = _qrc.QRCode(version=None,
+                     error_correction=_qrc.constants.ERROR_CORRECT_M,
+                     box_size=1, border=2)
+    qr.add_data(url); qr.make(fit=True)
+    matrix = qr.get_matrix()
+    n = len(matrix)
+    cell = size / n
+    for r, row in enumerate(matrix):
+        for c, v in enumerate(row):
+            if v:
+                x0 = c * cell; y0 = r * cell
+                canvas.create_rectangle(x0, y0, x0+cell, y0+cell,
+                                        fill='black', outline='')
+
 def _make_qr_canvas(parent, url, size=180):
-    """Малює QR-код на tk.Canvas (не потребує PIL/Pillow)."""
+    """Малює QR-код на tk.Canvas (не потребує PIL/Pillow). НЕ блокує головний
+    потік: якщо бібліотеки qrcode нема, встановлення (pip) запускається у
+    фоновому потоці, а не прямо в UI-колбеку — інакше вікно програми
+    "зависало" на весь час встановлення (до 60с) щоразу, як показувався чек."""
     canvas = tk.Canvas(parent, width=size, height=size, bg='white',
                        highlightthickness=1, highlightbackground='#cccccc')
     def _draw():
-        if not _ensure_qrcode():
-            canvas.create_text(size//2, size//2,
-                               text="QR\n(pip install qrcode)",
-                               justify='center', fill='gray',
-                               font=('Segoe UI', 9))
-            return
         try:
-            import qrcode as _qrc
-            qr = _qrc.QRCode(version=None,
-                             error_correction=_qrc.constants.ERROR_CORRECT_M,
-                             box_size=1, border=2)
-            qr.add_data(url); qr.make(fit=True)
-            matrix = qr.get_matrix()
-            n = len(matrix)
-            cell = size / n
-            for r, row in enumerate(matrix):
-                for c, v in enumerate(row):
-                    if v:
-                        x0 = c * cell; y0 = r * cell
-                        canvas.create_rectangle(x0, y0, x0+cell, y0+cell,
-                                                fill='black', outline='')
+            import qrcode as _qrc_probe  # noqa: F401 — лише перевірка наявності
+            _draw_qr_matrix(canvas, url, size)
+            return
+        except ImportError:
+            pass
         except Exception as _eqd:
             canvas.create_text(size//2, size//2,
                                text=f"QR помилка\n{str(_eqd)[:40]}",
                                justify='center', fill='red',
                                font=('Segoe UI', 8))
+            return
+        # qrcode не встановлений — показуємо заглушку одразу, а встановлення
+        # (якщо ще не пробували в цьому запуску програми) робимо у фоні.
+        canvas.create_text(size//2, size//2,
+                           text="QR\n(pip install qrcode)",
+                           justify='center', fill='gray',
+                           font=('Segoe UI', 9))
+        if _QRCODE_AUTOINSTALL_TRIED[0]:
+            return
+        _QRCODE_AUTOINSTALL_TRIED[0] = True
+        import threading
+        def _bg_install():
+            ok = _ensure_qrcode()
+            def _after():
+                try:
+                    if not canvas.winfo_exists(): return
+                except Exception:
+                    return
+                try: canvas.delete('all')
+                except Exception: return
+                if ok:
+                    try:
+                        _draw_qr_matrix(canvas, url, size)
+                        return
+                    except Exception:
+                        pass
+                canvas.create_text(size//2, size//2,
+                                   text="QR\n(pip install qrcode)",
+                                   justify='center', fill='gray',
+                                   font=('Segoe UI', 9))
+            try: canvas.after(0, _after)
+            except Exception: pass
+        threading.Thread(target=_bg_install, daemon=True).start()
     canvas.after(100, _draw)
     return canvas
+
+
 
 def _make_qr_ascii(url, width=36):
     """Генерує ASCII-представлення QR-коду для POS-принтера."""
@@ -2336,28 +2378,6 @@ def _attach_win_settings_menu(win, cache_key, default_size="500x400"):
 
     try: win.after(100, lambda: _bind_recursive(win))
     except Exception: pass
-    """Центрує вікно та підганяє розмір під екран."""
-    try:
-        root = parent.winfo_toplevel() if parent else win
-        root.update_idletasks()
-        sw = root.winfo_screenwidth()
-        sh = root.winfo_screenheight()
-        w = min(w, sw - 40)
-        h = min(h, sh - 40)
-        if parent:
-            rx = root.winfo_rootx(); ry = root.winfo_rooty()
-            rw = root.winfo_width(); rh = root.winfo_height()
-            x = rx + (rw - w) // 2
-            y = ry + (rh - h) // 2
-        else:
-            x = (sw - w) // 2; y = (sh - h) // 2
-        x = max(0, min(x, sw - w))
-        y = max(0, min(y, sh - h))
-        win.geometry(f"{w}x{h}+{x}+{y}")
-        win.resizable(True, True)
-        win.minsize(min(w, 400), min(h, 300))
-    except Exception:
-        win.geometry(f"{w}x{h}")
 
 def row_frm(parent):
     f = ctk.CTkFrame(parent, fg_color='transparent')
@@ -3370,65 +3390,95 @@ class HotelApp(ctk.CTk):
         if not getattr(self, '_db_check_running', False):
             return
         import threading, time as _time
-        
-        # 🔧 ВИПРАВЛЕННЯ: Добавити флаг для вимкнення ping якщо він вішає
+
         _ping_timeout_count = getattr(self, '_ping_timeout_count', 0)
-        if _ping_timeout_count > 2:
-            # Якщо ping вішав більше 2 разів - вимкнемо його
-            self._db_lbl.configure(text=" 🗄 БД: ping вимкнено", text_color=C['yellow'])
+        _ping_disabled = _ping_timeout_count > 2
+
+        if _ping_disabled:
+            # Пінг вимкнено (стабільно не відповідає) — все одно НЕ припиняємо
+            # спроби назавжди, а рідше пробуємо знову (раз на хвилину), інакше
+            # бейдж навіки лишається на "ping вимкнено" навіть якщо мережа
+            # згодом відновиться.
+            try:
+                self._db_lbl.configure(text=" 🗄 БД: ping вимкнено", text_color=C['yellow'])
+            except Exception:
+                pass
+            if getattr(self, '_db_check_running', False):
+                self.after(60000, self._check_db_status)
             return
-        
+
+        # Токен цього циклу перевірки — щоб watchdog знав, чи результат вже
+        # прийшов, і не було двох конкуруючих оновлень одночасно.
+        _gen = getattr(self, '_db_ping_gen', 0) + 1
+        self._db_ping_gen = _gen
+
         def _ping():
             try:
                 from app.utils.db import get_conn
                 t0 = _time.perf_counter()
-                # 🔧 ВИПРАВЛЕННЯ: Додати timeout щоб уникнути зависання
-                try:
-                    import socket
-                    socket.setdefaulttimeout(2)  # 2 секунди timeout для всіх операцій
-                except Exception:
-                    pass
-                
                 with get_conn() as _c:
                     with _c.cursor() as _cur:
                         _cur.execute("SELECT 1")
                 ms = int((_time.perf_counter() - t0) * 1000)
-                self._ping_timeout_count = 0  # Reset лічильник успішних ping
+                self._ping_timeout_count = 0
                 return True, ms
-            except Exception as e:
-                #記錄timeout
+            except Exception:
                 self._ping_timeout_count = _ping_timeout_count + 1
                 return False, 0
-        
-        def _run():
-            ok, ms = _ping()
-            def _update_ui():
-                try:
-                    if not self.winfo_exists(): return
-                    if ok:
-                        clr = C['green'] if ms < 50 else C['yellow'] if ms < 200 else C['red']
-                        self._db_dot.configure(text_color=clr)
-                        self._db_lbl.configure(text=" 🗄 БД: підключено", text_color=C['green'])
-                        self._db_ping_lbl.configure(text=f"{ms}ms", text_color=clr)
-                        try: self._db_badge.configure(fg_color='#162416')
-                        except Exception: pass
-                    else:
-                        self._db_dot.configure(text_color=C['red'])
-                        self._db_lbl.configure(text=" 🗄 БД: немає зв'язку", text_color=C['red'])
-                        self._db_ping_lbl.configure(text="✗", text_color=C['red'])
-                        try: self._db_badge.configure(fg_color='#2e1414')
-                        except Exception: pass
-                    if getattr(self, '_db_check_running', False):
-                        self.after(10000, self._check_db_status)
-                except Exception:
-                    pass
+
+        def _apply_result(ok, ms):
             try:
-                if self.winfo_exists():
-                    self.after(0, _update_ui)
+                if getattr(self, '_db_ping_gen', None) != _gen:
+                    return  # застарілий результат (watchdog вже оновив стан)
+                if not self.winfo_exists(): return
+                if ok:
+                    clr = C['green'] if ms < 50 else C['yellow'] if ms < 200 else C['red']
+                    self._db_dot.configure(text_color=clr)
+                    self._db_lbl.configure(text=" 🗄 БД: підключено", text_color=C['green'])
+                    self._db_ping_lbl.configure(text=f"{ms}ms", text_color=clr)
+                    try: self._db_badge.configure(fg_color='#162416')
+                    except Exception: pass
+                else:
+                    self._db_dot.configure(text_color=C['red'])
+                    self._db_lbl.configure(text=" 🗄 БД: немає зв'язку", text_color=C['red'])
+                    self._db_ping_lbl.configure(text="✗", text_color=C['red'])
+                    try: self._db_badge.configure(fg_color='#2e1414')
+                    except Exception: pass
+                if getattr(self, '_db_check_running', False):
+                    self.after(10000, self._check_db_status)
             except Exception:
                 pass
-        # 🔧 ВИПРАВЛЕННЯ: Запустити ping в окремому потоці з daemon=True для автоматичного завершення
+
+        def _run():
+            ok, ms = _ping()
+            # НЕ звертаємось до self.winfo_exists() з фонового потоку — це
+            # ненадійно для Tkinter. Просто плануємо оновлення на головному
+            # потоці й перевіряємо існування вікна вже там.
+            try:
+                self.after(0, lambda: _apply_result(ok, ms))
+            except Exception:
+                pass
         threading.Thread(target=_run, daemon=True).start()
+
+        # Watchdog: якщо за 7с потік ping ще не відповів (наприклад завис
+        # усередині get_conn() без спрацювання жодного з таймаутів) — не
+        # лишаємо бейдж навіки на "перевірка...", а примусово показуємо
+        # помилку зв'язку й плануємо наступну спробу.
+        def _watchdog():
+            try:
+                if getattr(self, '_db_ping_gen', None) != _gen:
+                    return  # результат уже прийшов вчасно
+                if not self.winfo_exists(): return
+                self._db_dot.configure(text_color=C['red'])
+                self._db_lbl.configure(text=" 🗄 БД: тайм-аут перевірки", text_color=C['red'])
+                self._db_ping_lbl.configure(text="✗", text_color=C['red'])
+                try: self._db_badge.configure(fg_color='#2e1414')
+                except Exception: pass
+                if getattr(self, '_db_check_running', False):
+                    self.after(10000, self._check_db_status)
+            except Exception:
+                pass
+        self.after(7000, _watchdog)
 
     def _build(self):
         # Глобальний скрол колесом миші для всього додатку
@@ -4674,8 +4724,9 @@ class DashboardFrame(tk.Frame):
             def _build_tile_overlay():
                 try:
                     if hasattr(self, '_overdue_tile_overlay') and self._overdue_tile_overlay:
-                        try: self._overdue_tile_overlay.place_forget()
+                        try: self._overdue_tile_overlay.destroy()
                         except Exception: pass
+                        self._overdue_tile_overlay = None
                     overdue = self._overdue_list
                     if not overdue: return
                     strictly = [b for b in overdue if b.get('days_late', 0) > 0]
@@ -4777,7 +4828,7 @@ class DashboardFrame(tk.Frame):
             if hasattr(self, '_overdue_tile_overlay'):
                 try:
                     if self._overdue_tile_overlay:
-                        self._overdue_tile_overlay.place_forget()
+                        self._overdue_tile_overlay.destroy()
                     self._overdue_tile_overlay = None
                 except Exception: pass
             def _rebuild_overlay():
@@ -8737,7 +8788,7 @@ class ChessFrame(tk.Frame):
                     with _co.cursor() as _cco:
                         _cco.execute(
                             """SELECT id, room_id, guest_id, check_in, check_out, status,
-                                      total_amount, note
+                                      total_amount, notes
                                FROM bookings
                                WHERE room_id=%s AND status IN ('checkedin','confirmed')
                                ORDER BY check_in DESC LIMIT 1""",
@@ -8745,7 +8796,7 @@ class ChessFrame(tk.Frame):
                         _brow = _cco.fetchone()
                         if _brow:
                             _cols = ['id','room_id','guest_id','check_in','check_out',
-                                     'status','total_amount','note']
+                                     'status','total_amount','notes']
                             _booking = dict(zip(_cols, _brow))
                             _booking['room_number'] = room.get('number','')
                             _booking['cat_name']    = room.get('cat_name','')
@@ -9478,13 +9529,48 @@ class BookingsFrame(tk.Frame):
 
     def _checkin_dlg(self):
         """Вікно заселення з бронювань: паспорт + оплата + залог → чек → заселення."""
-        from app.modules.logic import get_booking, get_balance, update_booking_status
-        from app.utils.db import query
-        import datetime as _dt
         bid = self._sel()
         if not bid: return
-        b = get_booking(bid)
-        if not b: return
+        # Раніше запити до БД (get_booking, SELECT rooms) виконувались тут-таки,
+        # синхронно в обробнику кнопки — якщо БД відповідала повільно, все вікно
+        # програми "зависало" (Windows показувала "Not Responding"), і людям
+        # доводилось примусово закривати й перезапускати програму (що виглядало
+        # як несподіваний "перелогін"). Тепер це виконується у фоновому потоці.
+        import threading
+        _wait = dlg_win(self, "⏳ Заселення", "320x110")
+        lbl(_wait, "⏳ Завантаження даних бронювання...", 12).pack(pady=38)
+        def _bg():
+            from app.modules.logic import get_booking
+            from app.utils.db import query
+            try:
+                b = get_booking(bid)
+            except Exception:
+                b = None
+            room = {}
+            if b:
+                try:
+                    room = query("SELECT * FROM rooms WHERE id=%s", (b['room_id'],), fetch='one') or {}
+                except Exception:
+                    room = {}
+            def _done():
+                try: _wait.destroy()
+                except Exception: pass
+                try:
+                    if self.winfo_exists():
+                        self._checkin_dlg_open(b, room)
+                except Exception:
+                    pass
+            try: self.after(0, _done)
+            except Exception: pass
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _checkin_dlg_open(self, b, room):
+        """Продовження _checkin_dlg — виконується на головному потоці ПІСЛЯ того,
+        як дані бронювання/кімнати вже завантажені у фоні."""
+        from app.modules.logic import get_balance, update_booking_status
+        import datetime as _dt
+        if not b:
+            messagebox.showerror("", "Не вдалось завантажити дані бронювання (перевірте з'єднання з БД)."); return
         if b['status'] == 'checkedin':
             messagebox.showinfo("","Гість вже заселений."); return
 
@@ -9492,11 +9578,6 @@ class BookingsFrame(tk.Frame):
         if not b.get('phone') and b.get('guest_phone'):
             b['phone'] = b['guest_phone']
 
-        # Завантажуємо кімнату для deposit_amount
-        try:
-            room = query("SELECT * FROM rooms WHERE id=%s", (b['room_id'],), fetch='one') or {}
-        except Exception:
-            room = {}
         if not room:
             room = {'id': b['room_id'], 'number': b.get('room_number',''),
                     'cat_name': b.get('cat_name',''), 'base_price': b.get('price_per_day', 0)}
@@ -19126,6 +19207,8 @@ class SettingsFrame(tk.Frame):
         btn(tb,"✏️ Ред.",lambda:self._room_edit(p),C['card2'],100).pack(side='left',padx=4)
         btn(tb,"🗑 Видалити",lambda:self._room_del(p),C['red'],120).pack(side='left',padx=4)
         btn(tb,"🧹 Прибирання",lambda:self._cleaning_dlg(p),C['yellow'],140).pack(side='left',padx=4)
+        btn(tb,"📤 Експорт Excel",self._rooms_export_excel,C['accent'],150).pack(side='left',padx=4)
+        btn(tb,"📥 Імпорт Excel",lambda:self._rooms_import_excel(p),C['green'],150).pack(side='left',padx=4)
         refresh_btn(tb, lambda:self._load_rooms(), side='left', padx=4, pady=6)
         ff,self.rooms_t=mktree(p,('id','number','cat','floor','status','price'),14,[50,80,160,60,120,100])
         for c,h in zip(('id','number','cat','floor','status','price'),['ID','Кімн.','Категорія','Пов.','Статус','Ціна/ніч']):
@@ -19140,6 +19223,129 @@ class SettingsFrame(tk.Frame):
         ff2.pack(fill='x')
         # Дані завантажуємо після рендеру UI через after()
         self.after(50, lambda: (self._load_rooms(), self._load_cleaning_log()))
+
+    def _rooms_export_excel(self):
+        """Експортує список номерів у .xlsx."""
+        from tkinter import filedialog
+        import datetime as _dt
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel файл", "*.xlsx")],
+            initialfile=f"nomery_{_dt.date.today().isoformat()}.xlsx")
+        if not path:
+            return
+        try:
+            import openpyxl
+            from openpyxl.styles import Font, PatternFill
+            from app.modules.logic import get_rooms
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "Номери"
+            headers = ['ID', 'Номер', 'Категорія', 'Поверх', 'Статус', 'Ціна/ніч', 'Нотатки']
+            ws.append(headers)
+            for _c in ws[1]:
+                _c.font = Font(bold=True)
+                _c.fill = PatternFill('solid', fgColor='DDDDDD')
+            rooms = get_rooms() or []
+            for r in rooms:
+                ws.append([
+                    r.get('id'), r.get('number'), r.get('cat_name', ''),
+                    r.get('floor', 1), STATUS_UA.get(r.get('status', ''), r.get('status', '')),
+                    float(r.get('base_price') or 0), r.get('notes', '') or '',
+                ])
+            widths = [8, 16, 22, 8, 14, 12, 34]
+            for i, w in enumerate(widths, start=1):
+                ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
+            ws.freeze_panes = "A2"
+            wb.save(path)
+            messagebox.showinfo("✅ Готово", f"Експортовано {len(rooms)} номерів у:\n{path}")
+        except ImportError:
+            messagebox.showerror("Помилка", "Бібліотека openpyxl не встановлена.")
+        except Exception as e:
+            messagebox.showerror("Помилка експорту", str(e))
+
+    def _rooms_import_excel(self, p):
+        """Імпортує номери з .xlsx: оновлює існуючі (за номером кімнати) і додає нові.
+        Очікує стовпці як в експорті: ID, Номер, Категорія, Поверх, Статус, Ціна/ніч, Нотатки
+        (ID і Ціна/ніч не обов'язкові для співставлення — рядки шукаються за 'Номер')."""
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(filetypes=[("Excel файл", "*.xlsx *.xls")])
+        if not path:
+            return
+        try:
+            import openpyxl
+        except ImportError:
+            messagebox.showerror("Помилка", "Бібліотека openpyxl не встановлена."); return
+        try:
+            from app.modules.logic import get_categories, get_rooms, save_room
+            wb = openpyxl.load_workbook(path, data_only=True)
+            ws = wb.active
+            rows = list(ws.iter_rows(min_row=2, values_only=True))
+            rows = [r for r in rows if r and any(v not in (None, '') for v in r)]
+            if not rows:
+                messagebox.showwarning("", "У файлі немає рядків з даними."); return
+
+            # Знаходимо, який стовпець за яким номером — за заголовками першого рядка,
+            # а не за жорсткою позицією, щоб імпорт не ламався від переставлених колонок.
+            hdr = [str(c or '').strip().lower() for c in next(ws.iter_rows(min_row=1, max_row=1, values_only=True))]
+            def _col(*names):
+                for n in names:
+                    if n in hdr:
+                        return hdr.index(n)
+                return None
+            i_num   = _col('номер')
+            i_cat   = _col('категорія','категория')
+            i_floor = _col('поверх')
+            i_stat  = _col('статус')
+            i_price = _col('ціна/ніч','ціна','ціна за ніч')
+            i_notes = _col('нотатки','нотатка')
+            if i_num is None:
+                messagebox.showerror("Помилка", "Не знайдено стовпець «Номер» у файлі."); return
+
+            cats = get_categories() or []
+            cat_map = {str(c.get('name','')).strip().lower(): c['id'] for c in cats}
+            default_cat_id = cats[0]['id'] if cats else None
+            existing = {str(r.get('number','')).strip(): r['id'] for r in (get_rooms() or [])}
+            status_rev = {v.strip().lower(): k for k, v in STATUS_UA.items()}
+            valid_statuses = set(STATUS_UA.keys())
+
+            ok = 0; unknown_cats = set(); errors = []
+            for row in rows:
+                try:
+                    number = str(row[i_num]).strip() if i_num < len(row) and row[i_num] is not None else ''
+                    if not number:
+                        continue
+                    cat_name = str(row[i_cat]).strip() if i_cat is not None and i_cat < len(row) and row[i_cat] else ''
+                    cid = cat_map.get(cat_name.lower())
+                    if cat_name and not cid:
+                        unknown_cats.add(cat_name)
+                    if not cid:
+                        cid = default_cat_id
+                    floor = row[i_floor] if i_floor is not None and i_floor < len(row) and row[i_floor] else 1
+                    try: floor = int(floor)
+                    except Exception: floor = 1
+                    status_raw = str(row[i_stat]).strip() if i_stat is not None and i_stat < len(row) and row[i_stat] else 'free'
+                    status = status_rev.get(status_raw.lower(), status_raw.lower())
+                    if status not in valid_statuses:
+                        status = 'free'
+                    notes = str(row[i_notes]).strip() if i_notes is not None and i_notes < len(row) and row[i_notes] else ''
+                    save_room({
+                        'number': number, 'category_id': cid, 'floor': floor,
+                        'notes': notes, 'status': status,
+                    }, existing.get(number))
+                    ok += 1
+                except Exception as _re:
+                    errors.append(f"{row}: {_re}")
+
+            msg = f"✅ Оброблено рядків: {ok} з {len(rows)}."
+            if unknown_cats:
+                msg += f"\n⚠️ Невідомі категорії (застосовано типову): {', '.join(sorted(unknown_cats))}"
+            if errors:
+                msg += f"\n⚠️ Помилок: {len(errors)} (перша: {errors[0][:150]})"
+            messagebox.showinfo("Імпорт завершено", msg)
+            self._load_rooms()
+        except Exception as e:
+            messagebox.showerror("Помилка імпорту", str(e))
 
     def _load_rooms(self):
         from app.modules.logic import get_rooms
@@ -19534,11 +19740,122 @@ class SettingsFrame(tk.Frame):
         btn(tb,"➕ Додати",lambda:self._cat_dlg(p),width=130).pack(side='left',padx=4)
         btn(tb,"✏️ Ред.",lambda:self._cat_edit(p),C['card2'],100).pack(side='left',padx=4)
         btn(tb,"🗑 Видалити",lambda:self._cat_del(p),C['red'],120).pack(side='left',padx=4)
+        btn(tb,"📤 Експорт Excel",self._cats_export_excel,C['accent'],150).pack(side='left',padx=4)
+        btn(tb,"📥 Імпорт Excel",lambda:self._cats_import_excel(p),C['green'],150).pack(side='left',padx=4)
         refresh_btn(tb, lambda:self._load_cats(), side='left', padx=4, pady=6)
         ff,self.cats_t=mktree(p,('id','name','desc','price','cap'),14,[50,150,220,100,70])
         for c,h in zip(('id','name','desc','price','cap'),['ID','Назва','Опис','Ціна/ніч','Місць']):
             self.cats_t.heading(c,text=h)
         ff.pack(fill='both',expand=True); self.after(60, self._load_cats)
+
+    def _cats_export_excel(self):
+        """Експортує список категорій у .xlsx."""
+        from tkinter import filedialog
+        import datetime as _dt
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel файл", "*.xlsx")],
+            initialfile=f"katehoriyi_{_dt.date.today().isoformat()}.xlsx")
+        if not path:
+            return
+        try:
+            import openpyxl
+            from openpyxl.styles import Font, PatternFill
+            from app.modules.logic import get_categories
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "Категорії"
+            headers = ['ID', 'Назва', 'Опис', 'Ціна', 'Тариф', 'Місць']
+            ws.append(headers)
+            for _c in ws[1]:
+                _c.font = Font(bold=True)
+                _c.fill = PatternFill('solid', fgColor='DDDDDD')
+            cats = get_categories() or []
+            for c in cats:
+                _desc_raw = c.get('description', '') or ''
+                _desc = _desc_raw.replace('[tariff:hour]', '').replace('[tariff:night]', '').strip()
+                _tariff = 'година' if '[tariff:hour]' in _desc_raw else 'ніч'
+                ws.append([c.get('id'), c.get('name', ''), _desc,
+                           float(c.get('base_price') or 0), _tariff, c.get('capacity', 2)])
+            widths = [8, 22, 30, 12, 12, 10]
+            for i, w in enumerate(widths, start=1):
+                ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
+            ws.freeze_panes = "A2"
+            wb.save(path)
+            messagebox.showinfo("✅ Готово", f"Експортовано {len(cats)} категорій у:\n{path}")
+        except ImportError:
+            messagebox.showerror("Помилка", "Бібліотека openpyxl не встановлена.")
+        except Exception as e:
+            messagebox.showerror("Помилка експорту", str(e))
+
+    def _cats_import_excel(self, p):
+        """Імпортує категорії з .xlsx: оновлює існуючі (за назвою) і додає нові.
+        Стовпці за заголовками: ID, Назва, Опис, Ціна, Тариф (ніч/година), Місць."""
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(filetypes=[("Excel файл", "*.xlsx *.xls")])
+        if not path:
+            return
+        try:
+            import openpyxl
+        except ImportError:
+            messagebox.showerror("Помилка", "Бібліотека openpyxl не встановлена."); return
+        try:
+            from app.modules.logic import get_categories, save_category
+            wb = openpyxl.load_workbook(path, data_only=True)
+            ws = wb.active
+            hdr_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True))
+            hdr = [str(c or '').strip().lower() for c in hdr_row]
+            def _col(*names):
+                for n in names:
+                    if n in hdr:
+                        return hdr.index(n)
+                return None
+            i_name  = _col('назва')
+            i_desc  = _col('опис')
+            i_price = _col('ціна','ціна/ніч')
+            i_tar   = _col('тариф')
+            i_cap   = _col('місць')
+            if i_name is None:
+                messagebox.showerror("Помилка", "Не знайдено стовпець «Назва» у файлі."); return
+
+            rows = list(ws.iter_rows(min_row=2, values_only=True))
+            rows = [r for r in rows if r and any(v not in (None, '') for v in r)]
+            if not rows:
+                messagebox.showwarning("", "У файлі немає рядків з даними."); return
+
+            existing = {str(c.get('name','')).strip().lower(): c['id'] for c in (get_categories() or [])}
+            ok = 0; errors = []
+            for row in rows:
+                try:
+                    name = str(row[i_name]).strip() if i_name < len(row) and row[i_name] else ''
+                    if not name:
+                        continue
+                    desc  = str(row[i_desc]).strip() if i_desc is not None and i_desc < len(row) and row[i_desc] else ''
+                    price = row[i_price] if i_price is not None and i_price < len(row) and row[i_price] else 0
+                    try: price = float(price)
+                    except Exception: price = 0.0
+                    tar_raw = str(row[i_tar]).strip().lower() if i_tar is not None and i_tar < len(row) and row[i_tar] else 'ніч'
+                    is_hourly = tar_raw in ('година', 'год', 'hour', '⏱год', '⏱ год')
+                    cap = row[i_cap] if i_cap is not None and i_cap < len(row) and row[i_cap] else 2
+                    try: cap = int(cap)
+                    except Exception: cap = 2
+                    save_category({
+                        'name': name,
+                        'description': desc + f" [tariff:{'hour' if is_hourly else 'night'}]",
+                        'base_price': price,
+                        'capacity': cap,
+                    }, existing.get(name.lower()))
+                    ok += 1
+                except Exception as _re:
+                    errors.append(f"{row}: {_re}")
+
+            msg = f"✅ Оброблено рядків: {ok} з {len(rows)}."
+            if errors:
+                msg += f"\n⚠️ Помилок: {len(errors)} (перша: {errors[0][:150]})"
+            messagebox.showinfo("Імпорт завершено", msg)
+            self._load_cats()
+        except Exception as e:
+            messagebox.showerror("Помилка імпорту", str(e))
 
     def _load_cats(self):
         from app.modules.logic import get_categories
@@ -19614,8 +19931,23 @@ class SettingsFrame(tk.Frame):
         from app.modules.logic import get_categories
         s=self.cats_t.selection()
         if not s: messagebox.showwarning("","Оберіть категорію"); return
-        cat=next((c for c in get_categories() if c['id']==int(s[0])),None)
-        if cat: self._cat_dlg(p,cat)
+        try:
+            cats = get_categories() or []
+        except Exception as e:
+            messagebox.showerror("Помилка", f"Не вдалось завантажити категорії:\n{e}")
+            return
+        # Порівнюємо як рядки — selection() завжди повертає iid-рядки, а
+        # get_categories() може повертати id як int (залежно від драйвера БД),
+        # тож строге "==" між int і str ніколи не збігалось і кнопка мовчки
+        # нічого не робила.
+        cat=next((c for c in cats if str(c['id'])==str(s[0])),None)
+        if cat:
+            try:
+                self._cat_dlg(p,cat)
+            except Exception as e:
+                messagebox.showerror("Помилка", f"Не вдалось відкрити редагування:\n{e}")
+        else:
+            messagebox.showerror("Помилка","Категорію не знайдено. Натисніть 🔄 і спробуйте ще раз.")
 
     def _cat_del(self,p):
         from app.modules.logic import delete_category
@@ -19941,32 +20273,49 @@ class SettingsFrame(tk.Frame):
         return rows
 
     def _menu_export_xls(self):
-        from app.modules.logic import get_services
         import tkinter.filedialog as fd
-        svcs=get_services(active_only=False) or []
-        if not svcs: messagebox.showinfo("","Меню порожнє"); return
+        from app.utils.db import get_conn as _gc_exp
+        try:
+            with _gc_exp() as _c:
+                with _c.cursor() as _cur:
+                    try:
+                        _cur.execute("ALTER TABLE services ADD COLUMN IF NOT EXISTS barcode VARCHAR(64) DEFAULT NULL")
+                        _c.commit()
+                    except Exception:
+                        _c.rollback()
+                    _cur.execute("""SELECT id, name, price, category, unit,
+                                            COALESCE(quantity,0), active, COALESCE(barcode,'')
+                                     FROM services
+                                     WHERE name NOT LIKE '__cat_placeholder_%%'
+                                     ORDER BY category, name""")
+                    _svc_rows = _cur.fetchall()
+        except Exception as e:
+            messagebox.showerror("Помилка", f"Не вдалось прочитати меню:\n{e}"); return
+        if not _svc_rows: messagebox.showinfo("","Меню порожнє"); return
         path=fd.asksaveasfilename(title="Зберегти прайс-лист",defaultextension=".xlsx",
             filetypes=[("Excel файл","*.xlsx"),("Всі файли","*.*")],initialfile="прайс_готель.xlsx")
         if not path: return
         try:
             rows=[]
-            for s in svcs:
-                qty = s.get('quantity') or s.get('stock') or s.get('qty') or ''
-                unit = s.get('unit') or 'шт'
-                active = '✓' if s.get('active', True) else '✗'
+            for (_id, _name, _price, _cat, _unit, _qty, _active, _barcode) in _svc_rows:
+                unit = _unit or 'шт'
+                active = '✓' if _active else '✗'
+                # «Код (КТ)» — це РЕДАГОВАНЕ поле barcode (штрих-код/артикул), а НЕ
+                # внутрішній id запису в базі. Якщо код ще не встановлено — колонка
+                # порожня; при імпорті програма прочитає й збереже те, що тут напишете.
                 rows.append([
-                    s['name'],
-                    s['id'],
-                    float(s['price']),
-                    s.get('category',''),
+                    _name,
+                    _barcode or '',
+                    float(_price),
+                    _cat or '',
                     unit,
-                    qty if qty != '' else '',
+                    _qty if _qty else '',
                     active,
                 ])
             headers=['Найменування','Код (КТ)','Сума (грн)','Категорія','Од.','Кількість','Акт.']
             self._make_xlsx(rows, headers, path,
                 col_widths=[50, 12, 14, 16, 8, 12, 6])
-            messagebox.showinfo("✅",f"Збережено {len(svcs)} позицій\n{path}")
+            messagebox.showinfo("✅",f"Збережено {len(rows)} позицій\n{path}")
         except Exception as e: messagebox.showerror("Помилка",str(e))
 
     def _menu_import_xls(self):
@@ -20045,6 +20394,11 @@ class SettingsFrame(tk.Frame):
             try:
                 with _gc_imp() as _c:
                     with _c.cursor() as _cur:
+                        try:
+                            _cur.execute("ALTER TABLE services ADD COLUMN IF NOT EXISTS barcode VARCHAR(64) DEFAULT NULL")
+                            _c.commit()
+                        except Exception:
+                            _c.rollback()
                         for r in real_rows:
                             name=str(r[0]).strip() if r else ''
                             if not name: skipped+=1; continue
@@ -20054,51 +20408,64 @@ class SettingsFrame(tk.Frame):
                             except Exception: price=0.0
                             cat_val=str(r[3]).strip() if len(r)>3 and str(r[3]).strip() else cat_var.get()
                             unit_val=str(r[4]).strip() if len(r)>4 and str(r[4]).strip() and str(r[4]).strip() not in ('0','✓','✗') else unit_var.get()
+                            # «Код (КТ)» з файлу — це barcode/артикул, редагований користувачем.
+                            # Раніше ця колонка взагалі не читалась при імпорті, тому будь-яка
+                            # зміна коду в Excel ігнорувалась, а програма завжди показувала
+                            # свій внутрішній id замість введеного коду.
+                            _kt_raw = str(r[1]).strip() if len(r)>1 and r[1] not in (None,'') else ''
+                            kt_code = _kt_raw or None
                             # Кількість з колонки F (індекс 5)
                             try:
                                 _qraw=str(r[5]).replace(',','.').strip() if len(r)>5 else ''
                                 qty_val=float(_qraw) if _qraw and _qraw not in ('✓','✗','') else None
                             except Exception: qty_val=None
-                            # Пошук існуючого запису — тільки за назвою (ціна може змінитись)
+                            # Пошук існуючого запису: спершу за КТ-кодом (якщо він вказаний
+                            # у файлі — це надійніший, стабільний ідентифікатор), інакше за назвою
                             if mode in ('upsert','add'):
-                                _cur.execute("SELECT id FROM services WHERE LOWER(TRIM(name))=LOWER(TRIM(%s)) LIMIT 1",(name,))
-                                _row=_cur.fetchone()
-                                existing_id=_row[0] if _row else None
+                                existing_id=None
+                                if kt_code:
+                                    _cur.execute("SELECT id FROM services WHERE barcode=%s LIMIT 1",(kt_code,))
+                                    _row=_cur.fetchone()
+                                    if _row: existing_id=_row[0]
+                                if existing_id is None:
+                                    _cur.execute("SELECT id FROM services WHERE LOWER(TRIM(name))=LOWER(TRIM(%s)) LIMIT 1",(name,))
+                                    _row=_cur.fetchone()
+                                    existing_id=_row[0] if _row else None
                             else:
                                 existing_id=None
                             if mode=='upsert':
                                 if existing_id:
                                     if qty_val is not None:
-                                        _cur.execute("""UPDATE services SET name=%s,price=%s,unit=%s,category=%s,quantity=%s,active=TRUE
-                                            WHERE id=%s""",(name,price,unit_val,cat_val,qty_val,existing_id))
+                                        _cur.execute("""UPDATE services SET name=%s,price=%s,unit=%s,category=%s,quantity=%s,active=TRUE,barcode=COALESCE(%s,barcode)
+                                            WHERE id=%s""",(name,price,unit_val,cat_val,qty_val,kt_code,existing_id))
                                     else:
-                                        _cur.execute("""UPDATE services SET name=%s,price=%s,unit=%s,category=%s,active=TRUE
-                                            WHERE id=%s""",(name,price,unit_val,cat_val,existing_id))
+                                        _cur.execute("""UPDATE services SET name=%s,price=%s,unit=%s,category=%s,active=TRUE,barcode=COALESCE(%s,barcode)
+                                            WHERE id=%s""",(name,price,unit_val,cat_val,kt_code,existing_id))
                                     updated+=1
                                 else:
                                     if qty_val is not None:
-                                        _cur.execute("""INSERT INTO services(name,price,unit,category,quantity,active)
-                                            VALUES(%s,%s,%s,%s,%s,TRUE)""",(name,price,unit_val,cat_val,qty_val))
+                                        _cur.execute("""INSERT INTO services(name,price,unit,category,quantity,active,barcode)
+                                            VALUES(%s,%s,%s,%s,%s,TRUE,%s)""",(name,price,unit_val,cat_val,qty_val,kt_code))
                                     else:
-                                        _cur.execute("""INSERT INTO services(name,price,unit,category,active)
-                                            VALUES(%s,%s,%s,%s,TRUE)""",(name,price,unit_val,cat_val))
+                                        _cur.execute("""INSERT INTO services(name,price,unit,category,active,barcode)
+                                            VALUES(%s,%s,%s,%s,TRUE,%s)""",(name,price,unit_val,cat_val,kt_code))
                                     imported+=1
                             elif mode=='add':
                                 if existing_id: skipped+=1; continue
                                 if qty_val is not None:
-                                    _cur.execute("""INSERT INTO services(name,price,unit,category,quantity,active)
-                                        VALUES(%s,%s,%s,%s,%s,TRUE)""",(name,price,unit_val,cat_val,qty_val))
+                                    _cur.execute("""INSERT INTO services(name,price,unit,category,quantity,active,barcode)
+                                        VALUES(%s,%s,%s,%s,%s,TRUE,%s)""",(name,price,unit_val,cat_val,qty_val,kt_code))
                                 else:
-                                    _cur.execute("""INSERT INTO services(name,price,unit,category,active)
-                                        VALUES(%s,%s,%s,%s,TRUE)""",(name,price,unit_val,cat_val))
+                                    _cur.execute("""INSERT INTO services(name,price,unit,category,active,barcode)
+                                        VALUES(%s,%s,%s,%s,TRUE,%s)""",(name,price,unit_val,cat_val,kt_code))
                                 imported+=1
                             else:  # replace
                                 if qty_val is not None:
-                                    _cur.execute("""INSERT INTO services(name,price,unit,category,quantity,active)
-                                        VALUES(%s,%s,%s,%s,%s,TRUE)""",(name,price,unit_val,cat_val,qty_val))
+                                    _cur.execute("""INSERT INTO services(name,price,unit,category,quantity,active,barcode)
+                                        VALUES(%s,%s,%s,%s,%s,TRUE,%s)""",(name,price,unit_val,cat_val,qty_val,kt_code))
                                 else:
-                                    _cur.execute("""INSERT INTO services(name,price,unit,category,active)
-                                        VALUES(%s,%s,%s,%s,TRUE)""",(name,price,unit_val,cat_val))
+                                    _cur.execute("""INSERT INTO services(name,price,unit,category,active,barcode)
+                                        VALUES(%s,%s,%s,%s,TRUE,%s)""",(name,price,unit_val,cat_val,kt_code))
                                 imported+=1
                     _c.commit()
             except Exception as e: messagebox.showerror("Помилка імпорту",str(e)); return
@@ -20703,16 +21070,39 @@ class SettingsFrame(tk.Frame):
             data={'full_name':flds['full_name'].get().strip(),'role':rv.get(),'active':av.get(),'password':flds['password'].get()}
             if not usr: data['username']=flds.get('username',type('',(),{'get':lambda s:''})()).get().strip()
             if not data['full_name']: messagebox.showerror("","Введіть ім'я"); return
-            save_user(data,usr['id'] if usr else None)
+            if not usr and not data['username']: messagebox.showerror("","Введіть логін"); return
+            try:
+                save_user(data,usr['id'] if usr else None)
+            except Exception as e:
+                messagebox.showerror("Помилка збереження", str(e))
+                return
             self._load_users(); win.destroy()
+            messagebox.showinfo("✅ Збережено",
+                "Користувача збережено.\nЯкщо він одразу не з'явився у списку — "
+                "натисніть 🔄 (можлива невелика затримка кешу).")
         btn(f,"💾 Зберегти",save,height=40).pack(fill='x',padx=10,pady=12)
 
     def _user_edit(self,p):
         from app.modules.logic import get_users
         s=self.users_t.selection()
         if not s: messagebox.showwarning("","Оберіть користувача"); return
-        u=next((x for x in get_users() if x['id']==int(s[0])),None)
-        if u: self._user_dlg(p,u)
+        try:
+            users = get_users() or []
+        except Exception as e:
+            messagebox.showerror("Помилка", f"Не вдалось завантажити користувачів:\n{e}")
+            return
+        # Порівнюємо як рядки — той самий клас багу, що й у категоріях: якщо
+        # id з get_users() повертається не тим самим типом (int vs str,
+        # наприклад коли дані йдуть через локальний SQLite-кеш), строге "=="
+        # ніколи не збігалось і кнопка мовчки нічого не робила.
+        u=next((x for x in users if str(x['id'])==str(s[0])),None)
+        if u:
+            try:
+                self._user_dlg(p,u)
+            except Exception as e:
+                messagebox.showerror("Помилка", f"Не вдалось відкрити редагування:\n{e}")
+        else:
+            messagebox.showerror("Помилка","Користувача не знайдено. Натисніть 🔄 і спробуйте ще раз.")
 
     def _user_del(self,p):
         from app.modules.logic import delete_user
@@ -23103,18 +23493,32 @@ class SettingsFrame(tk.Frame):
 
         def _install_qrcode():
             qr_hint_lbl.configure(text="⏳ Встановлення qrcode...\n(зачекайте 10-30 сек)")
-            s_qr.update()
-            try:
-                import subprocess as _sp, sys as _sys
-                result = _sp.run(
-                    [_sys.executable, '-m', 'pip', 'install', 'qrcode', '--quiet'],
-                    capture_output=True, text=True, timeout=120)
-                if result.returncode == 0:
-                    qr_hint_lbl.configure(text="✅ qrcode встановлено!\nНатисніть «👁 Переглянути QR»")
-                else:
-                    qr_hint_lbl.configure(text=f"⚠️ Помилка:\n{result.stderr[:100]}")
-            except Exception as _ei:
-                qr_hint_lbl.configure(text=f"⚠️ Помилка встановлення:\n{_ei}")
+            # Раніше pip install виконувався прямо тут, синхронно — це блокувало
+            # ВСЮ програму (Windows показувала "Not Responding") на весь час
+            # встановлення. Тепер робимо це у фоновому потоці.
+            import threading
+            def _bg():
+                try:
+                    import subprocess as _sp, sys as _sys
+                    result = _sp.run(
+                        [_sys.executable, '-m', 'pip', 'install', 'qrcode', '--quiet'],
+                        capture_output=True, text=True, timeout=120)
+                    ok = (result.returncode == 0)
+                    err = result.stderr[:100] if not ok else ""
+                except Exception as _ei:
+                    ok = False; err = str(_ei)
+                def _after():
+                    try:
+                        if ok:
+                            qr_hint_lbl.configure(text="✅ qrcode встановлено!")
+                            _preview_qr()
+                        else:
+                            qr_hint_lbl.configure(text=f"⚠️ Помилка встановлення:\n{err}")
+                    except Exception:
+                        pass
+                try: qr_hint_lbl.after(0, _after)
+                except Exception: pass
+            threading.Thread(target=_bg, daemon=True).start()
 
         def _save_qr():
             cfg_qr = {'enabled': qr_enabled_var.get(), 'url': qr_url_var.get().strip()}
@@ -23124,9 +23528,11 @@ class SettingsFrame(tk.Frame):
 
         qr_bf = tk.Frame(s_qr, bg=C['card']); qr_bf.pack(fill='x', padx=12, pady=(4,10))
         btn(qr_bf, "👁 Переглянути QR", _preview_qr, C['card2'], 160).pack(side='left', padx=(0,6))
-        btn(qr_bf, "💾 Зберегти QR",    _save_qr,    C['accent'], 150).pack(side='left')
+        btn(qr_bf, "💾 Зберегти QR",    _save_qr,    C['accent'], 150).pack(side='left', padx=(0,6))
+        btn(qr_bf, "⬇ Встановити qrcode", _install_qrcode, C['green'], 170).pack(side='left')
 
         _preview_qr()  # показати поточний QR одразу
+
 
         # ═══ РЕСТОРАН ═══
         s3 = _section(inner, "Ресторан / Бар", "🍽")
