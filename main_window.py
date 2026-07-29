@@ -893,6 +893,22 @@ def get_session_start():
         pass
     return None
 
+def get_session_owner():
+    """Повертає ім'я користувача, який ВІДКРИВ поточну зміну (з таблиці shifts).
+    Потрібно окремо від get_session_start(), бо людина, що зараз залогінена
+    (наприклад адмін, що зайшов подивитись), і людина, чия зміна фактично
+    активна — це не завжди одна й та сама особа."""
+    try:
+        from app.utils.db import query
+        shift_id = get_current_shift_id()
+        if shift_id:
+            row = query("SELECT username FROM shifts WHERE id=%s", (shift_id,), fetch='one')
+            if row and row.get('username'):
+                return row['username']
+    except Exception:
+        pass
+    return ''
+
 def _kyiv_tz():
     """Повертає часовий пояс Київ. Працює на Windows без tzdata."""
     try:
@@ -4338,12 +4354,18 @@ class DashboardFrame(tk.Frame):
                 log_error("Dashboard: помилка синхронізації статусів", _sync_err)
 
             shift_start_dt = get_session_start()
+            shift_owner = get_session_owner()
             import datetime as _dt2
             if shift_start_dt:
                 if shift_start_dt.date() == _dt2.date.today():
                     shift_label = f"з {shift_start_dt.strftime('%H:%M')}"
                 else:
                     shift_label = f"з {shift_start_dt.strftime('%d.%m %H:%M')}"
+                # Якщо зміну відкрив хтось інший, ніж поточний залогінений
+                # користувач (наприклад адмін зайшов подивитись) — показуємо,
+                # чия саме це зміна, а не мовчки приписуємо її поточному логіну.
+                if shift_owner and shift_owner != self.user.get('username'):
+                    shift_label += f" ({shift_owner})"
             else:
                 shift_label = "—"
 
@@ -19852,7 +19874,9 @@ class SettingsFrame(tk.Frame):
             msg = f"✅ Оброблено рядків: {ok} з {len(rows)}."
             if errors:
                 msg += f"\n⚠️ Помилок: {len(errors)} (перша: {errors[0][:150]})"
-            messagebox.showinfo("Імпорт завершено", msg)
+            messagebox.showinfo("Імпорт завершено", msg +
+                "\n\n💡 Якщо якісь рядки одразу не з'явились/не оновились у списку —"
+                " натисніть 🔄 (можлива невелика затримка кешу).")
             self._load_cats()
         except Exception as e:
             messagebox.showerror("Помилка імпорту", str(e))
@@ -19919,12 +19943,27 @@ class SettingsFrame(tk.Frame):
         def save():
             if not flds['name'].get().strip(): messagebox.showerror("","Введіть назву"); return
             desc = flds['description'].get()
-            # Зберігаємо тип тарифу в опис (додаємо мітку якщо немає)
-            save_category({'name':flds['name'].get().strip(),
-                           'description': desc.replace('[tariff:hour]','').replace('[tariff:night]','').strip() + f' [tariff:{tariff_var.get()}]',
-                           'base_price':float(flds['base_price'].get() or 0),
-                           'capacity':int(flds['capacity'].get() or 2)}, cat['id'] if cat else None)
+            try:
+                _price_val = float(flds['base_price'].get() or 0)
+            except ValueError:
+                messagebox.showerror("","Ціна має бути числом"); return
+            try:
+                _cap_val = int(flds['capacity'].get() or 2)
+            except ValueError:
+                messagebox.showerror("","Місць має бути цілим числом"); return
+            try:
+                # Зберігаємо тип тарифу в опис (додаємо мітку якщо немає)
+                save_category({'name':flds['name'].get().strip(),
+                               'description': desc.replace('[tariff:hour]','').replace('[tariff:night]','').strip() + f' [tariff:{tariff_var.get()}]',
+                               'base_price':_price_val,
+                               'capacity':_cap_val}, cat['id'] if cat else None)
+            except Exception as e:
+                messagebox.showerror("Помилка збереження", str(e))
+                return
             self._load_cats(); win.destroy()
+            messagebox.showinfo("✅ Збережено",
+                "Категорію збережено.\nЯкщо зміни одразу не з'явились у списку — "
+                "натисніть 🔄 (можлива невелика затримка кешу).")
         btn(f,"💾 Зберегти",save,height=40).pack(fill='x',padx=10,pady=12)
 
     def _cat_edit(self,p):
@@ -22919,6 +22958,14 @@ class SettingsFrame(tk.Frame):
             lambda: __import__('subprocess').Popen(['start', _url_ent.get().strip()], shell=True),
             C['card2'], 180, height=34)
         _mb_open.pack(side='left', padx=4)
+        # Кнопка "Оновити" одразу тут, поруч з повідомленням про успішну перевірку —
+        # раніше активна кнопка була лише в блоці "вручну" далеко нижче, і людина
+        # бачила напис "Натисніть «Оновити» нижче", але фактично не знаходила її
+        # без прокрутки — виглядало так, ніби кнопки взагалі немає.
+        _online_upd_btn = btn(mbr, "💾 Оновити зараз",
+            lambda: do_update_fn() if do_update_fn else None, C['green'], 170, height=34)
+        _online_upd_btn.pack(side='left', padx=4)
+        _online_upd_btn.configure(state='disabled')
 
         def _do_mega_check():
             url = _url_ent.get().strip()
@@ -22928,6 +22975,7 @@ class SettingsFrame(tk.Frame):
             _ms_lbl.configure(text="Перевірка...", text_color=C['yellow'])
             _mi_lbl.configure(text="Підключаємось...", text_color=C['text2'])
             _mb_check.configure(state='disabled')
+            _online_upd_btn.configure(state='disabled')
             import threading as _tmc
             def _bg():
                 try:
@@ -23008,6 +23056,7 @@ class SettingsFrame(tk.Frame):
                                 self._upd_selected = _dl
                                 self._upd_path_lbl.configure(text="main_window_update.py  (" + str(rs//1024) + " КБ)", text_color=C['green'])
                                 do_btn.configure(state='normal')
+                                _online_upd_btn.configure(state='normal')
                             except Exception: pass
                         elif rs > 0 and rs != cs:
                             diff = rs - cs; sign = "+" if diff > 0 else ""
