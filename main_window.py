@@ -755,6 +755,174 @@ def _save_app_settings(updates: dict):
     except Exception as _e:
         _logger.warning(f"_save_app_settings: {_e}")
 
+# ── Онлайн-оновлення: спільні функції (вкладка «Оновлення» + банер на дашборді) ──
+_UPD_DEFAULT_URL = "https://mega.nz/file/hg8nQQrD#sSav2kaJjhuQH6un01zrtWoqjyGq6L-vBrVRTbq7jH0"
+
+def _upd_get_real_dst():
+    """Повертає реальний шлях до main_window.py поруч з .exe або в папці проекту."""
+    import sys as _sysu, os as _osu
+    if getattr(_sysu, 'frozen', False):
+        exe_dir = _osu.path.dirname(_sysu.executable)
+        for candidate in [
+            _osu.path.join(exe_dir, 'app', 'ui', 'main_window.py'),
+            _osu.path.join(exe_dir, 'main_window.py'),
+            _osu.path.join(exe_dir, '..', 'app', 'ui', 'main_window.py'),
+        ]:
+            if _osu.path.exists(candidate):
+                return _osu.path.normpath(candidate)
+        return _osu.path.join(exe_dir, 'app', 'ui', 'main_window.py')
+    return _osu.path.abspath(__file__)
+
+def _upd_get_all_targets(primary_dst):
+    """Список усіх шляхів, де треба замінити main_window.py."""
+    import os as _osu
+    targets = []
+    for fw in [r'C:\hotel2\app\ui\main_window.py', r'C:\hotel2\dist\HotelPMS\app\ui\main_window.py']:
+        norm = _osu.path.normpath(fw)
+        if norm not in targets:
+            targets.append(norm)
+    norm_primary = _osu.path.normpath(primary_dst)
+    if norm_primary not in targets:
+        targets.append(norm_primary)
+    base = primary_dst
+    for _ in range(6):
+        base = _osu.path.dirname(base)
+        for extra in [
+            _osu.path.join(base, 'dist', 'HotelPMS', 'app', 'ui', 'main_window.py'),
+            _osu.path.join(base, 'dist', 'HotelPMS', '_internal', 'app', 'ui', 'main_window.py'),
+        ]:
+            norm = _osu.path.normpath(extra)
+            if norm not in targets and _osu.path.exists(norm):
+                targets.append(norm)
+    return targets
+
+def _upd_load_url():
+    try:
+        _s = _load_app_settings()
+        return _s.get('update_url', '') or _UPD_DEFAULT_URL
+    except Exception:
+        return _UPD_DEFAULT_URL
+
+def _upd_cache_bust(u):
+    """Додає параметр з поточним часом, щоб CDN (напр. GitHub raw/Fastly, кешує
+    на кілька хвилин після пушу) не віддав стару закешовану версію файлу."""
+    import time as _tu
+    sep = '&' if '?' in u else '?'
+    return f"{u}{sep}_cb={int(_tu.time())}"
+
+def _upd_to_direct_url(url):
+    """Конвертує посилання (GitHub/Pastebin/Google Drive/Dropbox/OneDrive) у пряме для завантаження."""
+    import re as _reu
+    url = url.strip()
+    if 'github.com' in url and '/blob/' in url:
+        return _upd_cache_bust(url.replace('github.com', 'raw.githubusercontent.com').replace('/blob/', '/'))
+    if 'raw.githubusercontent.com' in url:
+        return _upd_cache_bust(url)
+    if 'pastebin.com' in url and '/raw/' not in url:
+        return url.replace('pastebin.com/', 'pastebin.com/raw/')
+    m = _reu.search(r'drive\.google\.com/file/d/([a-zA-Z0-9_-]+)', url)
+    if m:
+        return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
+    m = _reu.search(r'drive\.google\.com.*[?&]id=([a-zA-Z0-9_-]+)', url)
+    if m:
+        return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
+    if 'dropbox.com' in url:
+        return _reu.sub(r'[?&]dl=0', '', url).rstrip('?') + ('&' if '?' in url else '?') + 'dl=1'
+    if '1drv.ms' in url or 'onedrive.live.com' in url:
+        return url.replace('redir?', 'download?').replace('embed?', 'download?')
+    return url
+
+def _upd_check_available(timeout=15):
+    """Мережевий запит — викликати лише у фоновому потоці.
+    Повертає dict: {'available': bool, 'data': bytes|None, 'error': str|None}"""
+    import os as _osu
+    url = _upd_load_url()
+    if not url:
+        return {'available': False, 'data': None, 'error': 'no_url'}
+    try:
+        direct_url = _upd_to_direct_url(url)
+        import urllib.request as _uru
+        req = _uru.Request(direct_url, headers={"User-Agent": "Mozilla/5.0"})
+        with _uru.urlopen(req, timeout=timeout) as resp:
+            data = resp.read()
+        if not (b'def ' in data[:3000] or b'import ' in data[:3000] or b'class ' in data[:3000]):
+            return {'available': False, 'data': None, 'error': 'not_direct_py'}
+        real_dst = _upd_get_real_dst()
+        cur_size = _osu.path.getsize(real_dst) if _osu.path.exists(real_dst) else 0
+        if cur_size and len(data) == cur_size:
+            return {'available': False, 'data': None, 'error': None}
+        return {'available': True, 'data': data, 'error': None}
+    except Exception as e:
+        return {'available': False, 'data': None, 'error': str(e)}
+
+def _upd_apply(data, parent=None):
+    """Записує щойно завантажений вміст main_window.py в усі цільові шляхи й
+    перезапускає програму. Викликати лише з головного потоку (є діалог
+    підтвердження). Спільна для вкладки «Оновлення» і банера на дашборді."""
+    import os as _osu, sys as _sysu, shutil as _shu, subprocess, tempfile, time as _tu
+    tmp_path = _osu.path.join(tempfile.gettempdir(), 'main_window_update.py')
+    with open(tmp_path, 'wb') as _tf:
+        _tf.write(data)
+    real_dst = _upd_get_real_dst()
+    all_targets = _upd_get_all_targets(real_dst)
+    targets_str = "\n".join(f"  • {t}" for t in all_targets)
+    msg = ("Встановити нову версію програми?\n\n"
+           f"Куди:\n{targets_str}\n\n"
+           "Файл буде замінено і програма перезапуститься автоматично.")
+    if not messagebox.askyesno("🔄 Оновлення", msg, parent=parent):
+        return False
+    try:
+        for target in all_targets:
+            _osu.makedirs(_osu.path.dirname(target), exist_ok=True)
+            if _osu.path.exists(target):
+                try: _shu.copy2(target, target + '.bak')
+                except Exception: pass
+            _shu.copy2(tmp_path, target)
+        _tu.sleep(0.5)
+        if getattr(_sysu, 'frozen', False):
+            exe_path = _sysu.executable
+            exe_dir = _osu.path.dirname(exe_path)
+            launcher_bat = _osu.path.join(exe_dir, '_restart_hotel.bat')
+            bat_content = (
+                "@echo off\n"
+                "timeout /t 2 /nobreak >nul\n"
+                f"start \"\" \"{exe_path}\"\n"
+                "del \"%~f0\" >nul 2>&1\n"
+            )
+            with open(launcher_bat, 'w', encoding='cp1251') as _bf:
+                _bf.write(bat_content)
+            subprocess.Popen(['cmd.exe', '/c', launcher_bat], creationflags=0x08000000)
+        else:
+            import platform
+            project_root = _osu.path.dirname(real_dst)
+            for _ in range(5):
+                if _osu.path.exists(_osu.path.join(project_root, 'main.py')):
+                    break
+                project_root = _osu.path.dirname(project_root)
+            if platform.system() == 'Windows':
+                subprocess.Popen([_sysu.executable, _osu.path.join(project_root, 'main.py')],
+                                  creationflags=0x00000010)
+            else:
+                launcher_sh = _osu.path.join(project_root, '_restart_hotel.sh')
+                with open(launcher_sh, 'w') as _shf:
+                    _shf.write(
+                        "#!/bin/bash\n"
+                        f"cd \"{project_root}\"\n"
+                        "source ~/venv/bin/activate 2>/dev/null "
+                        "|| source venv/bin/activate 2>/dev/null || :\n"
+                        "python3 main.py\n")
+                _osu.chmod(launcher_sh, 0o755)
+                for term in ['gnome-terminal', 'xterm', 'konsole']:
+                    try:
+                        subprocess.Popen([term, '--' if term != 'konsole' else '-e', launcher_sh])
+                        break
+                    except Exception:
+                        continue
+        _osu._exit(0)
+    except Exception as e:
+        messagebox.showerror("❌ Помилка", f"Не вдалося оновити:\n{e}", parent=parent)
+        return False
+
 # ── Прибиральниці: in-memory cache + PostgreSQL + local json fallback ──
 _cleaners_cache = None          # in-memory cache
 _cleaners_cache_ts = 0.0        # timestamp останнього завантаження
@@ -4219,6 +4387,11 @@ class DashboardFrame(tk.Frame):
                 pass
         self.after(200, _check_test_mode_dash)
 
+        # ── Банер "Доступне оновлення" (перевіряється у фоні одноразово за сесію) ──
+        self._update_banner = None
+        self._update_data = None
+        self.after(4000, self._check_for_app_update)
+
         # Статистичні картки — будуємо одразу зі статичним скелетом
         self._st = tk.Frame(self, bg=C['bg']); self._st.pack(fill='x', padx=20, pady=5)
         self._loading_lbl = lbl(self._st, "", 11, color=C['text2'])
@@ -4271,6 +4444,46 @@ class DashboardFrame(tk.Frame):
             self.after(30000, self._auto_refresh_tick)
         except Exception:
             pass
+
+    def _check_for_app_update(self):
+        """Одноразова (за сесію) фонова перевірка оновлення — показує банер
+        зверху дашборду, якщо на сервері є новіша версія main_window.py."""
+        import threading
+        def _bg():
+            try:
+                res = _upd_check_available(timeout=12)
+            except Exception:
+                res = {'available': False, 'data': None, 'error': None}
+            if res.get('available') and res.get('data'):
+                def _show():
+                    try:
+                        if self.winfo_exists():
+                            self._show_update_banner(res['data'])
+                    except Exception:
+                        pass
+                try: self.after(0, _show)
+                except Exception: pass
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _show_update_banner(self, data):
+        if self._update_banner is not None:
+            return  # вже показано (або вже закрито користувачем)
+        self._update_data = data
+        kb = len(data) // 1024
+        b = ctk.CTkFrame(self, fg_color='#1d4d2b', corner_radius=8)
+        b.pack(fill='x', padx=20, pady=(0, 6), before=self._st)
+        self._update_banner = b
+        row = tk.Frame(b, bg='#1d4d2b'); row.pack(fill='x', padx=12, pady=8)
+        lbl(row, f"🆕  Доступне оновлення програми ({kb} КБ) — рекомендуємо встановити",
+            12, True, C['green']).pack(side='left')
+        def _do_update_now():
+            _upd_apply(self._update_data, parent=self)
+        btn(row, "💾 Оновити зараз", _do_update_now, C['green'], 160, height=32).pack(side='right', padx=(6,0))
+        def _dismiss():
+            try: b.destroy()
+            except Exception: pass
+            self._update_banner = 'dismissed'
+        btn(row, "✕", _dismiss, C['card2'], 34, height=32).pack(side='right')
 
     def _load_data_async(self):
         """Запускає завантаження даних у фоновому потоці."""
@@ -22878,13 +23091,25 @@ class SettingsFrame(tk.Frame):
             try: _save_app_settings({_UPD_CFG_KEY: url.strip()})
             except Exception: pass
 
+        def _add_cache_bust(u):
+            """Додає параметр з поточним часом, щоб CDN GitHub (Fastly, кешує
+            raw.githubusercontent.com на кілька хвилин після кожного пушу)
+            не віддав стару закешовану версію файлу одразу після оновлення."""
+            import time as _tcb
+            sep = '&' if '?' in u else '?'
+            return f"{u}{sep}_cb={int(_tcb.time())}"
+
         def _to_direct_url(url):
             """Конвертує посилання у пряме для завантаження."""
             import re as _reu
             url = url.strip()
             # GitHub blob → raw (найнадійніший)
             if 'github.com' in url and '/blob/' in url:
-                return url.replace('github.com', 'raw.githubusercontent.com').replace('/blob/', '/')
+                raw_url = url.replace('github.com', 'raw.githubusercontent.com').replace('/blob/', '/')
+                return _add_cache_bust(raw_url)
+            if 'raw.githubusercontent.com' in url:
+                # Навіть якщо посилання вже "сире" — все одно обходимо кеш CDN
+                return _add_cache_bust(url)
             # Pastebin: /p/id → /raw/id
             if 'pastebin.com' in url and '/raw/' not in url:
                 return url.replace('pastebin.com/', 'pastebin.com/raw/')
