@@ -98,7 +98,7 @@ import time as _time_mod
 import queue as _queue_mod
 import traceback as _tb_mod
 
-APP_VERSION = "1.0.1"  # Версія — змінюйте при кожному оновленні
+APP_VERSION = "1.0.2"  # Версія — змінюйте при кожному оновленні
 SYNC_INTERVAL = 60    # секунд між автосинхронізаціями
 
 
@@ -4363,6 +4363,7 @@ class DashboardFrame(tk.Frame):
         lbl(self._hdr, f"🏠  Дашборд — {today.strftime('%d.%m.%Y')}", 22, True).pack(side='left')
         self._shift_lbl = lbl(self._hdr, f"👤 {self.user.get('full_name','')}", 11, color=C['text2'])
         self._shift_lbl.pack(side='left', padx=15)
+        lbl(self._hdr, f"v{APP_VERSION}", 11, color=C['text2']).pack(side='left', padx=(0, 15))
         refresh_btn(self._hdr, self._load_data_async, side='right', padx=8)
         # ── Кнопки X-звіт і Закрити зміну ──────────────────────────────
         def _open_x_or_z(report_type):
@@ -17641,6 +17642,15 @@ class ReportsFrame(tk.Frame):
                               AND (so.note IS NULL OR so.note NOT LIKE 'deposit%%')
                             ORDER BY so.created_at DESC
                         """, (shift_id,)) or []
+                    elif cat_type == 'restaurant':
+                        pay_det = _qr("""
+                            SELECT p.created_at, '—' AS room, '—' AS guest, '' AS phone,
+                                   p.amount, p.method, p.note, NULL AS check_in, NULL AS check_out
+                            FROM payments p
+                            WHERE p.shift_id=%s AND p.amount>0
+                              AND p.note LIKE 'Ресторан %%'
+                            ORDER BY p.created_at DESC
+                        """, (shift_id,)) or []
                     else:
                         pay_det = []
                 else:
@@ -17660,6 +17670,15 @@ class ReportsFrame(tk.Frame):
                                 p.note NOT LIKE 'Повернення%%'
                                 AND p.note NOT LIKE 'Додаткові послуги%%'))
                               AND {cat_cond}
+                            ORDER BY p.created_at DESC
+                        """, (_today_s2,)) or []
+                    elif cat_type == 'restaurant':
+                        pay_det = _qr("""
+                            SELECT p.created_at, '—' AS room, '—' AS guest, '' AS phone,
+                                   p.amount, p.method, p.note, NULL AS check_in, NULL AS check_out
+                            FROM payments p
+                            WHERE DATE(p.created_at)=%s AND p.amount>0
+                              AND p.note LIKE 'Ресторан %%'
                             ORDER BY p.created_at DESC
                         """, (_today_s2,)) or []
                     else:
@@ -17689,16 +17708,20 @@ class ReportsFrame(tk.Frame):
                     _ci   = str(row2.get('check_in','') or '')[:10]
                     _co   = str(row2.get('check_out','') or '')[:10]
                     r3a = tk.Frame(rf3, bg=C['card2']); r3a.pack(fill='x', padx=8, pady=(4,1))
-                    lbl(r3a, f"🛏 {row2.get('room','')}", 12, True, icon_color).pack(side='left', padx=4)
-                    lbl(r3a, f"👤 {row2.get('guest','')}", 12).pack(side='left', padx=6)
-                    lbl(r3a, f"📞 {row2.get('phone','')}", 11, color=C['text2']).pack(side='left', padx=4)
+                    if cat_type == 'restaurant':
+                        lbl(r3a, f"🍴 {_note}", 12, True, icon_color).pack(side='left', padx=4)
+                    else:
+                        lbl(r3a, f"🛏 {row2.get('room','')}", 12, True, icon_color).pack(side='left', padx=4)
+                        lbl(r3a, f"👤 {row2.get('guest','')}", 12).pack(side='left', padx=6)
+                        lbl(r3a, f"📞 {row2.get('phone','')}", 11, color=C['text2']).pack(side='left', padx=4)
                     lbl(r3a, f"{_amt:.2f}₴", 13, True, icon_color).pack(side='right', padx=8)
                     r3b = tk.Frame(rf3, bg=C['card2']); r3b.pack(fill='x', padx=8, pady=(0,4))
                     lbl(r3b, f"🕐 {_time}", 11, color=C['text2']).pack(side='left', padx=4)
                     if _ci:
                         lbl(r3b, f"📅 {_ci}→{_co}", 11, color=C['text2']).pack(side='left', padx=6)
                     lbl(r3b, _meth, 11, color=C['green']).pack(side='left', padx=6)
-                    lbl(r3b, _note[:40], 10, color=C['text2']).pack(side='left', padx=4)
+                    if cat_type != 'restaurant':
+                        lbl(r3b, _note[:40], 10, color=C['text2']).pack(side='left', padx=4)
 
             btn_f2 = tk.Frame(win2, bg=C['bg']); btn_f2.pack(fill='x', padx=15, pady=8)
             btn(btn_f2, "✖ Закрити", win2.destroy, C['card2'], 120, height=36).pack(side='right')
@@ -17711,7 +17734,7 @@ class ReportsFrame(tk.Frame):
             ("🛁 Бані",             _bani_r,   '#e67e22',    'bani'),
             ("⛺ Бесідки",          _besid_r,  '#27ae60',    'besidky'),
             ("🍽 Послуги готелю",   svc_rev,   '#1abc9c',    'services'),
-            ("🍴 Ресторан",         rest_total,'#9b59b6',    None),
+            ("🍴 Ресторан",         rest_total,'#9b59b6',    'restaurant'),
             ("📊 РАЗОМ",            _rooms_r+_bani_r+_besid_r+svc_rev+rest_total, C['green'], None),
         ]
         for (cat, amt, color, ctype) in _rev_cats:
@@ -17784,7 +17807,7 @@ class ReportsFrame(tk.Frame):
 
             hdr2 = card(sc); hdr2.pack(fill='x', padx=10, pady=(10,5))
             lbl(hdr2, title, 14, True, icon_color).pack(anchor='w', padx=12, pady=(10,3))
-            lbl(hdr2, f"Тип: {cat_type}", 11, color=C['text2']).pack(anchor='w', padx=12, pady=(0,8))
+            lbl(hdr2, f"Тип: {cat_type or 'всі категорії'}", 11, color=C['text2']).pack(anchor='w', padx=12, pady=(0,8))
 
             # Умова фільтрації по категорії
             if cat_type == 'rooms':
@@ -17801,15 +17824,20 @@ class ReportsFrame(tk.Frame):
                     OR lower(COALESCE(rc.name,'')) LIKE '%%saun%%'
                     OR lower(COALESCE(rc.description,'')) LIKE '%%[tariff:hour]%%'
                     OR CAST(COALESCE(r.number,'') AS text) ILIKE '%%баня%%')"""
-            else:  # besidky
+            elif cat_type == 'besidky':
                 cat_cond = """(lower(COALESCE(rc.name,'')) LIKE '%%бесід%%'
                     OR lower(COALESCE(rc.name,'')) LIKE '%%альтанк%%'
                     OR CAST(COALESCE(r.number,'') AS text) ILIKE '%%бесід%%'
                     OR CAST(COALESCE(r.number,'') AS text) ILIKE '%%альтанк%%')"""
+            else:  # None / 'all' — всі категорії (номери + бані + бесідки)
+                cat_cond = "1=1"
+
+            _status_cond = "b.status=%s" if status_filter else "1=1"
 
             # Отримати бронювання
             try:
                 if shift_id:
+                    _params = ((status_filter,) if status_filter else ()) + (shift_id,)
                     rows = _qp(f"""
                         SELECT b.id, r.number AS room, g.name AS guest, g.phone,
                                b.check_in, b.check_out, b.status,
@@ -17824,14 +17852,15 @@ class ReportsFrame(tk.Frame):
                         JOIN rooms r ON b.room_id=r.id
                         JOIN guests g ON b.guest_id=g.id
                         LEFT JOIN room_categories rc ON r.category_id=rc.id
-                        WHERE b.status=%s
+                        WHERE {_status_cond}
                           AND b.created_at >= (SELECT opened_at FROM shifts WHERE id=%s)
                           AND {cat_cond}
                         ORDER BY b.check_in DESC
-                    """, (status_filter, shift_id)) or []
+                    """, _params) or []
                 else:
                     import datetime as _dtt2
                     _today_s = str(today)
+                    _params = ((status_filter,) if status_filter else ()) + (_today_s,)
                     rows = _qp(f"""
                         SELECT b.id, r.number AS room, g.name AS guest, g.phone,
                                b.check_in, b.check_out, b.status,
@@ -17846,10 +17875,10 @@ class ReportsFrame(tk.Frame):
                         JOIN rooms r ON b.room_id=r.id
                         JOIN guests g ON b.guest_id=g.id
                         LEFT JOIN room_categories rc ON r.category_id=rc.id
-                        WHERE b.status=%s AND DATE(b.created_at)=%s
+                        WHERE {_status_cond} AND DATE(b.created_at)=%s
                           AND {cat_cond}
                         ORDER BY b.check_in DESC
-                    """, (status_filter, _today_s)) or []
+                    """, _params) or []
             except Exception as _ex:
                 rows = []
                 lbl(sc, f"Помилка: {_ex}", 11, color=C['red']).pack(padx=15, pady=10)
@@ -17919,9 +17948,11 @@ class ReportsFrame(tk.Frame):
                  on_click=lambda: _show_bookings_popup("🔥 Заброньовані бані", "confirmed", "bani", '#e67e22'))
         _ops_row(bk2, "⛺ Бесідок заброньовано",  bk_besid, '#27ae60',
                  on_click=lambda: _show_bookings_popup("⛺ Заброньовані бесідки", "confirmed", "besidky", '#27ae60'))
-        _ops_row(bk2, "📋 Всього нових броней",   str(bk.get('cnt') or 0), C['text2'])
+        _ops_row(bk2, "📋 Всього нових броней",   str(bk.get('cnt') or 0), C['text2'],
+                 on_click=lambda: _show_bookings_popup("📋 Всі нові бронювання", None, None, C['text2']))
         _ops_hdr(bk2, "— Ресторан —")
-        _ops_row(bk2, "🍴 Закритих замовлень",    rest_cnt, '#9b59b6')
+        _ops_row(bk2, "🍴 Закритих замовлень",    rest_cnt, '#9b59b6',
+                 on_click=lambda: _show_revenue_details("🍴 Ресторан — закриті замовлення", 'restaurant', '#9b59b6'))
         tk.Frame(bk2, bg=C['card'], height=6).pack()
 
         # Виселені за зміну
