@@ -98,7 +98,7 @@ import time as _time_mod
 import queue as _queue_mod
 import traceback as _tb_mod
 
-APP_VERSION = "1.0.2"  # Версія — змінюйте при кожному оновленні
+APP_VERSION = "1.0.3"  # Версія — змінюйте при кожному оновленні
 SYNC_INTERVAL = 60    # секунд між автосинхронізаціями
 
 
@@ -728,18 +728,53 @@ def get_data_dir():
 
 # ══ НАЛАШТУВАННЯ ПРОГРАМИ (тестовий режим та ін.) ══
 def _get_app_settings_path():
+    """Шлях до app_settings.json.
+
+    ВАЖЛИВО: раніше цей файл лежав у get_data_dir() (папка 'data' поруч
+    з .exe, тобто всередині dist/HotelPMS/). Кожне перезбирання EXE
+    (pyinstaller) видаляє й пересоздає папку dist — разом з нею зникав
+    і збережений update_url, тому після перезбирання поле «Посилання»
+    відкочувалось на дефолтне значення (виглядало так, ніби зміни не
+    зберігаються). Тепер файл зберігається у стабільній папці в профілі
+    користувача, яка НЕ зачіпається збіркою і переживає перезбирання EXE.
+    """
     try:
-        return os.path.join(get_data_dir(), 'app_settings.json')
+        base = os.path.join(os.path.expanduser('~'), '.hotel_pms')
+        os.makedirs(base, exist_ok=True)
+        return os.path.join(base, 'app_settings.json')
     except Exception:
         return os.path.join(os.path.expanduser('~'), 'hotel_app_settings.json')
 
+def _get_legacy_app_settings_paths():
+    """Старі шляхи app_settings.json (у папці data/ поруч з exe/проектом),
+    з яких треба одноразово перенести налаштування у новий стабільний шлях."""
+    paths = []
+    try:
+        paths.append(os.path.join(get_data_dir(), 'app_settings.json'))
+    except Exception:
+        pass
+    return paths
+
 def _load_app_settings():
-    """Читає app_settings.json з папки data/."""
+    """Читає app_settings.json зі стабільної папки профілю користувача.
+    Якщо файл там ще не існує — одноразово мігрує налаштування зі старого
+    шляху (поруч з exe/dist), щоб не втратити те, що людина вже зберегла."""
     try:
         p = _get_app_settings_path()
         if _os.path.exists(p):
             with open(p, encoding='utf-8') as _asf:
                 return json.load(_asf)
+        # Міграція зі старого шляху (поруч з exe) — один раз
+        for _legacy in _get_legacy_app_settings_paths():
+            if _os.path.exists(_legacy):
+                with open(_legacy, encoding='utf-8') as _asf:
+                    _data = json.load(_asf)
+                try:
+                    with open(p, 'w', encoding='utf-8') as _asf2:
+                        json.dump(_data, _asf2, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+                return _data
     except Exception:
         pass
     return {}
