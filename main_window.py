@@ -98,7 +98,7 @@ import time as _time_mod
 import queue as _queue_mod
 import traceback as _tb_mod
 
-APP_VERSION = "1.0.0"  # Версія — змінюйте при кожному оновленні
+APP_VERSION = "1.0.1"  # Версія — змінюйте при кожному оновленні
 SYNC_INTERVAL = 60    # секунд між автосинхронізаціями
 
 
@@ -832,11 +832,29 @@ def _upd_to_direct_url(url):
         return url.replace('redir?', 'download?').replace('embed?', 'download?')
     return url
 
+def _upd_parse_version(data):
+    """Витягує APP_VERSION = "X.Y.Z" з вмісту .py файла (байти або текст)."""
+    import re as _rev
+    try:
+        text = data.decode('utf-8', errors='ignore') if isinstance(data, (bytes, bytearray)) else data
+    except Exception:
+        return None
+    m = _rev.search(r'^APP_VERSION\s*=\s*["\']([0-9]+(?:\.[0-9]+)*)["\']', text, _rev.MULTILINE)
+    return m.group(1) if m else None
+
+def _upd_version_tuple(v):
+    try:
+        return tuple(int(x) for x in v.split('.'))
+    except Exception:
+        return (0,)
+
 def _upd_check_available(timeout=15):
     """Мережевий запит — викликати лише у фоновому потоці.
-    Повертає dict: {'available': bool, 'data': bytes|None, 'error': str|None}"""
+    Повертає dict: {'available': bool, 'data': bytes|None, 'error': str|None,
+    'remote_version': str|None, 'local_version': str, 'size_only': bool}"""
     import os as _osu
     url = _upd_load_url()
+    local_ver = globals().get('APP_VERSION', '0.0.0')
     if not url:
         return {'available': False, 'data': None, 'error': 'no_url'}
     try:
@@ -847,11 +865,28 @@ def _upd_check_available(timeout=15):
             data = resp.read()
         if not (b'def ' in data[:3000] or b'import ' in data[:3000] or b'class ' in data[:3000]):
             return {'available': False, 'data': None, 'error': 'not_direct_py'}
+        remote_ver = _upd_parse_version(data)
+        if remote_ver:
+            # Порівнюємо як версії (1.2.0 > 1.1.9), а не за розміром файлу —
+            # менший файл на сервері (наприклад після рефакторингу/чистки коду)
+            # раніше все одно позначався як "оновлення" лише через те, що
+            # розмір відрізнявся, що ризикувало відкотити програму на СТАРІШУ
+            # версію замість новішої.
+            is_newer = _upd_version_tuple(remote_ver) > _upd_version_tuple(local_ver)
+            return {'available': is_newer, 'data': data if is_newer else None,
+                    'error': None, 'remote_version': remote_ver,
+                    'local_version': local_ver, 'size_only': False}
+        # Немає рядка APP_VERSION у файлі — не можемо надійно визначити, що
+        # новіше. Порівнюємо розмір лише як запасний варіант і чітко
+        # позначаємо це (size_only=True), щоб інтерфейс міг попередити
+        # користувача, що це менш надійна перевірка.
         real_dst = _upd_get_real_dst()
         cur_size = _osu.path.getsize(real_dst) if _osu.path.exists(real_dst) else 0
         if cur_size and len(data) == cur_size:
-            return {'available': False, 'data': None, 'error': None}
-        return {'available': True, 'data': data, 'error': None}
+            return {'available': False, 'data': None, 'error': None,
+                    'remote_version': None, 'local_version': local_ver, 'size_only': True}
+        return {'available': True, 'data': data, 'error': None,
+                'remote_version': None, 'local_version': local_ver, 'size_only': True}
     except Exception as e:
         return {'available': False, 'data': None, 'error': str(e)}
 
@@ -4458,27 +4493,67 @@ class DashboardFrame(tk.Frame):
                 def _show():
                     try:
                         if self.winfo_exists():
-                            self._show_update_banner(res['data'])
+                            self._show_update_banner(res)
                     except Exception:
                         pass
                 try: self.after(0, _show)
                 except Exception: pass
         threading.Thread(target=_bg, daemon=True).start()
 
-    def _show_update_banner(self, data):
+    def _show_update_banner(self, res):
         if self._update_banner is not None:
             return  # вже показано (або вже закрито користувачем)
+        data = res['data']
         self._update_data = data
         kb = len(data) // 1024
-        b = ctk.CTkFrame(self, fg_color='#1d4d2b', corner_radius=8)
+        remote_ver = res.get('remote_version')
+        local_ver = res.get('local_version', '')
+        size_only = res.get('size_only', False)
+        if remote_ver:
+            title = f"🆕  Доступне оновлення: v{local_ver} → v{remote_ver}  ({kb} КБ)"
+        else:
+            # Немає рядка версії у файлі — порівняння лише за розміром,
+            # менш надійне. Явно попереджаємо, щоб не встановити щось не те.
+            title = f"⚠️  Знайдено ІНШИЙ файл на сервері ({kb} КБ, версію не вдалось визначити — перевірте вручну перед встановленням)"
+        clr = C['green'] if not size_only else C['yellow']
+        bg_clr = '#1d4d2b' if not size_only else '#4d3d1d'
+        b = ctk.CTkFrame(self, fg_color=bg_clr, corner_radius=8)
         b.pack(fill='x', padx=20, pady=(0, 6), before=self._st)
         self._update_banner = b
-        row = tk.Frame(b, bg='#1d4d2b'); row.pack(fill='x', padx=12, pady=8)
-        lbl(row, f"🆕  Доступне оновлення програми ({kb} КБ) — рекомендуємо встановити",
-            12, True, C['green']).pack(side='left')
+        row = tk.Frame(b, bg=bg_clr); row.pack(fill='x', padx=12, pady=8)
+        lbl(row, title, 12, True, clr).pack(side='left')
         def _do_update_now():
-            _upd_apply(self._update_data, parent=self)
-        btn(row, "💾 Оновити зараз", _do_update_now, C['green'], 160, height=32).pack(side='right', padx=(6,0))
+            btn_ref['widget'].configure(state='disabled', text='⏳ Перевіряємо...')
+            import threading
+            def _bg():
+                try:
+                    fresh = _upd_check_available(timeout=15)
+                except Exception as e:
+                    fresh = {'available': False, 'data': None, 'error': str(e)}
+                def _after():
+                    try:
+                        btn_ref['widget'].configure(state='normal', text='💾 Оновити зараз')
+                    except Exception: pass
+                    if fresh.get('data'):
+                        # Завжди застосовуємо щойно завантажені (свіжі) дані,
+                        # а не ті, що були отримані під час першої перевірки —
+                        # інакше можна встановити вже застарілу проміжну версію,
+                        # якщо на сервері з'явилось ще новіше оновлення.
+                        _upd_apply(fresh['data'], parent=self)
+                    else:
+                        # Свіжої версії вже нема (могли встигнути оновити раніше,
+                        # або сервер тимчасово недоступний) — застосовуємо те, що
+                        # показував банер, як запасний варіант.
+                        if self._update_data:
+                            _upd_apply(self._update_data, parent=self)
+                        else:
+                            messagebox.showwarning("", "Не вдалось перевірити оновлення повторно. Спробуйте пізніше.", parent=self)
+                try: self.after(0, _after)
+                except Exception: pass
+            threading.Thread(target=_bg, daemon=True).start()
+        btn_ref = {}
+        btn_ref['widget'] = btn(row, "💾 Оновити зараз", _do_update_now, C['green'], 160, height=32)
+        btn_ref['widget'].pack(side='right', padx=(6,0))
         def _dismiss():
             try: b.destroy()
             except Exception: pass
