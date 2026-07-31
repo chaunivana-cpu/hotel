@@ -98,7 +98,7 @@ import time as _time_mod
 import queue as _queue_mod
 import traceback as _tb_mod
 
-APP_VERSION = "1.0.3"  # Версія — змінюйте при кожному оновленні
+APP_VERSION = "1.0.5"  # Версія — змінюйте при кожному оновленні
 SYNC_INTERVAL = 60    # секунд між автосинхронізаціями
 
 
@@ -200,7 +200,7 @@ class OfflineSyncManager:
                 _p_co = _os.path.normpath(_os.path.join(
                     _os.path.dirname(_os.path.abspath(__file__)),
                     '..', '..', 'config', 'db.json'))
-                with open(_p_co) as _fco: _cfg_co = _jco.load(_fco)
+                _cfg_co = _read_db_json_robust(_p_co)
             except Exception: pass
             host_co = str(_cfg_co.get('host', 'localhost')).strip()
             port_co = int(_cfg_co.get('port', 5432))
@@ -790,6 +790,73 @@ def _save_app_settings(updates: dict):
     except Exception as _e:
         _logger.warning(f"_save_app_settings: {_e}")
 
+# ── config/db.json: стабільне місце зберігання (спільне з app/utils/db.py) ──
+# Причина: config/db.json обчислювався відносно __file__ (main_window.py),
+# тобто лежав всередині dist/HotelPMS/ — папки, яку PyInstaller видаляє й
+# пересоздає при КОЖНОМУ перезбиранні EXE. Через це поля Host/Port/Database/
+# User/Password у вікні входу скидались на дефолтні після кожної збірки.
+# Рішення: db.json тепер зберігається у стабільній папці профілю користувача
+# (не зачіпається збіркою) — app/utils/db.py (load_config) читає САМЕ звідти
+# (з fallback на старий шлях і одноразовою міграцією, якщо стабільного файлу
+# ще нема). Тут дублюємо ту саму логіку для вікон налаштувань БД, щоб вони
+# читали/писали в те саме місце, звідки бере конфіг реальне з'єднання з БД.
+def _db_cfg_stable_path():
+    try:
+        base = os.path.join(os.path.expanduser('~'), '.hotel_pms')
+        os.makedirs(base, exist_ok=True)
+        return os.path.join(base, 'db.json')
+    except Exception:
+        return os.path.join(os.path.expanduser('~'), 'hotel_db_config.json')
+
+def _read_db_json_robust(legacy_path=None):
+    """Читає db.json: спершу зі стабільного місця (~/.hotel_pms/db.json),
+    якщо там немає — зі старого шляху (поруч з exe/проектом, якщо переданий).
+    Повертає {} якщо конфіг не знайдено ніде (замість винятку) — зручно для
+    місць коду, які й раніше м'яко деградували на дефолтні значення."""
+    try:
+        stable = _db_cfg_stable_path()
+        if os.path.exists(stable):
+            with open(stable, encoding='utf-8') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    if legacy_path:
+        try:
+            with open(legacy_path) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def _load_db_cfg_shared(legacy_path):
+    """Читає db.json зі стабільного місця; якщо його ще нема — one-time
+    міграція зі старого шляху (поруч з exe/проектом)."""
+    stable = _db_cfg_stable_path()
+    if os.path.exists(stable):
+        with open(stable, encoding='utf-8') as f:
+            return json.load(f)
+    with open(legacy_path) as f:
+        cfg = json.load(f)
+    try:
+        with open(stable, 'w', encoding='utf-8') as sf:
+            json.dump(cfg, sf, indent=4)
+    except Exception:
+        pass
+    return cfg
+
+def _save_db_cfg_shared(cfg, legacy_path):
+    """Зберігає db.json у стабільне місце (джерело правди) і, для сумісності,
+    дублює у старий шлях поруч з exe (не критично, якщо його знову змиє
+    наступним перезбиранням — стабільна копія лишається основною)."""
+    with open(_db_cfg_stable_path(), 'w', encoding='utf-8') as f:
+        json.dump(cfg, f, indent=4)
+    try:
+        os.makedirs(os.path.dirname(legacy_path), exist_ok=True)
+        with open(legacy_path, 'w') as f:
+            json.dump(cfg, f, indent=4)
+    except Exception:
+        pass
+
 # ── Онлайн-оновлення: спільні функції (вкладка «Оновлення» + банер на дашборді) ──
 _UPD_DEFAULT_URL = "https://mega.nz/file/hg8nQQrD#sSav2kaJjhuQH6un01zrtWoqjyGq6L-vBrVRTbq7jH0"
 
@@ -1277,6 +1344,7 @@ def _ensure_shifts_table():
         query("ALTER TABLE shifts ADD COLUMN IF NOT EXISTS opening_cash NUMERIC(10,2) DEFAULT 0", fetch=None)
         query("ALTER TABLE shifts ADD COLUMN IF NOT EXISTS opening_deposits NUMERIC(10,2) DEFAULT 0", fetch=None)
         query("ALTER TABLE payments ADD COLUMN IF NOT EXISTS shift_id INTEGER", fetch=None)
+        query("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS source_hotels BOOLEAN DEFAULT FALSE", fetch=None)
         query("""CREATE TABLE IF NOT EXISTS cash_transfers (
             id SERIAL PRIMARY KEY,
             shift_id INTEGER,
@@ -2820,14 +2888,13 @@ class SetupWindow(ctk.CTk):
     def _load_cfg(self):
         try:
             p = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),'..','..','config','db.json'))
-            with open(p) as f: return json.load(f)
+            return _load_db_cfg_shared(p)
         except: return {'host':'localhost','port':5432,'dbname':'hotel','user':'hotel','password':'hotel'}
 
     def _save_cfg(self):
         cfg = {k:(int(v.get()) if k=='port' else v.get()) for k,v in self.dbf.items()}
         p = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),'..','..','config','db.json'))
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        with open(p,'w') as f: json.dump(cfg,f,indent=4)
+        _save_db_cfg_shared(cfg, p)
 
     def _test(self):
         self._save_cfg()
@@ -3539,6 +3606,7 @@ class HotelApp(ctk.CTk):
             "ALTER TABLE bookings ADD COLUMN deposit_amount REAL DEFAULT 0",
             "ALTER TABLE bookings ADD COLUMN deposit_paid INTEGER DEFAULT 0",
             "ALTER TABLE bookings ADD COLUMN notes TEXT DEFAULT ''",
+            "ALTER TABLE bookings ADD COLUMN source_hotels INTEGER DEFAULT 0",
             "ALTER TABLE services ADD COLUMN quantity REAL DEFAULT 0",
             "ALTER TABLE services ADD COLUMN stock REAL DEFAULT 0",
             "ALTER TABLE services ADD COLUMN barcode TEXT DEFAULT NULL",
@@ -8159,6 +8227,12 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
     lbl(pf,"Нотатка:",12).grid(row=6,column=0,sticky='w',pady=4)
     e_note = ent(pf, "", w=300); e_note.grid(row=6,column=1,padx=(15,0),pady=4,sticky='w')
 
+    lbl(pf,"",12).grid(row=7,column=0,sticky='w',pady=4)
+    var_hotels_ci = ctk.BooleanVar(value=False)
+    ctk.CTkCheckBox(pf, text="🏨 Hotels (заселення з каналу Hotels)",
+                     variable=var_hotels_ci, font=('Segoe UI',11),
+                     fg_color=C['accent'], text_color=C['text']).grid(row=7,column=1,padx=(15,0),pady=4,sticky='w')
+
     # ── Додаткові послуги ───────────────────────────────────────────────
     _get_room_svcs = _build_services_block(sc, ['restaurant','minibar','other'],
                                            "🛎 Додаткові послуги до номера",
@@ -8213,12 +8287,12 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
         room_total_amt = price * nights_cnt
         query("""INSERT INTO bookings
                   (guest_id, room_id, check_in, check_out, price_per_day,
-                   adults, notes, status, total_amount, created_at)
-                  VALUES (%s,%s,%s,%s,%s,%s,%s,'checkedin',%s,NOW())""",
+                   adults, notes, status, total_amount, source_hotels, created_at)
+                  VALUES (%s,%s,%s,%s,%s,%s,%s,'checkedin',%s,%s,NOW())""",
               (gid, room['id'], ci, co, price,
                int(e_adults.get() or 1),
                (f"Паспорт: {passport_info}  " if passport_info.strip() else "") + e_note.get().strip(),
-               room_total_amt),
+               room_total_amt, bool(var_hotels_ci.get())),
               fetch=None)
         b_row = query("""SELECT id FROM bookings WHERE room_id=%s AND check_in=%s
                           ORDER BY id DESC LIMIT 1""", (room['id'], ci), fetch='one')
@@ -10186,6 +10260,13 @@ class BookingDlg(ctk.CTkToplevel):
         self.e_notes=ent(f,w=360); self.e_notes.pack(side='left')
 
         f=row_frm(b2)
+        ctk.CTkLabel(f,text="",font=('Segoe UI',11),width=120,anchor='w').pack(side='left')
+        self.var_hotels = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(f, text="🏨 Hotels (бронювання з каналу Hotels)",
+                         variable=self.var_hotels, font=('Segoe UI',11),
+                         fg_color=C['accent'], text_color=C['text']).pack(side='left')
+
+        f=row_frm(b2)
         ctk.CTkLabel(f,text="💰 Аванс",font=('Segoe UI',11),text_color=C['text2'],width=120,anchor='w').pack(side='left')
         dep_f=tk.Frame(f,bg=C['card2']); dep_f.pack(side='left')
         self.e_deposit=ent(dep_f,"0",w=120); self.e_deposit.pack(side='left')
@@ -10266,6 +10347,20 @@ class BookingDlg(ctk.CTkToplevel):
                         'children':int(self.fields['kids'].get() or 0),
                         'notes':self.e_notes.get(),
                         'deposit_amount':_adv_amount})
+        # Позначка "Hotels" (джерело бронювання) — окремим UPDATE, оскільки
+        # create_booking() з app.modules.logic може не знати про це поле.
+        try:
+            from app.utils.db import query as _qh
+            _use_bid_h = _new_bid
+            if not _use_bid_h:
+                _last_h = _qh("SELECT id FROM bookings WHERE room_id=%s AND guest_id=%s ORDER BY created_at DESC LIMIT 1",
+                              (rid, gid), fetch='one')
+                _use_bid_h = _last_h['id'] if _last_h else None
+            if _use_bid_h:
+                _qh("UPDATE bookings SET source_hotels=%s WHERE id=%s",
+                    (bool(self.var_hotels.get()), _use_bid_h), fetch=None)
+        except Exception as _eh:
+            log_error("BookingDlg: не вдалося зберегти позначку Hotels", _eh)
         # Записати аванс як платіж якщо > 0
         if _adv_amount > 0:
             try:
@@ -17528,6 +17623,29 @@ class ReportsFrame(tk.Frame):
         room_rev = max(grand_total - svc_rev - rest_total, 0)
         rest_cnt    = int(rest.get('cnt') or 0)
 
+        # Hotels (джерело бронювання) — рахуємо окремо, незалежно від того,
+        # яка з гілок (зміна/офлайн-кеш/дата) відпрацювала вище.
+        try:
+            if shift_id:
+                _hot_bk_row = query("""SELECT COUNT(*) AS cnt FROM bookings b
+                                        WHERE b.status='confirmed' AND b.source_hotels=TRUE
+                                          AND b.created_at >= (SELECT opened_at FROM shifts WHERE id=%s)""",
+                                     (shift_id,), fetch='one') or {}
+            else:
+                _hot_bk_row = query("""SELECT COUNT(*) AS cnt FROM bookings b
+                                        WHERE b.status='confirmed' AND b.source_hotels=TRUE
+                                          AND DATE(b.created_at)=%s""",
+                                     (today,), fetch='one') or {}
+            bk_hotels = int(_hot_bk_row.get('cnt') or 0)
+        except Exception:
+            bk_hotels = 0
+        try:
+            _ci_hot_row = query("SELECT COUNT(*) AS cnt FROM bookings WHERE status='checkedin' AND source_hotels=TRUE",
+                                 fetch='one') or {}
+            ci_hotels = int(_ci_hot_row.get('cnt') or 0)
+        except Exception:
+            ci_hotels = 0
+
         # --- UI ---
         title_color = C['red'] if is_z else C['accent']
         icon = '🔴' if is_z else '📋'
@@ -17825,7 +17943,7 @@ class ReportsFrame(tk.Frame):
                     w.bind('<Button-1>', lambda e, cb=on_click: cb())
                     w.configure(cursor='hand2')
 
-        def _show_bookings_popup(title, status_filter, cat_type, icon_color):
+        def _show_bookings_popup(title, status_filter, cat_type, icon_color, hotels_only=False):
             """Popup з деталями бронювань по категорії."""
             from app.utils.db import query as _qp
             win = dlg_win(self, title, "700x520")
@@ -17842,7 +17960,8 @@ class ReportsFrame(tk.Frame):
 
             hdr2 = card(sc); hdr2.pack(fill='x', padx=10, pady=(10,5))
             lbl(hdr2, title, 14, True, icon_color).pack(anchor='w', padx=12, pady=(10,3))
-            lbl(hdr2, f"Тип: {cat_type or 'всі категорії'}", 11, color=C['text2']).pack(anchor='w', padx=12, pady=(0,8))
+            lbl(hdr2, f"Тип: {cat_type or 'всі категорії'}" + ("  •  джерело: 🏨 Hotels" if hotels_only else ""),
+                11, color=C['text2']).pack(anchor='w', padx=12, pady=(0,8))
 
             # Умова фільтрації по категорії
             if cat_type == 'rooms':
@@ -17868,6 +17987,7 @@ class ReportsFrame(tk.Frame):
                 cat_cond = "1=1"
 
             _status_cond = "b.status=%s" if status_filter else "1=1"
+            _hotels_cond = "AND b.source_hotels=TRUE" if hotels_only else ""
 
             # Отримати бронювання
             try:
@@ -17890,6 +18010,7 @@ class ReportsFrame(tk.Frame):
                         WHERE {_status_cond}
                           AND b.created_at >= (SELECT opened_at FROM shifts WHERE id=%s)
                           AND {cat_cond}
+                          {_hotels_cond}
                         ORDER BY b.check_in DESC
                     """, _params) or []
                 else:
@@ -17912,6 +18033,7 @@ class ReportsFrame(tk.Frame):
                         LEFT JOIN room_categories rc ON r.category_id=rc.id
                         WHERE {_status_cond} AND DATE(b.created_at)=%s
                           AND {cat_cond}
+                          {_hotels_cond}
                         ORDER BY b.check_in DESC
                     """, _params) or []
             except Exception as _ex:
@@ -17976,6 +18098,8 @@ class ReportsFrame(tk.Frame):
                  on_click=lambda: _show_bookings_popup("🔥 Заселені бані", "checkedin", "bani", '#e67e22'))
         _ops_row(bk2, "⛺ Бесідок заселено",     ci_besid, '#27ae60',
                  on_click=lambda: _show_bookings_popup("⛺ Заселені бесідки", "checkedin", "besidky", '#27ae60'))
+        _ops_row(bk2, "🏨 Заселено з Hotels",    ci_hotels, '#3498db',
+                 on_click=lambda: _show_bookings_popup("🏨 Заселено з Hotels", "checkedin", None, '#3498db', hotels_only=True))
         _ops_hdr(bk2, "— Нові бронювання за зміну —")
         _ops_row(bk2, "🛏 Номерів заброньовано",  bk_rooms, C['accent'],
                  on_click=lambda: _show_bookings_popup("🛏 Заброньовані номери", "confirmed", "rooms", C['accent']))
@@ -17983,6 +18107,8 @@ class ReportsFrame(tk.Frame):
                  on_click=lambda: _show_bookings_popup("🔥 Заброньовані бані", "confirmed", "bani", '#e67e22'))
         _ops_row(bk2, "⛺ Бесідок заброньовано",  bk_besid, '#27ae60',
                  on_click=lambda: _show_bookings_popup("⛺ Заброньовані бесідки", "confirmed", "besidky", '#27ae60'))
+        _ops_row(bk2, "🏨 Заброньовано з Hotels", bk_hotels, '#3498db',
+                 on_click=lambda: _show_bookings_popup("🏨 Заброньовано з Hotels", "confirmed", None, '#3498db', hotels_only=True))
         _ops_row(bk2, "📋 Всього нових броней",   str(bk.get('cnt') or 0), C['text2'],
                  on_click=lambda: _show_bookings_popup("📋 Всі нові бронювання", None, None, C['text2']))
         _ops_hdr(bk2, "— Ресторан —")
@@ -18071,17 +18197,181 @@ class ReportsFrame(tk.Frame):
         _clean_still = sum(1 for e in _clog_shift if e.get('new_status')=='cleaning')
         _cleaners_used = list(dict.fromkeys(e.get('cleaner','') for e in _clog_shift if e.get('cleaner','')))
 
+        def _stat_row(parent, label, value, color, on_click=None):
+            """Універсальний рядок статистики з опціональним розгортанням (▶)."""
+            rf = tk.Frame(parent, bg=C['card2'], cursor='hand2' if on_click else '')
+            rf.pack(fill='x', padx=10, pady=2)
+            lbl(rf, label, 12).pack(side='left', padx=10, pady=6)
+            v_lbl = lbl(rf, str(value), 11 if len(str(value))>20 else 13, True, color)
+            v_lbl.pack(side='right', padx=15)
+            if on_click:
+                _arrow = lbl(rf, "▶", 10, color=C['text2']); _arrow.pack(side='right', padx=4)
+                for w in (rf, v_lbl, _arrow):
+                    w.bind('<Button-1>', lambda e, cb=on_click: cb())
+                    w.configure(cursor='hand2')
+            return rf
+
+        def _show_cleaning_popup(title, filter_status, icon_color):
+            """Popup зі списком записів прибирання за зміну (опційно відфільтрованих за статусом)."""
+            win = dlg_win(self, title, "650x480")
+            top = tk.Frame(win, bg=C['bg']); top.pack(fill='both', expand=True)
+            cv = tk.Canvas(top, bg=C['bg'], highlightthickness=0)
+            sb = tk.Scrollbar(top, orient='vertical', command=cv.yview)
+            cv.configure(yscrollcommand=sb.set)
+            sb.pack(side='right', fill='y'); cv.pack(side='left', fill='both', expand=True)
+            sc = tk.Frame(cv, bg=C['bg'])
+            cw = cv.create_window((0,0), window=sc, anchor='nw')
+            cv.bind('<Configure>', lambda e: cv.itemconfig(cw, width=e.width))
+            sc.bind('<Configure>', lambda e: cv.configure(scrollregion=cv.bbox('all')))
+            cv.bind('<MouseWheel>', lambda e: cv.yview_scroll(int(-1*(e.delta/120)),'units'))
+            hdr = card(sc); hdr.pack(fill='x', padx=10, pady=(10,5))
+            lbl(hdr, title, 14, True, icon_color).pack(anchor='w', padx=12, pady=(10,3))
+            _rows = _clog_shift if not filter_status else [e for e in _clog_shift if e.get('new_status')==filter_status]
+            if not _rows:
+                lbl(sc, "Немає записів за цю зміну", 12, color=C['text2']).pack(padx=15, pady=20)
+            else:
+                lbl(hdr, f"Записів: {len(_rows)}", 11, color=C['text2']).pack(anchor='w', padx=12, pady=(0,8))
+                for e in _rows:
+                    rf2 = tk.Frame(sc, bg=C['card2']); rf2.pack(fill='x', padx=10, pady=2)
+                    st_clr = C['green'] if e.get('new_status')=='free' else C['yellow']
+                    lbl(rf2, f"🛏 №{e.get('room','')}", 12, True, icon_color).pack(side='left', padx=8, pady=6)
+                    lbl(rf2, f"👤 {e.get('cleaner','—')}", 11, color=C['text2']).pack(side='left', padx=6)
+                    lbl(rf2, STATUS_UA.get(e.get('new_status',''),''), 11, True, st_clr).pack(side='right', padx=8)
+                    lbl(rf2, f"{e.get('started','')} → {e.get('finished','...')}", 10, color=C['text2']).pack(side='right', padx=8)
+            btn_f = tk.Frame(win, bg=C['bg']); btn_f.pack(fill='x', padx=15, pady=8)
+            btn(btn_f, "✖ Закрити", win.destroy, C['card2'], 120, height=36).pack(side='right')
+
+        def _show_cleaners_popup(title, icon_color):
+            """Popup з розбивкою прибирань по кожній прибиральниці."""
+            win = dlg_win(self, title, "550x450")
+            top = tk.Frame(win, bg=C['bg']); top.pack(fill='both', expand=True)
+            cv = tk.Canvas(top, bg=C['bg'], highlightthickness=0)
+            sb = tk.Scrollbar(top, orient='vertical', command=cv.yview)
+            cv.configure(yscrollcommand=sb.set)
+            sb.pack(side='right', fill='y'); cv.pack(side='left', fill='both', expand=True)
+            sc = tk.Frame(cv, bg=C['bg'])
+            cw = cv.create_window((0,0), window=sc, anchor='nw')
+            cv.bind('<Configure>', lambda e: cv.itemconfig(cw, width=e.width))
+            sc.bind('<Configure>', lambda e: cv.configure(scrollregion=cv.bbox('all')))
+            cv.bind('<MouseWheel>', lambda e: cv.yview_scroll(int(-1*(e.delta/120)),'units'))
+            hdr = card(sc); hdr.pack(fill='x', padx=10, pady=(10,5))
+            lbl(hdr, title, 14, True, icon_color).pack(anchor='w', padx=12, pady=(10,8))
+            if not _cleaners_used:
+                lbl(sc, "Немає даних за цю зміну", 12, color=C['text2']).pack(padx=15, pady=20)
+            else:
+                for _cln in _cleaners_used:
+                    _cnt = sum(1 for e in _clog_shift if e.get('cleaner','')==_cln)
+                    rf2 = tk.Frame(sc, bg=C['card2']); rf2.pack(fill='x', padx=10, pady=2)
+                    lbl(rf2, f"👤 {_cln}", 12).pack(side='left', padx=10, pady=6)
+                    lbl(rf2, f"{_cnt} прибирань", 12, True, icon_color).pack(side='right', padx=12)
+            btn_f = tk.Frame(win, bg=C['bg']); btn_f.pack(fill='x', padx=15, pady=8)
+            btn(btn_f, "✖ Закрити", win.destroy, C['card2'], 120, height=36).pack(side='right')
+
+        def _show_rooms_status_popup(title, status_filter, icon_color):
+            """Popup зі списком номерів (опційно за статусом) з поточної шахматки."""
+            win = dlg_win(self, title, "600x500")
+            top = tk.Frame(win, bg=C['bg']); top.pack(fill='both', expand=True)
+            cv = tk.Canvas(top, bg=C['bg'], highlightthickness=0)
+            sb = tk.Scrollbar(top, orient='vertical', command=cv.yview)
+            cv.configure(yscrollcommand=sb.set)
+            sb.pack(side='right', fill='y'); cv.pack(side='left', fill='both', expand=True)
+            sc = tk.Frame(cv, bg=C['bg'])
+            cw = cv.create_window((0,0), window=sc, anchor='nw')
+            cv.bind('<Configure>', lambda e: cv.itemconfig(cw, width=e.width))
+            sc.bind('<Configure>', lambda e: cv.configure(scrollregion=cv.bbox('all')))
+            cv.bind('<MouseWheel>', lambda e: cv.yview_scroll(int(-1*(e.delta/120)),'units'))
+            hdr = card(sc); hdr.pack(fill='x', padx=10, pady=(10,5))
+            lbl(hdr, title, 14, True, icon_color).pack(anchor='w', padx=12, pady=(10,8))
+            try:
+                if status_filter:
+                    _rrows = query("""SELECT r.number, r.status, COALESCE(rc.name,'') AS cat
+                                       FROM rooms r LEFT JOIN room_categories rc ON r.category_id=rc.id
+                                       WHERE r.status=%s ORDER BY r.number""", (status_filter,)) or []
+                else:
+                    _rrows = query("""SELECT r.number, r.status, COALESCE(rc.name,'') AS cat
+                                       FROM rooms r LEFT JOIN room_categories rc ON r.category_id=rc.id
+                                       ORDER BY r.number""") or []
+            except Exception as _exr:
+                _rrows = []
+                lbl(sc, f"Помилка: {_exr}", 11, color=C['red']).pack(padx=15, pady=10)
+            STATUS_UA_R = {'free':'Вільний','checkedin':'Заселено','occupied':'Заселено',
+                           'confirmed':'Заброньовано','cleaning':'Прибирання','repair':'Ремонт'}
+            if not _rrows:
+                lbl(sc, "Немає номерів за цим фільтром", 12, color=C['text2']).pack(padx=15, pady=20)
+            else:
+                for r in _rrows:
+                    rf2 = tk.Frame(sc, bg=C['card2']); rf2.pack(fill='x', padx=10, pady=2)
+                    lbl(rf2, f"🛏 №{r.get('number','')}", 12, True, icon_color).pack(side='left', padx=8, pady=6)
+                    lbl(rf2, r.get('cat','') or '—', 11, color=C['text2']).pack(side='left', padx=6)
+                    lbl(rf2, STATUS_UA_R.get(str(r.get('status','')), str(r.get('status',''))), 11, True).pack(side='right', padx=10)
+            btn_f = tk.Frame(win, bg=C['bg']); btn_f.pack(fill='x', padx=15, pady=8)
+            btn(btn_f, "✖ Закрити", win.destroy, C['card2'], 120, height=36).pack(side='right')
+
+        def _show_visitors_popup(title, mode, icon_color):
+            """Popup зі списком гостей/бронювань за зміну (унікальні гості або нові заселення/виїзди)."""
+            win = dlg_win(self, title, "700x500")
+            top = tk.Frame(win, bg=C['bg']); top.pack(fill='both', expand=True)
+            cv = tk.Canvas(top, bg=C['bg'], highlightthickness=0)
+            sb = tk.Scrollbar(top, orient='vertical', command=cv.yview)
+            cv.configure(yscrollcommand=sb.set)
+            sb.pack(side='right', fill='y'); cv.pack(side='left', fill='both', expand=True)
+            sc = tk.Frame(cv, bg=C['bg'])
+            cw = cv.create_window((0,0), window=sc, anchor='nw')
+            cv.bind('<Configure>', lambda e: cv.itemconfig(cw, width=e.width))
+            sc.bind('<Configure>', lambda e: cv.configure(scrollregion=cv.bbox('all')))
+            cv.bind('<MouseWheel>', lambda e: cv.yview_scroll(int(-1*(e.delta/120)),'units'))
+            hdr = card(sc); hdr.pack(fill='x', padx=10, pady=(10,5))
+            lbl(hdr, title, 14, True, icon_color).pack(anchor='w', padx=12, pady=(10,8))
+            try:
+                if mode == 'unique_guests':
+                    _vrows = query("""
+                        SELECT DISTINCT g.name AS guest, g.phone, r.number AS room, b.status
+                        FROM bookings b
+                        JOIN guests g ON b.guest_id=g.id
+                        LEFT JOIN rooms r ON b.room_id=r.id
+                        WHERE b.created_at >= (SELECT opened_at FROM shifts WHERE id=%s)
+                           OR (b.status = 'checkedin')
+                        ORDER BY g.name
+                    """, (shift_id,)) or []
+                else:  # new_checkin_checkout
+                    _vrows = query("""
+                        SELECT g.name AS guest, g.phone, r.number AS room, b.status,
+                               b.check_in, b.check_out
+                        FROM bookings b
+                        JOIN guests g ON b.guest_id=g.id
+                        LEFT JOIN rooms r ON b.room_id=r.id
+                        WHERE b.status IN ('checkedin','checkedout')
+                          AND b.created_at >= (SELECT opened_at FROM shifts WHERE id=%s)
+                        ORDER BY b.check_in DESC
+                    """, (shift_id,)) or []
+            except Exception as _exv:
+                _vrows = []
+                lbl(sc, f"Помилка: {_exv}", 11, color=C['red']).pack(padx=15, pady=10)
+            STATUS_UA_V = {'checkedin':'Заселений','confirmed':'Заброньований','checkedout':'Виселений','cancelled':'Скасований'}
+            if not _vrows:
+                lbl(sc, "Немає записів за цю зміну", 12, color=C['text2']).pack(padx=15, pady=20)
+            else:
+                lbl(hdr, f"Всього: {len(_vrows)}", 11, color=C['text2']).pack(anchor='w', padx=12, pady=(0,8))
+                for r in _vrows:
+                    rf2 = tk.Frame(sc, bg=C['card2']); rf2.pack(fill='x', padx=10, pady=2)
+                    lbl(rf2, f"👤 {r.get('guest','')}", 12, True, icon_color).pack(side='left', padx=8, pady=6)
+                    lbl(rf2, f"🛏 {r.get('room','') or '—'}", 11, color=C['text2']).pack(side='left', padx=6)
+                    lbl(rf2, f"📞 {r.get('phone','') or ''}", 10, color=C['text2']).pack(side='left', padx=4)
+                    lbl(rf2, STATUS_UA_V.get(str(r.get('status','')), ''), 11, True).pack(side='right', padx=10)
+            btn_f = tk.Frame(win, bg=C['bg']); btn_f.pack(fill='x', padx=15, pady=8)
+            btn(btn_f, "✖ Закрити", win.destroy, C['card2'], 120, height=36).pack(side='right')
+
         cl2 = card(self.result); cl2.pack(fill='x', padx=5, pady=5)
         lbl(cl2, "🧹  Прибирання за зміну", 13, True).pack(anchor='w', padx=12, pady=(10,5))
-        for (p,v,clr) in [
-            ("🧹 Всього прибрань",        str(_clean_cnt),    C['yellow']),
-            ("✅ Після → Вільний",        str(_clean_free),   C['green']),
-            ("🔄 Ще прибирається",        str(_clean_still),  C['accent']),
-            ("👤 Прибиральниці",          ', '.join(_cleaners_used) if _cleaners_used else '—', C['text2']),
-        ]:
-            rf=tk.Frame(cl2,bg=C['card2']); rf.pack(fill='x',padx=10,pady=2)
-            lbl(rf, p, 12).pack(side='left',padx=10,pady=6)
-            lbl(rf, v, 11 if len(str(v))>20 else 13, True, clr).pack(side='right',padx=15)
+        _stat_row(cl2, "🧹 Всього прибрань",  _clean_cnt,  C['yellow'],
+                  on_click=lambda: _show_cleaning_popup("🧹 Всього прибрань за зміну", None, C['yellow']))
+        _stat_row(cl2, "✅ Після → Вільний",  _clean_free, C['green'],
+                  on_click=lambda: _show_cleaning_popup("✅ Прибрано → Вільний", 'free', C['green']))
+        _stat_row(cl2, "🔄 Ще прибирається",  _clean_still, C['accent'],
+                  on_click=lambda: _show_cleaning_popup("🔄 Ще прибирається", 'cleaning', C['accent']))
+        _stat_row(cl2, "👤 Прибиральниці",
+                  ', '.join(_cleaners_used) if _cleaners_used else '—', C['text2'],
+                  on_click=(lambda: _show_cleaners_popup("👤 Прибиральниці за зміну", C['text2'])) if _cleaners_used else None)
         # Список кімнат
         if _clog_shift:
             for e in _clog_shift:
@@ -18096,30 +18386,26 @@ class ReportsFrame(tk.Frame):
         ch_card = card(self.result); ch_card.pack(fill='x', padx=5, pady=5)
         lbl(ch_card, "📅  Шахматка — поточний стан номерів", 13, True).pack(anchor='w', padx=12, pady=(10,5))
         _chess_rows = [
-            ("🏠 Всього номерів",        str(_chess_total),  C['text2']),
-            ("✅ Вільних",               str(_chess_free),   C['green']),
-            ("🔴 Заселено",              str(_chess_occ),    C['accent']),
-            ("📋 Заброньовано",          str(_chess_booked), '#9b59b6'),
-            ("🧹 На прибиранні",         str(_chess_clean),  C['yellow']),
-            ("🔧 На ремонті",            str(_chess_repair), C['red']),
+            ("🏠 Всього номерів",        str(_chess_total),  C['text2'],  None),
+            ("✅ Вільних",               str(_chess_free),   C['green'],  'free'),
+            ("🔴 Заселено",              str(_chess_occ),    C['accent'], 'checkedin'),
+            ("📋 Заброньовано",          str(_chess_booked), '#9b59b6',   'confirmed'),
+            ("🧹 На прибиранні",         str(_chess_clean),  C['yellow'], 'cleaning'),
+            ("🔧 На ремонті",            str(_chess_repair), C['red'],    'repair'),
         ]
-        for (p, v, clr) in _chess_rows:
+        for (p, v, clr, st) in _chess_rows:
             if int(v or 0) == 0 and p not in ("🏠 Всього номерів", "✅ Вільних"): continue
-            rf = tk.Frame(ch_card, bg=C['card2']); rf.pack(fill='x', padx=10, pady=2)
-            lbl(rf, p, 12).pack(side='left', padx=10, pady=6)
-            lbl(rf, v, 13, True, clr).pack(side='right', padx=15)
+            _stat_row(ch_card, p, v, clr,
+                      on_click=lambda t=p, s=st, c=clr: _show_rooms_status_popup(f"{t}", s, c))
         tk.Frame(ch_card, bg=C['card'], height=6).pack()
 
         # Відвідувачі за зміну
         vis_card = card(self.result); vis_card.pack(fill='x', padx=5, pady=5)
         lbl(vis_card, "👥  Відвідувачі", 13, True).pack(anchor='w', padx=12, pady=(10,5))
-        for (p, v, clr) in [
-            ("👥 Унікальних гостей за зміну", str(_visitors_total),   C['accent']),
-            ("🛎 Нових заселень/виїздів",     str(_visitors_checkin), C['green']),
-        ]:
-            rf = tk.Frame(vis_card, bg=C['card2']); rf.pack(fill='x', padx=10, pady=2)
-            lbl(rf, p, 12).pack(side='left', padx=10, pady=6)
-            lbl(rf, v, 13, True, clr).pack(side='right', padx=15)
+        _stat_row(vis_card, "👥 Унікальних гостей за зміну", _visitors_total, C['accent'],
+                  on_click=lambda: _show_visitors_popup("👥 Унікальні гості за зміну", 'unique_guests', C['accent']))
+        _stat_row(vis_card, "🛎 Нових заселень/виїздів", _visitors_checkin, C['green'],
+                  on_click=lambda: _show_visitors_popup("🛎 Нові заселення/виїзди", 'new_checkin_checkout', C['green']))
         tk.Frame(vis_card, bg=C['card'], height=6).pack()
 
         # Кнопки дій
@@ -18738,10 +19024,9 @@ def _run_test_mode_cleanup(on_done=None, on_error=None):
                 _osT.path.join(_osT.path.dirname(_osT.path.abspath(__file__)), 'config', 'db.json'),
             ]:
                 if _osT.path.exists(_cp): _db_json = _cp; break
-            if not _db_json:
+            _tcfg = _read_db_json_robust(_db_json)
+            if not _tcfg:
                 raise RuntimeError("config/db.json не знайдено")
-            with open(_db_json) as _tf:
-                _tcfg = _jsonT.load(_tf)
             _conn = _pg2.connect(
                 host=_tcfg.get('host','localhost'), port=int(_tcfg.get('port',5432)),
                 dbname=_tcfg.get('database','hotel'), user=_tcfg.get('user','hotel'),
@@ -21738,13 +22023,13 @@ class SettingsFrame(tk.Frame):
     def _load_cfg(self):
         try:
             p=os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),'..','..','config','db.json'))
-            with open(p) as f: return json.load(f)
+            return _load_db_cfg_shared(p)
         except: return {'host':'localhost','port':5432,'dbname':'hotel','user':'hotel','password':'hotel'}
 
     def _save_db(self):
         cfg={k:(int(v.get()) if k=='port' else v.get()) for k,v in self.db_flds.items()}
         p=os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),'..','..','config','db.json'))
-        with open(p,'w') as f: json.dump(cfg,f,indent=4)
+        _save_db_cfg_shared(cfg, p)
         self.db_info.configure(text="✓ Збережено",text_color=C['green'])
         # ── Скинути ВСІ кеші підключення щоб новий хост одразу застосувався ──
         # 1. Скинути кеш статусу online/offline в OfflineSyncManager
@@ -22690,9 +22975,9 @@ class SettingsFrame(tk.Frame):
                 ]:
                     if _os.path.exists(_candidate):
                         _db_json = _candidate; break
-                if not _db_json:
+                _cfg = _read_db_json_robust(_db_json)
+                if not _cfg:
                     raise RuntimeError("config/db.json не знайдено")
-                with open(_db_json) as _f: _cfg = _json.load(_f)
                 conn = psycopg2.connect(
                     host=_cfg.get('host','localhost'), port=int(_cfg.get('port',5432)),
                     dbname=_cfg.get('database','hotel'), user=_cfg.get('user','hotel'),
