@@ -98,7 +98,7 @@ import time as _time_mod
 import queue as _queue_mod
 import traceback as _tb_mod
 
-APP_VERSION = "1.0.5"  # Версія — змінюйте при кожному оновленні
+APP_VERSION = "1.0.1"  # Версія — змінюйте при кожному оновленні
 SYNC_INTERVAL = 60    # секунд між автосинхронізаціями
 
 
@@ -847,8 +847,23 @@ def _load_db_cfg_shared(legacy_path):
 def _save_db_cfg_shared(cfg, legacy_path):
     """Зберігає db.json у стабільне місце (джерело правди) і, для сумісності,
     дублює у старий шлях поруч з exe (не критично, якщо його знову змиє
-    наступним перезбиранням — стабільна копія лишається основною)."""
-    with open(_db_cfg_stable_path(), 'w', encoding='utf-8') as f:
+    наступним перезбиранням — стабільна копія лишається основною).
+
+    ВАЖЛИВО: db.json тепер містить ще й секцію "cloud" (хмарний резервний
+    сервер). Раніше цей запис БЕЗУМОВНО перезаписував увесь файл — тобто
+    збереження ГОЛОВНОЇ БД стирало налаштування хмари. Тепер зливаємо з
+    тим, що вже є у файлі, і оновлюємо лише поля основної БД."""
+    stable = _db_cfg_stable_path()
+    try:
+        existing = {}
+        if os.path.exists(stable):
+            with open(stable, encoding='utf-8') as f:
+                existing = json.load(f) or {}
+        existing.update(cfg)
+        cfg = existing
+    except Exception:
+        pass
+    with open(stable, 'w', encoding='utf-8') as f:
         json.dump(cfg, f, indent=4)
     try:
         os.makedirs(os.path.dirname(legacy_path), exist_ok=True)
@@ -1843,6 +1858,38 @@ def cbx_ask_and_receipt(amount: float, payment_type: str, description: str,
 _POS_SETTINGS = {'enabled': True, 'port': '127.0.0.1', 'baudrate': 9101, 'type': 'direct'}
 
 # ── Інформація про готель (завантажується з hotel_info.json) ────────────────
+# ВАЖЛИВО: якщо на цьому комп'ютері налаштовано декілька профілів підключення
+# (декілька готелів — див. SetupWindow._load_profiles), назва/адреса готелю
+# зберігається ОКРЕМО для кожного профілю (по файлу на профіль), інакше зміна
+# назви для одного готелю "перебивала" б назву для іншого — вони фізично
+# зберігались в одному спільному файлі на диску.
+def _hotel_info_filename():
+    """Повертає ім'я файлу hotel_info для АКТИВНОГО профілю підключення
+    (того, що обраний зараз на екрані входу), або дефолтне ім'я, якщо
+    профілів ще не налаштовано (звичайний однохотельний режим)."""
+    import json as _jhf, os as _ojf, re as _rejf
+    try:
+        _lp = _ojf.path.normpath(_ojf.path.join(
+            _ojf.path.dirname(_ojf.path.abspath(__file__)),
+            '..', '..', 'config', 'last_profile.json'))
+        if _ojf.path.exists(_lp):
+            with open(_lp, encoding='utf-8') as _fh:
+                _name = _jhf.load(_fh).get('name', '')
+            if _name:
+                _slug = _rejf.sub(r'[\\/:*?"<>|]+', '_', _name).strip()
+                if _slug:
+                    return f'hotel_info__{_slug}.json'
+    except Exception:
+        pass
+    return 'hotel_info.json'
+
+def _hotel_info_path():
+    import os as _ojp
+    base = _ojp.path.normpath(_ojp.path.join(
+        _ojp.path.dirname(_ojp.path.abspath(__file__)), '..', '..', 'data'))
+    _ojp.makedirs(base, exist_ok=True)
+    return _ojp.path.join(base, _hotel_info_filename())
+
 def _load_hotel_info():
     import json as _jhj, os as _ojh
     _defaults = {
@@ -1852,9 +1899,7 @@ def _load_hotel_info():
         'city':    '',
     }
     try:
-        _p = _ojh.path.normpath(_ojh.path.join(
-            _ojh.path.dirname(_ojh.path.abspath(__file__)),
-            '..', '..', 'data', 'hotel_info.json'))
+        _p = _hotel_info_path()
         if _ojh.path.exists(_p):
             with open(_p, encoding='utf-8') as _fh:
                 _loaded = _jhj.load(_fh)
@@ -1864,6 +1909,167 @@ def _load_hotel_info():
     return _defaults
 
 _HOTEL_INFO = _load_hotel_info()
+
+def _reload_hotel_info_for_active_profile():
+    """Перечитує hotel_info.json для щойно обраного профілю підключення
+    (викликається одразу після входу в програму) — щоб _HOTEL_INFO
+    відповідав саме тому готелю, до якого зараз підключились."""
+    _fresh = _load_hotel_info()
+    _HOTEL_INFO.clear()
+    _HOTEL_INFO.update(_fresh)
+
+# ── Назва/адреса готелю — АВТОРИТЕТНО зберігається в самій підключеній БД ──
+# (таблиця hotel_settings, той самий підхід, що й для прибиральниць). Це
+# надійніше за локальний файл: файл прив'язаний до "профілю" на екрані входу
+# (можна і не використовувати профілі, тоді всі готелі б ділили один файл),
+# а таблиця в БД належить конкретно тій базі даних, до якої підключились —
+# тобто конкретному готелю, завжди коректно, незалежно від профілів.
+def _get_hotel_info_db():
+    import json as _jhi
+    try:
+        from app.utils.db import get_conn as _gchi
+        with _gchi() as _chi:
+            with _chi.cursor() as _curhi:
+                _curhi.execute("""CREATE TABLE IF NOT EXISTS hotel_settings
+                    (key TEXT PRIMARY KEY, value TEXT)""")
+                _chi.commit()
+                _curhi.execute("SELECT value FROM hotel_settings WHERE key='hotel_info'")
+                row = _curhi.fetchone()
+                if row and row[0]:
+                    return _jhi.loads(row[0])
+    except Exception:
+        pass
+    return None
+
+def _save_hotel_info_db(info_dict):
+    """Записує назву/адресу готелю в БД у фоні (не блокує UI)."""
+    import json as _jhi2, threading as _thi2
+    _info_copy = dict(info_dict)
+    def _do():
+        try:
+            from app.utils.db import get_conn as _gchi2
+            with _gchi2() as _chi2:
+                with _chi2.cursor() as _curhi2:
+                    _curhi2.execute("""CREATE TABLE IF NOT EXISTS hotel_settings
+                        (key TEXT PRIMARY KEY, value TEXT)""")
+                    val = _jhi2.dumps(_info_copy, ensure_ascii=False)
+                    _curhi2.execute("""INSERT INTO hotel_settings(key,value) VALUES('hotel_info',%s)
+                        ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value""", (val,))
+                _chi2.commit()
+        except Exception as _e:
+            try: log_error("_save_hotel_info_db", _e)
+            except Exception: pass
+    _thi2.Thread(target=_do, daemon=True).start()
+
+def _reload_hotel_info_from_db():
+    """Викликається одразу після успішного входу — підвантажує назву готелю
+    з таблиці hotel_settings ТІЄЇ бази даних, до якої щойно підключились.
+    Це головне джерело правди: кожен готель = окрема БД = окрема назва.
+    Якщо в цій БД назви ще нема (нова база) — ініціалізує її поточним
+    (локальним) значенням, щоб надалі трималась саме в цій БД."""
+    info = _get_hotel_info_db()
+    if info:
+        _HOTEL_INFO.update(info)
+    else:
+        try: _save_hotel_info_db(dict(_HOTEL_INFO))
+        except Exception: pass
+
+# ── Налаштування лівої панелі (яких пунктів меню показувати) ────────────────
+# Ключі, які НЕ можна вимкнути (завжди присутні в меню)
+_SIDEBAR_CORE_KEYS = {'dashboard', 'settings'}
+
+def _sidebar_cfg_path():
+    import os as _oscp
+    base = _oscp.path.normpath(_oscp.path.join(
+        _oscp.path.dirname(_oscp.path.abspath(__file__)), '..', '..', 'data'))
+    _oscp.makedirs(base, exist_ok=True)
+    return _oscp.path.join(base, 'sidebar_config.json')
+
+def _load_sidebar_cfg():
+    import json as _jsc
+    try:
+        _p = _sidebar_cfg_path()
+        import os as _oslc
+        if _oslc.path.exists(_p):
+            with open(_p, encoding='utf-8') as _fh:
+                return _jsc.load(_fh)
+    except Exception:
+        pass
+    return {}
+
+_SIDEBAR_CFG = _load_sidebar_cfg()
+
+def _sidebar_visible(key):
+    """Пункт меню показується, якщо він core, або явно не вимкнений в налаштуваннях."""
+    if key in _SIDEBAR_CORE_KEYS:
+        return True
+    return _SIDEBAR_CFG.get(key, True)
+
+# ── Налаштування лівої панелі — так само, як і назва готелю, зберігаються
+# АВТОРИТЕТНО в самій підключеній БД (кожен готель = окрема база = окремі
+# налаштування меню, а не спільні на весь комп'ютер).
+def _get_sidebar_cfg_db():
+    import json as _jsi
+    try:
+        from app.utils.db import get_conn as _gcsi
+        with _gcsi() as _csi:
+            with _csi.cursor() as _cursi:
+                _cursi.execute("""CREATE TABLE IF NOT EXISTS hotel_settings
+                    (key TEXT PRIMARY KEY, value TEXT)""")
+                _csi.commit()
+                _cursi.execute("SELECT value FROM hotel_settings WHERE key='sidebar_config'")
+                row = _cursi.fetchone()
+                if row and row[0]:
+                    return _jsi.loads(row[0])
+    except Exception:
+        pass
+    return None
+
+def _save_sidebar_cfg_db(cfg_dict):
+    """Записує налаштування лівої панелі в БД у фоні (не блокує UI)."""
+    import json as _jsi2, threading as _thsi2
+    _cfg_copy = dict(cfg_dict)
+    def _do():
+        try:
+            from app.utils.db import get_conn as _gcsi2
+            with _gcsi2() as _csi2:
+                with _csi2.cursor() as _cursi2:
+                    _cursi2.execute("""CREATE TABLE IF NOT EXISTS hotel_settings
+                        (key TEXT PRIMARY KEY, value TEXT)""")
+                    val = _jsi2.dumps(_cfg_copy, ensure_ascii=False)
+                    _cursi2.execute("""INSERT INTO hotel_settings(key,value) VALUES('sidebar_config',%s)
+                        ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value""", (val,))
+                _csi2.commit()
+        except Exception as _e:
+            try: log_error("_save_sidebar_cfg_db", _e)
+            except Exception: pass
+    _thsi2.Thread(target=_do, daemon=True).start()
+
+def _reload_sidebar_cfg_from_db():
+    """Викликається одразу після успішного входу — підвантажує налаштування
+    лівої панелі з таблиці hotel_settings ТІЄЇ бази даних, до якої щойно
+    підключились. Якщо в цій БД налаштувань ще нема — ініціалізує поточним
+    (локальним) значенням, щоб надалі трималось саме в цій БД."""
+    cfg = _get_sidebar_cfg_db()
+    if cfg is not None:
+        _SIDEBAR_CFG.clear()
+        _SIDEBAR_CFG.update(cfg)
+    else:
+        try: _save_sidebar_cfg_db(dict(_SIDEBAR_CFG))
+        except Exception: pass
+
+def _find_hotel_app(widget):
+    """Піднімається по дереву tkinter-віджетів від будь-якого фрейму налаштувань
+    до головного вікна програми (HotelApp), щоб можна було оновити сайдбар/заголовок
+    одразу після збереження — без перезапуску."""
+    w = widget
+    for _ in range(25):
+        if w is None:
+            return None
+        if hasattr(w, '_rebuild_sidebar') and hasattr(w, '_refresh_hotel_name'):
+            return w
+        w = getattr(w, 'master', None)
+    return None
 # URL для QR-коду на чеках — завантажується з qr_config.json
 # Можна змінити у Налаштування → Логіка → «QR-код на чеках»
 def _load_qr_url_at_startup():
@@ -2800,6 +3006,23 @@ class SetupWindow(ctk.CTk):
 
         db = card(scroll); db.pack(fill='x', padx=25, pady=5)
         lbl(db,"⚙️  База даних",13,True).pack(anchor='w', padx=12, pady=(10,6))
+
+        # ── Збережені профілі підключення (декілька готелів) ───────────────
+        _profiles = self._load_profiles()
+        _prof_row = row_frm(db)
+        ctk.CTkLabel(_prof_row,text="Готель",font=('Segoe UI',11),text_color=C['text2'],width=90,anchor='w').pack(side='left')
+        _prof_names = ["— обрати профіль —"] + [p.get('name','?') for p in _profiles]
+        self._prof_var = tk.StringVar(value=_prof_names[0])
+        self._prof_menu = ctk.CTkOptionMenu(
+            _prof_row, variable=self._prof_var, values=_prof_names, width=300,
+            fg_color=C['card2'], button_color=C['border'], button_hover_color=C['accent'],
+            dropdown_fg_color=C['card2'], text_color=C['text'],
+            command=self._on_profile_selected)
+        self._prof_menu.pack(side='left')
+        _prof_bf = ctk.CTkFrame(db, fg_color='transparent'); _prof_bf.pack(fill='x', padx=12, pady=(2,8))
+        btn(_prof_bf,"💾 Зберегти як новий профіль",self._save_profile,C['card2'],220).pack(side='left',padx=(0,6))
+        btn(_prof_bf,"🗑 Видалити профіль",self._delete_profile,C['red'],170).pack(side='left')
+
         cfg = self._load_cfg()
         self.dbf = {}
         for label_text, key in [("Host",'host'),("Port",'port'),("Database",'dbname'),("User",'user'),("Password",'password')]:
@@ -2816,7 +3039,14 @@ class SetupWindow(ctk.CTk):
         lg = card(scroll); lg.pack(fill='x', padx=25, pady=5)
         lbl(lg,"🔐  Вхід",13,True).pack(anchor='w', padx=12, pady=(10,6))
         f1=row_frm(lg); ctk.CTkLabel(f1,text="Логін",font=('Segoe UI',11),text_color=C['text2'],width=80,anchor='w').pack(side='left')
-        self.e_user=ent(f1,w=310); self.e_user.pack(side='left')
+        _login_hist = self._load_login_history()
+        self.e_user = ctk.CTkComboBox(f1, values=_login_hist, width=310,
+                                       fg_color=C['card2'], border_color=C['border'],
+                                       text_color=C['text'], font=('Segoe UI',12),
+                                       dropdown_fg_color=C['card2'],
+                                       button_color=C['border'], button_hover_color=C['accent'])
+        self.e_user.set('')
+        self.e_user.pack(side='left')
         f2=row_frm(lg); ctk.CTkLabel(f2,text="Пароль",font=('Segoe UI',11),text_color=C['text2'],width=80,anchor='w').pack(side='left')
         self.e_pass=ent(f2,w=310,show='*'); self.e_pass.pack(side='left')
         # ── Галочка "Запам'ятати логін" ──
@@ -2828,13 +3058,155 @@ class SetupWindow(ctk.CTk):
         # ── Підвантажити збережений логін ──
         _lc = self._load_login_cache()
         if _lc.get('remember'):
-            self.e_user.insert(0, _lc.get('username',''))
+            self.e_user.set(_lc.get('username',''))
             self.e_pass.insert(0, _lc.get('password',''))
             self._remember_var.set(True)
         btn(lg,"▶  Увійти",self._login,height=42).pack(fill='x',padx=12,pady=(6,15))
         self.e_pass.bind('<Return>', lambda e: self._login())
         # Відступ знизу щоб кнопка не обрізалась
         ctk.CTkFrame(scroll, fg_color='transparent', height=20).pack()
+
+        # ── Автозастосувати останній обраний профіль підключення ───────────
+        _last_prof = self._load_last_profile()
+        if _last_prof and _last_prof in _prof_names:
+            self._prof_var.set(_last_prof)
+            self._on_profile_selected(_last_prof, fill_login=False)
+
+    # ── Збережені профілі підключення (декілька готелів) ───────────────────
+    def _profiles_path(self):
+        p = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),'..','..','config','db_profiles.json'))
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        return p
+
+    def _load_profiles(self):
+        try:
+            with open(self._profiles_path(), encoding='utf-8') as f:
+                data = json.load(f)
+                return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def _save_profiles(self, profiles):
+        try:
+            with open(self._profiles_path(), 'w', encoding='utf-8') as f:
+                json.dump(profiles, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            log_error("_save_profiles", e)
+
+    def _on_profile_selected(self, name, fill_login=True):
+        if name == "— обрати профіль —":
+            return
+        for p in self._load_profiles():
+            if p.get('name') == name:
+                for key in ('host','port','dbname','user','password'):
+                    e = self.dbf.get(key)
+                    if e is not None:
+                        e.delete(0, 'end'); e.insert(0, str(p.get(key,'')))
+                # Підставляємо і логін/пароль користувача, якщо збережені в профілі
+                # (тільки при ручному виборі зі списку — щоб не перебивати вже
+                # підвантажений через "Запам'ятати логін" збережений логін)
+                if fill_login:
+                    if 'login_username' in p:
+                        self.e_user.set(p.get('login_username',''))
+                    if 'login_password' in p:
+                        self.e_pass.delete(0,'end'); self.e_pass.insert(0, p.get('login_password',''))
+                self._save_cfg()
+                self._save_last_profile(name)
+                self.db_lbl.configure(text=f"✓ Профіль «{name}» завантажено", text_color=C['green'])
+                break
+
+    def _save_profile(self):
+        from tkinter import simpledialog
+        _default = self._prof_var.get() if self._prof_var.get() != "— обрати профіль —" else ""
+        name = simpledialog.askstring("Зберегти профіль", "Назва готелю / профілю:", initialvalue=_default, parent=self)
+        if not name:
+            return
+        name = name.strip()
+        if not name:
+            return
+        profiles = self._load_profiles()
+        new_profile = {
+            'name': name,
+            'host': self.dbf['host'].get().strip(),
+            'port': self.dbf['port'].get().strip(),
+            'dbname': self.dbf['dbname'].get().strip(),
+            'user': self.dbf['user'].get().strip(),
+            'password': self.dbf['password'].get(),
+            'login_username': self.e_user.get().strip(),
+            'login_password': self.e_pass.get(),
+        }
+        profiles = [p for p in profiles if p.get('name') != name]
+        profiles.append(new_profile)
+        self._save_profiles(profiles)
+        _names = ["— обрати профіль —"] + [p.get('name','?') for p in profiles]
+        self._prof_menu.configure(values=_names)
+        self._prof_var.set(name)
+        self._save_last_profile(name)
+        self.db_lbl.configure(text=f"✅ Профіль «{name}» збережено", text_color=C['green'])
+
+    def _delete_profile(self):
+        name = self._prof_var.get()
+        if name == "— обрати профіль —":
+            messagebox.showwarning("", "Оберіть профіль для видалення"); return
+        if not messagebox.askyesno("Видалити профіль?", f"Видалити збережений профіль «{name}»?"):
+            return
+        profiles = [p for p in self._load_profiles() if p.get('name') != name]
+        self._save_profiles(profiles)
+        _names = ["— обрати профіль —"] + [p.get('name','?') for p in profiles]
+        self._prof_menu.configure(values=_names)
+        self._prof_var.set(_names[0])
+        if self._load_last_profile() == name:
+            self._save_last_profile('')
+        self.db_lbl.configure(text=f"🗑 Профіль «{name}» видалено", text_color=C['text2'])
+
+    def _last_profile_path(self):
+        p = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),'..','..','config','last_profile.json'))
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        return p
+
+    def _load_last_profile(self):
+        try:
+            with open(self._last_profile_path(), encoding='utf-8') as f:
+                return json.load(f).get('name', '')
+        except Exception:
+            return ''
+
+    def _save_last_profile(self, name):
+        try:
+            with open(self._last_profile_path(), 'w', encoding='utf-8') as f:
+                json.dump({'name': name}, f, ensure_ascii=False)
+        except Exception as e:
+            log_error("_save_last_profile", e)
+
+    # ── Історія логінів (для випадаючого списку на полі "Логін") ──────────
+    def _login_history_path(self):
+        p = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),'..','..','config','login_history.json'))
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        return p
+
+    def _load_login_history(self):
+        try:
+            with open(self._login_history_path(), encoding='utf-8') as f:
+                data = json.load(f)
+                return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def _add_login_history(self, username):
+        if not username:
+            return
+        try:
+            hist = self._load_login_history()
+            hist = [u for u in hist if u != username]
+            hist.insert(0, username)
+            hist = hist[:10]
+            with open(self._login_history_path(), 'w', encoding='utf-8') as f:
+                json.dump(hist, f, ensure_ascii=False)
+            if hasattr(self, 'e_user'):
+                try: self.e_user.configure(values=hist)
+                except Exception: pass
+        except Exception as e:
+            log_error("_add_login_history", e)
 
     def _load_login_cache(self):
         try:
@@ -2914,15 +3286,38 @@ class SetupWindow(ctk.CTk):
         username = self.e_user.get().strip()
         password = self.e_pass.get().strip()
         _is_offline_login = False
+        _login_via_cloud = False
         try:
             from app.utils.db import query, get_conn as _gcL
-            # Перевірити чи PG доступний
+            # ── Спершу пробуємо ЖИВИЙ запит. query()/get_conn() самі вміють
+            # автоматично перемкнутись на хмарний резервний сервер, якщо
+            # основний недоступний — тож РАНІШЕ тут перевірявся лише
+            # основний (_sync_mgr.check_online() б'є TCP-пінгом лише в
+            # основний), і при недоступності основного логін ішов у
+            # ЛОКАЛЬНИЙ КЕШ, навіть коли хмара була живою і мала свіжіші
+            # дані (наприклад щойно змінений пароль). Тепер спершу
+            # намагаємось достукатись хоч куди-небудь (основний АБО хмара),
+            # і лише якщо не вдалось НІКУДИ — відкочуємось на кеш.
             _t_chk = _time_mod.monotonic()
-            _pg_ok = _sync_mgr.check_online()
-            try: log_info(f"[STARTUP] _login: check_online()={_pg_ok} за {(_time_mod.monotonic()-_t_chk)*1000:.0f}мс")
+            u = None
+            _pg_ok = False
+            try:
+                u = query("SELECT * FROM users WHERE username=%s AND password=%s AND active=TRUE",
+                          (username, password), fetch='one')
+                _pg_ok = True
+                try:
+                    from app.utils.db import get_backend_status
+                    _login_via_cloud = get_backend_status().get('backend') == 'cloud'
+                except Exception:
+                    pass
+            except Exception as _e_login_q:
+                _pg_ok = False
+                try: log_info(f"[STARTUP] _login: живий запит не вдався ({_e_login_q}), пробую офлайн-кеш")
+                except Exception: pass
+            try: log_info(f"[STARTUP] _login: pg_ok={_pg_ok} cloud={_login_via_cloud} за {(_time_mod.monotonic()-_t_chk)*1000:.0f}мс")
             except Exception: pass
             if not _pg_ok:
-                # ── ОФЛАЙН: авторизація з кешу ──
+                # ── ОФЛАЙН (і основний, і хмара недоступні/не налаштовані): авторизація з кешу ──
                 u = self._get_user_from_cache(username, password)
                 if not u:
                     messagebox.showerror("Сервер недоступний",
@@ -2932,17 +3327,35 @@ class SetupWindow(ctk.CTk):
                 # Показати попередження про офлайн-режим
                 messagebox.showwarning("⚠️ Офлайн-режим",
                     "Сервер БД недоступний. Всі зміни зберігаються локально та синхронізуються при відновленні зв'язку.")
-            else:
-                _t_q = _time_mod.monotonic()
-                u = query("SELECT * FROM users WHERE username=%s AND password=%s AND active=TRUE",
-                          (username, password), fetch='one')
-                try: log_info(f"[STARTUP] _login: запит users виконано за {(_time_mod.monotonic()-_t_q)*1000:.0f}мс")
-                except Exception: pass
+            elif _login_via_cloud:
+                messagebox.showwarning("☁️ Резервний режим",
+                    "Основний сервер недоступний. Програма працює через хмарний резервний сервер "
+                    "— усі функції доступні як зазвичай, дані автоматично довантажаться в основну БД, "
+                    "щойно вона повернеться.")
             if not u:
                 messagebox.showerror("Помилка","Невірний логін або пароль"); return
 
             role = u.get('role','')
             username = u.get('username','')
+
+            # Перечитати назву/адресу готелю для АКТИВНОГО профілю підключення —
+            # якщо на цьому ПК налаштовано декілька готелів, кожен має власний
+            # файл hotel_info, щоб назви не "перебивали" одна одну.
+            try: _reload_hotel_info_for_active_profile()
+            except Exception: pass
+            # Головне джерело правди — сама підключена БД (кожен готель = окрема
+            # база, тому назва звідти завжди коректна незалежно від профілів на
+            # екрані входу). Виконуємо синхронно (швидкий SELECT), щоб дашборд,
+            # заголовок і чеки одразу відкрились з правильною назвою.
+            if not _is_offline_login:
+                try: _reload_hotel_info_from_db()
+                except Exception: pass
+                try: _reload_sidebar_cfg_from_db()
+                except Exception: pass
+
+            # Зберегти логін в історію (для випадаючого списку), без пароля
+            try: self._add_login_history(username)
+            except Exception: pass
 
             # Зберегти логін якщо увімкнена галочка
             try:
@@ -3032,6 +3445,48 @@ class SetupWindow(ctk.CTk):
             messagebox.showerror("Помилка БД", f"{e}")
 
 # ══════════════════════════════════════════════════════
+# ── Список пунктів лівого меню (іконка, назва, ключ) ─────────────────────
+# Використовується при побудові сайдбару та у Налаштування → Ліва панель
+_NAV_ITEMS = [
+    ("🏡","Дашборд","dashboard"),
+    ("♟️","Шахматка","chess"),
+    ("📌","Заброньовано","bookings"),
+    ("✅","Заселені","checkedin"),
+    ("🏁","Виселені","checkedout"),
+    ("🌅","Заїзди","arrivals"),
+    ("🌇","Виїзди","departures"),
+    ("🧺","Прибирання","cleaning"),
+    ("🛏️","Номери","rooms"),
+    ("💵","Каса","cashier"),
+    ("🍴","Ресторан","restaurant"),
+    ("🌿","Бесідки","gazebo"),
+    ("🌊","Бані","sauna"),
+    ("📈","Звіти","reports"),
+    ("👥","Відвідувачі","visitors"),
+    ("📒","База гостей","guestdb"),
+    ("⚙️","Налаштування","settings"),
+]
+_NAV_ICON_COLORS = {
+    "dashboard":  "#5B9BD5",
+    "chess":      "#9B7EDE",
+    "bookings":   "#4FC3A1",
+    "checkedin":  "#52C97A",
+    "checkedout": "#E0686C",
+    "arrivals":   "#4FB6E8",
+    "departures": "#E8A24F",
+    "cleaning":   "#5FD0D0",
+    "rooms":      "#C9A24B",
+    "cashier":    "#52C97A",
+    "restaurant": "#E8915F",
+    "gazebo":     "#7BC267",
+    "sauna":      "#E8775F",
+    "reports":    "#5B9BD5",
+    "visitors":   "#B07EE0",
+    "guestdb":    "#5FA8D3",
+    "settings":   "#9AA5B1",
+}
+
+
 class HotelApp(ctk.CTk):
     def _quit(self):
         try:
@@ -3194,6 +3649,16 @@ class HotelApp(ctk.CTk):
                 shift_id = get_current_shift_id()
                 _sync_mgr.on_shift_open(shift_id)
                 log_info(f"[OfflineSync] Менеджер запущено, shift_id={shift_id}")
+                # 4b. Хмарний failover-вартовий: якщо основний сервер впаде,
+                # get_conn() сам перемкнеться на хмару (якщо вона налаштована
+                # у Налаштування → База даних); цей потік лише стежить, коли
+                # основний повернеться, і тоді довантажує дані з хмари назад.
+                try:
+                    from app.utils.db import start_failover_watcher, start_reference_sync_scheduler
+                    start_failover_watcher()
+                    start_reference_sync_scheduler()
+                except Exception as _e_fw:
+                    log_error("[DB failover] не вдалося запустити watcher", _e_fw)
             _step("4. _sync_mgr.start() + on_shift_open", _start_sync)
             log_info("[STARTUP] _bg_init: ВСІ кроки фонової ініціалізації завершено")
         _thr_init.Thread(target=_bg_init, daemon=True).start()
@@ -3480,6 +3945,19 @@ class HotelApp(ctk.CTk):
                 return
             online = _sync_mgr.is_online()
             pending = _sync_mgr.pending_count()
+            # is_online() перевіряє ЛИШЕ основний сервер (прямий TCP-пінг).
+            # Якщо основний недоступний, але застосунок фактично успішно
+            # працює через ХМАРНИЙ резервний сервер (db.py сам туди
+            # перемкнувся при останньому запиті) — це НЕ те саме, що
+            # справжній офлайн: дані нікуди не губляться, все working
+            # normally. Показуємо це окремим — жовтим, не червоним — станом.
+            _on_cloud = False
+            if not online:
+                try:
+                    from app.utils.db import get_backend_status
+                    _on_cloud = get_backend_status().get('backend') == 'cloud'
+                except Exception:
+                    _on_cloud = False
             if online and pending == 0:
                 self._sync_dot.configure(text_color=C['green'])
                 self._sync_lbl.configure(text=" ☁ Синхронізовано", text_color=C['text2'])
@@ -3489,6 +3967,11 @@ class HotelApp(ctk.CTk):
                 self._sync_dot.configure(text_color=C['yellow'])
                 self._sync_lbl.configure(text=" ☁ Вивантаження...", text_color=C['yellow'])
                 self._sync_count_lbl.configure(text=f"{pending} оп.")
+                self._sync_badge.configure(fg_color='#2a2500')
+            elif _on_cloud:
+                self._sync_dot.configure(text_color=C['yellow'])
+                self._sync_lbl.configure(text=" ☁ Хмара (резерв)", text_color=C['yellow'])
+                self._sync_count_lbl.configure(text="основний недоступний", text_color=C['yellow'])
                 self._sync_badge.configure(fg_color='#2a2500')
             else:
                 self._sync_dot.configure(text_color=C['red'])
@@ -3754,12 +4237,24 @@ class HotelApp(ctk.CTk):
                     return  # застарілий результат (watchdog вже оновив стан)
                 if not self.winfo_exists(): return
                 if ok:
-                    clr = C['green'] if ms < 50 else C['yellow'] if ms < 200 else C['red']
-                    self._db_dot.configure(text_color=clr)
-                    self._db_lbl.configure(text=" 🗄 БД: підключено", text_color=C['green'])
-                    self._db_ping_lbl.configure(text=f"{ms}ms", text_color=clr)
-                    try: self._db_badge.configure(fg_color='#162416')
-                    except Exception: pass
+                    try:
+                        from app.utils.db import get_backend_status
+                        _on_cloud = get_backend_status().get('backend') == 'cloud'
+                    except Exception:
+                        _on_cloud = False
+                    if _on_cloud:
+                        self._db_dot.configure(text_color=C['yellow'])
+                        self._db_lbl.configure(text=" ☁ БД: ХМАРА (резерв)", text_color=C['yellow'])
+                        self._db_ping_lbl.configure(text=f"{ms}ms", text_color=C['yellow'])
+                        try: self._db_badge.configure(fg_color='#2e2410')
+                        except Exception: pass
+                    else:
+                        clr = C['green'] if ms < 50 else C['yellow'] if ms < 200 else C['red']
+                        self._db_dot.configure(text_color=clr)
+                        self._db_lbl.configure(text=" 🗄 БД: підключено", text_color=C['green'])
+                        self._db_ping_lbl.configure(text=f"{ms}ms", text_color=clr)
+                        try: self._db_badge.configure(fg_color='#162416')
+                        except Exception: pass
                 else:
                     self._db_dot.configure(text_color=C['red'])
                     self._db_lbl.configure(text=" 🗄 БД: немає зв'язку", text_color=C['red'])
@@ -3813,7 +4308,8 @@ class HotelApp(ctk.CTk):
         sb_top = tk.Frame(sb, bg=C['card'])
         sb_top.pack(fill='x', side='top')
         ctk.CTkLabel(sb_top, text="🏨", font=('Segoe UI',40)).pack(pady=(20,0))
-        lbl(sb_top, _HOTEL_INFO.get('name','Готель\nКоролівська Бочка').replace(' ','\n',1), 13, True, C['accent']).pack()
+        self._sb_hotel_lbl = lbl(sb_top, _HOTEL_INFO.get('name','Готель\nКоролівська Бочка').replace(' ','\n',1), 13, True, C['accent'])
+        self._sb_hotel_lbl.pack()
         lbl(sb_top,f"👤 {self.user['full_name']}",11,color=C['text2']).pack(pady=(3,3))
 
         # ── Статус БД — бейдж-хмарка ─────────────────────
@@ -3884,52 +4380,8 @@ class HotelApp(ctk.CTk):
         sb_nav.pack(fill='both', expand=True, side='top')
 
         self.nav = {}; self.active = None
-        _NAV_ICON_COLORS = {
-            "dashboard":  "#5B9BD5",
-            "chess":      "#9B7EDE",
-            "bookings":   "#4FC3A1",
-            "checkedin":  "#52C97A",
-            "checkedout": "#E0686C",
-            "arrivals":   "#4FB6E8",
-            "departures": "#E8A24F",
-            "cleaning":   "#5FD0D0",
-            "rooms":      "#C9A24B",
-            "cashier":    "#52C97A",
-            "restaurant": "#E8915F",
-            "gazebo":     "#7BC267",
-            "sauna":      "#E8775F",
-            "reports":    "#5B9BD5",
-            "visitors":   "#B07EE0",
-            "guestdb":    "#5FA8D3",
-            "settings":   "#9AA5B1",
-        }
-        for icon, name, key in [
-            ("🏡","Дашборд","dashboard"),
-            ("♟️","Шахматка","chess"),
-            ("📌","Заброньовано","bookings"),
-            ("✅","Заселені","checkedin"),
-            ("🏁","Виселені","checkedout"),
-            ("🌅","Заїзди","arrivals"),
-            ("🌇","Виїзди","departures"),
-            ("🧺","Прибирання","cleaning"),
-            ("🛏️","Номери","rooms"),
-            ("💵","Каса","cashier"),
-            ("🍴","Ресторан","restaurant"),
-            ("🌿","Бесідки","gazebo"),
-            ("🌊","Бані","sauna"),
-            ("📈","Звіти","reports"),
-            ("👥","Відвідувачі","visitors"),
-            ("📒","База гостей","guestdb"),
-            ("⚙️","Налаштування","settings"),
-        ]:
-            _color = _NAV_ICON_COLORS.get(key, C['text'])
-            b = ctk.CTkButton(
-                sb_nav, text=f" {icon}  {name}", anchor='w',
-                fg_color='transparent', hover_color=C['card2'],
-                text_color=_color, font=('Segoe UI', 13, 'bold'), height=44,
-                corner_radius=10, command=lambda k=key: self._show(k))
-            b.pack(fill='x', padx=10, pady=2)
-            self.nav[key] = b
+        self._sb_nav = sb_nav
+        self._populate_nav()
 
         # Сайдбар — скрол через canvas (єдиний обробник, без дублів)
         def _nav_scroll(e):
@@ -3948,17 +4400,55 @@ class HotelApp(ctk.CTk):
         # Відкласти показ дашборду — вікно намалюється миттєво, вміст підвантажується
         self.after(10, lambda: self._show('dashboard'))
 
+    def _populate_nav(self):
+        """Будує кнопки лівого меню з урахуванням налаштувань видимості (_SIDEBAR_CFG).
+        Може викликатись повторно (при зміні налаштувань) — попередньо очищає self.nav.
+        """
+        for _b in self.nav.values():
+            try: _b.destroy()
+            except Exception: pass
+        self.nav = {}
+        for icon, name, key in _NAV_ITEMS:
+            if not _sidebar_visible(key):
+                continue
+            _color = _NAV_ICON_COLORS.get(key, C['text'])
+            b = ctk.CTkButton(
+                self._sb_nav, text=f" {icon}  {name}", anchor='w',
+                fg_color='transparent', hover_color=C['card2'],
+                text_color=_color, font=('Segoe UI', 13, 'bold'), height=44,
+                corner_radius=10, command=lambda k=key: self._show(k))
+            b.pack(fill='x', padx=10, pady=2)
+            self.nav[key] = b
+
+    def _rebuild_sidebar(self):
+        """Викликається з Налаштування → Ліва панель після збереження змін.
+        Перебудовує кнопки меню та, якщо активна вкладка вимкнена, перемикає на дашборд.
+        """
+        self._populate_nav()
+        if self.active not in self.nav:
+            self._show('dashboard')
+        else:
+            # Підсвітити активну кнопку заново (нові кнопки без підсвітки)
+            self.nav[self.active].configure(fg_color=C['accent'], text_color='white')
+
+    def _refresh_hotel_name(self):
+        """Оновлює назву готелю в шапці вікна та у верхньому логотипі сайдбару
+        одразу після збереження в Налаштуваннях — без перезапуску програми."""
+        try:
+            self.title(f"🏨 {_HOTEL_INFO.get('name','Готель')} — {self.user['full_name']}")
+        except Exception: pass
+        try:
+            if hasattr(self, '_sb_hotel_lbl') and self._sb_hotel_lbl.winfo_exists():
+                self._sb_hotel_lbl.configure(
+                    text=_HOTEL_INFO.get('name','Готель\nКоролівська Бочка').replace(' ','\n',1))
+        except Exception: pass
+
     def _show(self, key):
+        # 0. Захист: якщо пункт меню вимкнений в налаштуваннях — на дашборд
+        if key not in self.nav:
+            key = 'dashboard'
         # 1. Оновити підсвітку кнопок навігації
-        _NAV_ICON_COLORS = {
-            "dashboard":"#5B9BD5","chess":"#9B7EDE","bookings":"#4FC3A1",
-            "checkedin":"#52C97A","checkedout":"#E0686C","arrivals":"#4FB6E8",
-            "departures":"#E8A24F","cleaning":"#5FD0D0","rooms":"#C9A24B",
-            "cashier":"#52C97A","restaurant":"#E8915F","gazebo":"#7BC267",
-            "sauna":"#E8775F","reports":"#5B9BD5","visitors":"#B07EE0",
-            "guestdb":"#5FA8D3","settings":"#9AA5B1",
-        }
-        if self.active:
+        if self.active and self.active in self.nav:
             _c = _NAV_ICON_COLORS.get(self.active, C['text'])
             self.nav[self.active].configure(fg_color='transparent', text_color=_c)
         # Активна кнопка: акцентний фон + біла іконка+текст
@@ -6396,7 +6886,7 @@ class RoomsFrame(tk.Frame):
                             try: _cu.execute("INSERT INTO payments(room_id,amount,method,note,shift_id,created_at) VALUES(%s,%s,%s,%s,%s,NOW())",(sel_room['id'],total,meth_var.get(),f"Послуга: {note}",get_current_shift_id()))
                             except: _cu.execute("INSERT INTO payments(booking_id,amount,method,note,shift_id,created_at) VALUES(NULL,%s,%s,%s,%s,NOW())",(total,meth_var.get(),f"Послуга: {note}",get_current_shift_id()))
                         _cc.commit()
-                lines=[f"  Готель: Готель Королівська Бочка",f"{'─'*50}",f"  🛎 ЧЕК ПОСЛУГИ",f"{'─'*50}",
+                lines=[f"  Готель: {_HOTEL_INFO.get('name','Готель Королівська Бочка')}",f"{'─'*50}",f"  🛎 ЧЕК ПОСЛУГИ",f"{'─'*50}",
                        f"  Номер  : №{sel_room['number']} ({sel_room.get('cat_name','')})",
                        f"  Послуга: {s['name']}",f"  К-сть  : {qty} {s.get('unit','шт')}",
                        f"  Ціна   : {pr:.0f}₴",f"{'─'*50}",f"  Сума   : {total:.0f}₴",
@@ -7176,7 +7666,7 @@ def _open_checkout_dlg(parent, bid, on_close=None):
         _cl_append({'room': str(b.get('room_number', b['room_id'])), 'cleaner': '—', 'started': _dt.datetime.now().strftime('%d.%m.%Y %H:%M'), 'finished': '', 'new_status': 'cleaning', 'note': 'Авто-запис при виселенні', 'logged_at': _dt.datetime.now().strftime('%d.%m.%Y %H:%M:%S')})
 
         lines = [
-            f"  Готель: Готель Королівська Бочка",
+            f"  Готель: {_HOTEL_INFO.get('name','Готель Королівська Бочка')}",
             f"{'─'*52}",
             f"  🚪 ЧЕК ВИСЕЛЕННЯ",
             f"{'─'*52}",
@@ -7472,7 +7962,7 @@ def _open_checkin_existing(parent, b, room, on_save=None):
         _chk_name  = e_name.get().strip() or b.get('guest_name','')
         _chk_phone = e_phone.get().strip() or b.get('phone','') or b.get('guest_phone','')
         lines = [
-            f"  Готель: Готель Королівська Бочка",
+            f"  Готель: {_HOTEL_INFO.get('name','Готель Королівська Бочка')}",
             f"{'─'*52}",
             f"  ✅ ЧЕК ЗАСЕЛЕННЯ",
             f"{'─'*52}",
@@ -7889,7 +8379,7 @@ def _open_add_service_dlg(parent, room, bid, cat_keys, on_save=None):
 
             # 3. Чек
             lines3 = [
-                f"  Готель: Готель Королівська Бочка",
+                f"  Готель: {_HOTEL_INFO.get('name','Готель Королівська Бочка')}",
                 f"{'─'*50}",
                 f"  🛎 ЧЕК ПОСЛУГИ",
                 f"{'─'*50}",
@@ -8350,7 +8840,7 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
 
         # Чек з послугами
         lines = [
-            f"  Готель: Готель Королівська Бочка",
+            f"  Готель: {_HOTEL_INFO.get('name','Готель Королівська Бочка')}",
             f"{'─'*52}",
             f"  ✅ ЧЕК ЗАСЕЛЕННЯ",
             f"{'─'*52}",
@@ -9535,7 +10025,7 @@ class CheckedinFrame(tk.Frame):
 
             # Чек виселення
             lines=[
-                f"  Готель: Готель Королівська Бочка",
+                f"  Готель: {_HOTEL_INFO.get('name','Готель Королівська Бочка')}",
                 f"{'─'*52}",
                 f"  🚪 ЧЕК ВИСЕЛЕННЯ",
                 f"{'─'*52}",
@@ -10158,7 +10648,7 @@ class BookingsFrame(tk.Frame):
 
             # Чек
             lines=[
-                f"  Готель: Готель Королівська Бочка",
+                f"  Готель: {_HOTEL_INFO.get('name','Готель Королівська Бочка')}",
                 f"{'─'*52}",
                 f"  ✅ ЧЕК ЗАСЕЛЕННЯ",
                 f"{'─'*52}",
@@ -11033,7 +11523,7 @@ class BookingDetailDlg(ctk.CTkToplevel):
     def _print_receipt(self, b, bal, svc, pay, deposits=None, fines=None):
         n = (b['check_out'] - b['check_in']).days
         lines = [
-            f"  Готель: Готель Королівська Бочка",
+            f"  Готель: {_HOTEL_INFO.get('name','Готель Королівська Бочка')}",
             f"  Чек заселення",
             f"{'─'*52}",
             f"  Гість   : {b.get('guest_name','')}",
@@ -13640,7 +14130,7 @@ class RestaurantFrame(tk.Frame):
             # Чек з нульовою сумою — теж показуємо
             import datetime as _dt0
             print_text(f"Чек ресторан #{oid0}", [
-                f"  Готель: Готель Королівська Бочка",
+                f"  Готель: {_HOTEL_INFO.get('name','Готель Королівська Бочка')}",
                 f"{'─'*48}",
                 f"  🍽  ЧЕК РЕСТОРАНУ / БАРУ",
                 f"{'─'*48}",
@@ -13795,7 +14285,7 @@ class RestaurantFrame(tk.Frame):
                     shift_str = '—'
                 meth_ua = {'cash':'Готівка','card':'Картка','transfer':'Переказ','online':'Онлайн'}.get(meth, meth)
                 lines = [
-                    f"  Готель: Готель Королівська Бочка",
+                    f"  Готель: {_HOTEL_INFO.get('name','Готель Королівська Бочка')}",
                     f"{'─'*48}",
                     f"  🍽  ЧЕК РЕСТОРАНУ / БАРУ",
                     f"{'─'*48}",
@@ -14741,7 +15231,7 @@ class _BookableObjectFrame(tk.Frame):
                             try: _cu3.execute("INSERT INTO payments(room_id,amount,method,note,shift_id,created_at) VALUES(%s,%s,%s,%s,%s,NOW())",(room2['id'],total3,meth_q.get(),f"Послуга: {note3}",get_current_shift_id()))
                             except: _cu3.execute("INSERT INTO payments(booking_id,amount,method,note,shift_id,created_at) VALUES(NULL,%s,%s,%s,%s,NOW())",(total3,meth_q.get(),f"Послуга: {note3}",get_current_shift_id()))
                         _cc3.commit()
-                lines3=[f"  Готель: Готель Королівська Бочка",f"{'─'*50}",f"  🛎 ЧЕК ПОСЛУГИ",f"{'─'*50}",
+                lines3=[f"  Готель: {_HOTEL_INFO.get('name','Готель Королівська Бочка')}",f"{'─'*50}",f"  🛎 ЧЕК ПОСЛУГИ",f"{'─'*50}",
                         f"  Обʼєкт : {room2['number']} ({room2.get('cat_name','')})",
                         f"  Послуга: {s3['name']}",f"  К-сть  : {qty3} {s3.get('unit','шт')}",
                         f"  Ціна   : {pr3:.0f}₴",f"{'─'*50}",f"  Сума   : {total3:.0f}₴",
@@ -15501,7 +15991,7 @@ def _open_sauna_checkin_dlg(parent, room, on_save=None, booking=None):
                   (bid, _svc_total2, meth_var.get(), get_current_shift_id()), fetch=None)
 
         lines = [
-            f"  Готель: Готель Королівська Бочка",
+            f"  Готель: {_HOTEL_INFO.get('name','Готель Королівська Бочка')}",
             f"{'─'*52}",
             f"  🔥 ЧЕК ЗАСЕЛЕННЯ (БАНЯ)",
             f"{'─'*52}",
@@ -19789,6 +20279,7 @@ class SettingsFrame(tk.Frame):
             ("👥 Користувачі",    "_users_tab"),
             ("🧹 Прибиральниці",  "_cleaners_tab"),
             ("💛 Залоги",         "_deposits_tab"),
+            ("📋 Ліва панель",    "_sidebar_tab"),
             ("⚙️ База даних",     "_db_tab"),
             ("💾 Резерв/Експорт", "_backup_tab"),
             ("🖨 Принтер",        "_printer_tab"),
@@ -21790,6 +22281,91 @@ class SettingsFrame(tk.Frame):
             try: delete_user(int(s[0])); self._load_users()
             except Exception as e: messagebox.showerror("Помилка",str(e))
 
+    # ── ЛІВА ПАНЕЛЬ (назва готелю + вмикання/вимикання пунктів меню) ────
+    def _sidebar_tab(self, p):
+        import json as _jsb
+        scroll = ctk.CTkScrollableFrame(p, fg_color=C['bg'])
+        scroll.pack(fill='both', expand=True, padx=0, pady=0)
+
+        # ── Назва готелю ─────────────────────────────────────────────────
+        nm_card = card(scroll); nm_card.pack(fill='x', padx=10, pady=(10,6))
+        lbl(nm_card, "🏨  Назва готелю", 14, True).pack(anchor='w', padx=12, pady=(12,4))
+        lbl(nm_card, "Відображається у логотипі лівої панелі, заголовку вікна, на чеках та у звітах.",
+            10, color=C['text2']).pack(anchor='w', padx=12, pady=(0,6))
+
+        def _hi_cfg_path2():
+            return _hotel_info_path()
+
+        _row = tk.Frame(nm_card, bg=C['card']); _row.pack(fill='x', padx=12, pady=2)
+        lbl(_row, "Назва:", 11, color=C['text2']).pack(side='left', padx=(0,8))
+        _nm_var = tk.StringVar(value=_HOTEL_INFO.get('name',''))
+        tk.Entry(_row, textvariable=_nm_var, font=('Segoe UI',11),
+                 bg=C['bg'], fg=C['text'], insertbackground=C['text'],
+                 relief='flat', bd=4, width=48).pack(side='left', fill='x', expand=True)
+
+        _nm_st = lbl(nm_card, "", 10); _nm_st.pack(anchor='w', padx=12)
+
+        def _save_name():
+            new_name = _nm_var.get().strip()
+            if not new_name:
+                _nm_st.configure(text="❌ Назва не може бути порожньою", text_color=C['red']); return
+            try:
+                _hi = dict(_HOTEL_INFO); _hi['name'] = new_name
+                with open(_hi_cfg_path2(), 'w', encoding='utf-8') as _f:
+                    _jsb.dump(_hi, _f, ensure_ascii=False, indent=2)
+                _HOTEL_INFO.update(_hi)
+                _save_hotel_info_db(_hi)  # головне джерело правди — сама БД (кожен готель = окрема база)
+                _app = _find_hotel_app(nm_card)
+                if _app: _app._refresh_hotel_name()
+                _nm_st.configure(text="✅ Збережено та застосовано.", text_color=C['green'])
+                log_info(f"[HOTEL_INFO name] {new_name}")
+            except Exception as _e:
+                _nm_st.configure(text=f"❌ {_e}", text_color=C['red'])
+        btn(nm_card, "💾 Зберегти назву", _save_name, C['accent'], 170).pack(anchor='w', padx=12, pady=(4,12))
+
+        # ── Пункти лівого меню ───────────────────────────────────────────
+        nav_card = card(scroll); nav_card.pack(fill='x', padx=10, pady=(0,10))
+        lbl(nav_card, "📋  Пункти лівого меню", 14, True).pack(anchor='w', padx=12, pady=(12,4))
+        lbl(nav_card,
+            "Виберіть, які розділи показувати в лівій панелі. \"Дашборд\" та \"Налаштування\"\n"
+            "вимкнути не можна — вони потрібні для роботи програми.",
+            10, color=C['text2']).pack(anchor='w', padx=12, pady=(0,8))
+
+        _nav_vars = {}
+        grid = tk.Frame(nav_card, bg=C['card']); grid.pack(fill='x', padx=12, pady=(0,6))
+        _col_count = 3
+        for _i, (icon, name, key) in enumerate(_NAV_ITEMS):
+            _is_core = key in _SIDEBAR_CORE_KEYS
+            _var = tk.BooleanVar(value=_sidebar_visible(key))
+            _nav_vars[key] = _var
+            _cb = ctk.CTkCheckBox(
+                grid, text=f"{icon} {name}", variable=_var,
+                font=('Segoe UI', 11), text_color=C['text'] if not _is_core else C['text2'],
+                fg_color=C['accent'], hover_color=C['accent'],
+                state='disabled' if _is_core else 'normal')
+            _r, _c = divmod(_i, _col_count)
+            _cb.grid(row=_r, column=_c, sticky='w', padx=8, pady=6)
+
+        _nav_st = lbl(nav_card, "", 10); _nav_st.pack(anchor='w', padx=12)
+
+        def _save_nav():
+            try:
+                new_cfg = {k: bool(v.get()) for k, v in _nav_vars.items() if k not in _SIDEBAR_CORE_KEYS}
+                with open(_sidebar_cfg_path(), 'w', encoding='utf-8') as _f:
+                    _jsb.dump(new_cfg, _f, ensure_ascii=False, indent=2)
+                _SIDEBAR_CFG.clear(); _SIDEBAR_CFG.update(new_cfg)
+                _save_sidebar_cfg_db(new_cfg)  # головне джерело правди — сама БД (кожен готель = окрема база)
+                _app = _find_hotel_app(nav_card)
+                if _app:
+                    _app._rebuild_sidebar()
+                    _nav_st.configure(text="✅ Збережено! Меню вже оновлено.", text_color=C['green'])
+                else:
+                    _nav_st.configure(text="✅ Збережено! Зміни з'являться після перезапуску.", text_color=C['green'])
+                log_info(f"[SIDEBAR_CFG] {new_cfg}")
+            except Exception as _e:
+                _nav_st.configure(text=f"❌ {_e}", text_color=C['red'])
+        btn(nav_card, "💾 Зберегти меню", _save_nav, C['accent'], 170).pack(anchor='w', padx=12, pady=(4,12))
+
     # ── БАЗА ДАНИХ ────────────────────────────────────
     def _db_tab(self,p):
         import datetime as _dtdb, json as _jhis, os as _ohis
@@ -21802,10 +22378,7 @@ class SettingsFrame(tk.Frame):
         lbl(hi_card, "Відображається в шапці програми, на чеках та у звітах.", 10, color=C['text2']).pack(anchor='w', padx=12, pady=(0,6))
 
         def _hi_cfg_path():
-            base = _ohis.path.normpath(_ohis.path.join(
-                _ohis.path.dirname(_ohis.path.abspath(__file__)), '..', '..', 'data'))
-            _ohis.makedirs(base, exist_ok=True)
-            return _ohis.path.join(base, 'hotel_info.json')
+            return _hotel_info_path()
 
         _hi_vars = {}
         for _fk, _fl in [('name',"Назва"),('city',"Місто"),('address',"Адреса"),('phone',"Телефон")]:
@@ -21824,7 +22397,13 @@ class SettingsFrame(tk.Frame):
                 with open(_hi_cfg_path(),'w',encoding='utf-8') as _f:
                     _jhis.dump(new_hi, _f, ensure_ascii=False, indent=2)
                 _HOTEL_INFO.update(new_hi)
-                _hi_st.configure(text="✅ Збережено! Зміни в назві з'являться після перезапуску.", text_color=C['green'])
+                _save_hotel_info_db(new_hi)  # головне джерело правди — сама БД (кожен готель = окрема база)
+                _app = _find_hotel_app(hi_card)
+                if _app:
+                    _app._refresh_hotel_name()
+                    _hi_st.configure(text="✅ Збережено! Назва вже оновлена в шапці та меню (нові чеки — теж).", text_color=C['green'])
+                else:
+                    _hi_st.configure(text="✅ Збережено! Зміни з'являться після перезапуску.", text_color=C['green'])
                 log_info(f"[HOTEL_INFO] {new_hi}")
             except Exception as _e:
                 _hi_st.configure(text=f"❌ {_e}", text_color=C['red'])
@@ -21844,6 +22423,47 @@ class SettingsFrame(tk.Frame):
         btn(bf,"🔗 Тест",self._test_db,C['green'],100).pack(side='left',padx=4)
         btn(bf,"📦 Ініціалізувати БД",self._init_db,C['yellow'],190).pack(side='left',padx=4)
         self.db_info=lbl(f,"",11,color=C['green']); self.db_info.pack(anchor='w',padx=12,pady=(0,10))
+
+        # ── Хмарний резервний сервер (failover) ─────────────────────────────
+        cl_card = card(scroll); cl_card.pack(fill='x', padx=10, pady=(0,10))
+        lbl(cl_card, "☁️  Хмарний резервний сервер (failover)", 14, True).pack(anchor='w', padx=12, pady=(12,4))
+        lbl(cl_card,
+            "Якщо основний сервер стане недоступним — програма автоматично\n"
+            "перемкнеться сюди, а коли основний повернеться — все, що встигли\n"
+            "зробити в хмарі, автоматично довантажиться назад в основну БД.",
+            10, color=C['text2']).pack(anchor='w', padx=12, pady=(0,8))
+        try:
+            from app.utils.db import load_cloud_config as _load_cloud_cfg
+            _cloud_cfg = _load_cloud_cfg() or {}
+        except Exception:
+            _cloud_cfg = {}
+        self.cloud_flds = {}
+        for lt, key in [("Host",'host'),("Port",'port'),("Database",'dbname'),
+                         ("User",'user'),("Password",'password')]:
+            r = row_frm(cl_card)
+            ctk.CTkLabel(r, text=lt, font=('Segoe UI',11), text_color=C['text2'], width=100, anchor='w').pack(side='left')
+            e = ent(r, w=300, show='*' if key=='password' else None)
+            e.insert(0, str(_cloud_cfg.get(key,'')))
+            e.pack(side='left')
+            self.cloud_flds[key] = e
+        cl_bf = ctk.CTkFrame(cl_card, fg_color='transparent'); cl_bf.pack(fill='x', padx=12, pady=(8,4))
+        btn(cl_bf, "💾 Зберегти", self._save_cloud_db, width=130).pack(side='left', padx=4)
+        btn(cl_bf, "🔗 Тест хмари", self._test_cloud_db, C['green'], 130).pack(side='left', padx=4)
+        btn(cl_bf, "📦 Ініціалізувати хмару", self._init_cloud_db, C['yellow'], 190).pack(side='left', padx=4)
+        btn(cl_bf, "🔄 Оновити довідники в хмарі", self._push_cloud_refs, '#3498db', 220).pack(side='left', padx=4)
+        self.cloud_info = lbl(cl_card, "", 11, color=C['green'])
+        self.cloud_info.configure(wraplength=850, justify='left')
+        self.cloud_info.pack(anchor='w', padx=12, pady=(0,6))
+        try:
+            from app.utils.db import get_backend_status as _get_backend_status
+            _bst = _get_backend_status()
+            _cur_backend_txt = ("🟢 Зараз працює: основний сервер" if _bst.get('backend')=='main'
+                                 else "🟠 Зараз працює: ХМАРА (основний недоступний)")
+            _cur_backend_color = C['green'] if _bst.get('backend')=='main' else C['yellow']
+        except Exception:
+            _cur_backend_txt, _cur_backend_color = "", C['text2']
+        self.cloud_backend_lbl = lbl(cl_card, _cur_backend_txt, 11, True, _cur_backend_color)
+        self.cloud_backend_lbl.pack(anchor='w', padx=12, pady=(0,12))
 
         # ── Локальна SQLite база (кеш) ────────────────────────────────────
         lc = card(scroll); lc.pack(fill='x', padx=10, pady=(0,10))
@@ -22059,6 +22679,30 @@ class SettingsFrame(tk.Frame):
         ok,msg=test_connection()
         self.db_info.configure(text="✓ Підключено!" if ok else f"✗ {msg[:50]}",text_color=C['green'] if ok else C['red'])
 
+    def _save_cloud_db(self):
+        cloud_cfg = {k: (int(v.get()) if k=='port' and v.get().strip() else v.get())
+                     for k, v in self.cloud_flds.items()}
+        try:
+            from app.utils.db import save_cloud_config
+            save_cloud_config(cloud_cfg)
+            self.cloud_info.configure(text="✓ Збережено", text_color=C['green'])
+            log_info(f"[CLOUD_DB] Хмару налаштовано: {cloud_cfg.get('host')}:{cloud_cfg.get('port')} db={cloud_cfg.get('dbname')}")
+        except Exception as _e:
+            self.cloud_info.configure(text=f"✗ {_e}", text_color=C['red'])
+
+    def _test_cloud_db(self):
+        self._save_cloud_db()
+        try:
+            from app.utils.db import test_cloud_connection
+            ok, msg = test_cloud_connection()
+            self.cloud_info.configure(text="✓ Хмара доступна!" if ok else f"✗ {msg}",
+                                       text_color=C['green'] if ok else C['red'])
+            if not ok:
+                log_error("Тест хмари: підключення не вдалося", Exception(msg))
+        except Exception as _e:
+            self.cloud_info.configure(text=f"✗ {_e}", text_color=C['red'])
+            log_error("Тест хмари: виняток", _e)
+
     def _init_db(self):
         self._save_db()
         if not messagebox.askyesno("Ініціалізація","Створити таблиці (якщо не існують)?"):return
@@ -22071,6 +22715,41 @@ class SettingsFrame(tk.Frame):
                 conn.commit()
             self.db_info.configure(text="✓ БД ініціалізовано!",text_color=C['green'])
             messagebox.showinfo("✅","Готово!")
+        except Exception as e:
+            messagebox.showerror("Помилка",str(e))
+
+    def _push_cloud_refs(self):
+        self.cloud_info.configure(text="⏳ Оновлюю довідники в хмарі…", text_color=C['yellow'])
+        def _bg():
+            try:
+                from app.utils.db import push_reference_data_to_cloud
+                res = push_reference_data_to_cloud()
+                txt = "✓ Оновлено: " + ", ".join(f"{k}={v}" for k,v in res.items()) if res else "✗ Хмара недоступна або не налаштована"
+                clr = C['green'] if res else C['red']
+            except Exception as _e:
+                txt, clr = f"✗ {_e}", C['red']
+            def _apply():
+                try: self.cloud_info.configure(text=txt, text_color=clr)
+                except Exception: pass
+            try: self.after(0, _apply)
+            except Exception: pass
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _init_cloud_db(self):
+        self._save_cloud_db()
+        if not messagebox.askyesno("Ініціалізація хмари","Створити таблиці в хмарній БД (якщо не існують)?"):return
+        try:
+            schema=os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),'..','..','db','schema.sql'))
+            from app.utils.db import get_conn, _bump_cloud_sequences
+            with get_conn(force_backend='cloud') as conn:
+                with conn.cursor() as cur:
+                    with open(schema) as sf: cur.execute(sf.read())
+                conn.commit()
+                # Одразу зсуваємо послідовності на CLOUD_ID_OFFSET, щоб хмара
+                # була готова прийняти перший failover без ризику зіткнення ID.
+                _bump_cloud_sequences(conn)
+            self.cloud_info.configure(text="✓ Хмару ініціалізовано!",text_color=C['green'])
+            messagebox.showinfo("✅","Готово! Хмара готова як резервний сервер.")
         except Exception as e:
             messagebox.showerror("Помилка",str(e))
 
