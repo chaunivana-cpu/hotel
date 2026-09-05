@@ -98,7 +98,7 @@ import time as _time_mod
 import queue as _queue_mod
 import traceback as _tb_mod
 
-APP_VERSION = "1.0.2"  # Версія — змінюйте при кожному оновленні
+APP_VERSION = "1.0.3"  # Версія — змінюйте при кожному оновленні
 SYNC_INTERVAL = 60    # секунд між автосинхронізаціями
 
 
@@ -1765,30 +1765,41 @@ def refresh_btn(parent, cmd, size=50, side='right', padx=8, pady=10):
 
 def _attach_entry_clipboard(e):
     """Права кнопка миші (Вирізати/Копіювати/Вставити/Виділити все) +
-    явні біндинги Ctrl+X/C/V/A. CTkEntry в цьому середовищі не завжди
-    підтримує стандартну вставку через Ctrl+V, особливо коли активна
-    українська розкладка клавіатури (фізичні V/C/X/A дають інші keysym'и
-    — Cyrillic_em/es/che/ef), тож дублюємо біндинги і на них."""
+    явні біндинги Ctrl+X/C/V/A. У CTkEntry (customtkinter) `e` — це
+    ЗОВНІШНЯ обгортка-фрейм, а не сам tkinter.Entry: реальний віджет,
+    що приймає фокус і клавіші, лежить у `e._entry`. Якщо викликати
+    event_generate("<<Paste>>") на зовнішній обгортці — подія летить
+    в нікуди і вставка мовчки нічого не робить. Тому працюємо саме з
+    внутрішнім entry. Додатково дублюємо Ctrl+X/C/V/A на кириличні
+    keysym'и (Cyrillic_che/es/em/ef), бо на активній українській
+    розкладці фізичні X/C/V/A дають саме їх."""
     try:
+        _real = getattr(e, '_entry', e)  # справжній tkinter.Entry всередині CTkEntry
         _menu = tk.Menu(e, tearoff=0, bg=C['card2'], fg=C['text'],
                          activebackground=C['accent'], activeforeground='white')
-        _menu.add_command(label="✂️  Вирізати",     command=lambda: e.event_generate("<<Cut>>"))
-        _menu.add_command(label="📋  Копіювати",    command=lambda: e.event_generate("<<Copy>>"))
-        _menu.add_command(label="📌  Вставити",     command=lambda: e.event_generate("<<Paste>>"))
+        def _do(virt_event):
+            _real.focus_set()
+            _real.event_generate(virt_event)
+        _menu.add_command(label="✂️  Вирізати",     command=lambda: _do("<<Cut>>"))
+        _menu.add_command(label="📋  Копіювати",    command=lambda: _do("<<Copy>>"))
+        _menu.add_command(label="📌  Вставити",     command=lambda: _do("<<Paste>>"))
         _menu.add_separator()
-        _menu.add_command(label="🔘  Виділити все", command=lambda: e.select_range(0,'end'))
+        _menu.add_command(label="🔘  Виділити все", command=lambda: (_real.focus_set(), _real.select_range(0,'end')))
         def _popup(ev):
-            try: _menu.tk_popup(ev.x_root, ev.y_root)
-            finally: _menu.grab_release()
+            try:
+                _real.focus_set()
+                _menu.tk_popup(ev.x_root, ev.y_root)
+            finally:
+                _menu.grab_release()
         e.bind('<Button-3>', _popup)
         for _ks in ('v','V','Cyrillic_em'):
-            e.bind(f'<Control-{_ks}>', lambda ev: (e.event_generate('<<Paste>>'), 'break')[1])
+            e.bind(f'<Control-{_ks}>', lambda ev: (_do('<<Paste>>'), 'break')[1])
         for _ks in ('c','C','Cyrillic_es'):
-            e.bind(f'<Control-{_ks}>', lambda ev: (e.event_generate('<<Copy>>'), 'break')[1])
+            e.bind(f'<Control-{_ks}>', lambda ev: (_do('<<Copy>>'), 'break')[1])
         for _ks in ('x','X','Cyrillic_che'):
-            e.bind(f'<Control-{_ks}>', lambda ev: (e.event_generate('<<Cut>>'), 'break')[1])
+            e.bind(f'<Control-{_ks}>', lambda ev: (_do('<<Cut>>'), 'break')[1])
         for _ks in ('a','A','Cyrillic_ef'):
-            e.bind(f'<Control-{_ks}>', lambda ev: (e.select_range(0,'end'), 'break')[1])
+            e.bind(f'<Control-{_ks}>', lambda ev: (_real.select_range(0,'end'), 'break')[1])
     except Exception:
         pass
 
