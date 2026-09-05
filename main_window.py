@@ -98,7 +98,7 @@ import time as _time_mod
 import queue as _queue_mod
 import traceback as _tb_mod
 
-APP_VERSION = "1.0.5"  # Версія — змінюйте при кожному оновленні
+APP_VERSION = "1.0.6"  # Версія — змінюйте при кожному оновленні
 SYNC_INTERVAL = 60    # секунд між автосинхронізаціями
 
 
@@ -5439,7 +5439,11 @@ class DashboardFrame(tk.Frame):
         tk.Frame(_cb, bg=C['text2'], width=1, height=36).pack(side='left', fill='y', padx=(0, 18))
         lbl(_cb, "🔒  Залоги:", 13, True, C['text']).pack(side='left')
         self._dash_dep_lbl = lbl(_cb, "—", 22, True, '#e67e22')
-        self._dash_dep_lbl.pack(side='left', padx=(8, 8))
+        self._dash_dep_lbl.pack(side='left', padx=(8, 18))
+        tk.Frame(_cb, bg=C['text2'], width=1, height=36).pack(side='left', fill='y', padx=(0, 18))
+        lbl(_cb, "↩️  Повернено залогів:", 13, True, C['text']).pack(side='left')
+        self._dash_dep_ret_lbl = lbl(_cb, "—", 22, True, C['gray'])
+        self._dash_dep_ret_lbl.pack(side='left', padx=(8, 8))
 
         # ── Банер тестового режиму (відображається якщо режим активний) ──
         self._test_mode_dash_banner = None
@@ -5758,12 +5762,14 @@ class DashboardFrame(tk.Frame):
                             shift_paid = _op_cash + float(_p[0] or 0) - float(_p[1] or 0) - float(_tr)
                             # Залоги — окремо
                             shift_dep  = max(_op_dep + float(_p[2] or 0) - float(_p[3] or 0), 0)
+                            shift_dep_returned = float(_p[3] or 0)
                             shift_card     = float(_p[4] or 0)
                             shift_transfer = float(_p[5] or 0)
             except Exception as _cash_err:
                 log_error("Dashboard: помилка запиту каси", _cash_err)
                 shift_paid = 0.0
                 shift_dep  = 0.0
+                shift_dep_returned = 0.0
                 shift_card = 0.0
                 shift_transfer = 0.0
 
@@ -5840,7 +5846,7 @@ class DashboardFrame(tk.Frame):
 
             try:
                 if self.winfo_exists():
-                    self.after(0, lambda: self._render_data(rooms, arr, dep, shift_label, shift_paid, shift_dep, today, overdue_bookings, shift_card, shift_transfer))
+                    self.after(0, lambda: self._render_data(rooms, arr, dep, shift_label, shift_paid, shift_dep, today, overdue_bookings, shift_card, shift_transfer, shift_dep_returned))
             except Exception:
                 pass
         except Exception as e:
@@ -5922,7 +5928,7 @@ class DashboardFrame(tk.Frame):
         except Exception as e:
             log_error("Dashboard._render_data: помилка під час рендеру — дані НЕ домальовані", e)
 
-    def _render_data_impl(self, rooms, arr, dep, shift_label, shift_paid, shift_dep, today, overdue_bookings=None, shift_card=0.0, shift_transfer=0.0):
+    def _render_data_impl(self, rooms, arr, dep, shift_label, shift_paid, shift_dep, today, overdue_bookings=None, shift_card=0.0, shift_transfer=0.0, shift_dep_returned=0.0):
         """Оновлює UI: при першому виклику будує, далі тільки оновлює дані."""
         try:
             self._shift_lbl.configure(text=f"👤 {self.user.get('full_name','')}  |  Зміна {shift_label}")
@@ -5952,6 +5958,8 @@ class DashboardFrame(tk.Frame):
             self._dash_card_lbl.configure(text=f"{shift_card:.0f}₴")
             self._dash_transfer_lbl.configure(text=f"{shift_transfer:.0f}₴")
             self._dash_dep_lbl.configure(text=f"{shift_dep:.0f}₴")
+            if hasattr(self, '_dash_dep_ret_lbl'):
+                self._dash_dep_ret_lbl.configure(text=f"{shift_dep_returned:.0f}₴")
         except Exception:
             pass
 
