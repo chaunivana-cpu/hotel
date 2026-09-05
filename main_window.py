@@ -17462,7 +17462,7 @@ class ReportsFrame(tk.Frame):
                             JOIN rooms r ON b.room_id = r.id
                             LEFT JOIN guests g ON b.guest_id = g.id
                             WHERE b.check_out BETWEEN %s AND %s
-                              AND b.status IN ('checkedout','completed','checkedin','confirmed')
+                              AND b.status IN ('checkedout','completed')
                             ORDER BY b.check_out, r.number
                         """, (df, dt))
                         _rc_dep_xl = [d[0] for d in _cur_dep_xl.description]
@@ -18105,7 +18105,7 @@ class ReportsFrame(tk.Frame):
                             JOIN rooms r ON b.room_id = r.id
                             LEFT JOIN guests g ON b.guest_id = g.id
                             WHERE b.check_out BETWEEN %s AND %s
-                              AND b.status IN ('checkedout','completed','checkedin','confirmed')
+                              AND b.status IN ('checkedout','completed')
                             ORDER BY b.check_out, r.number
                         """, (df, dt))
                         _rc3 = [d[0] for d in _cur_dep.description]
@@ -18917,20 +18917,30 @@ class ReportsFrame(tk.Frame):
             else:
                 cat_cond = "1=1"
 
-            # Для ресторану — визначаємо реальну назву колонки кількості
-            # (quantity/qty) один раз, щоб підтягнути склад замовлення.
+            # Для ресторану — визначаємо реальні назви колонок кількості
+            # (quantity/qty) і назви позиції (name/item_name/title/
+            # service_name/note — в цій БД назва зберігається як 'note') один
+            # раз, щоб коректно підтягнути склад замовлення без здогадок.
             _rqc_ri = 'quantity'
+            _rnc_ri = None  # None → назви в roi немає, доведеться JOIN-ити services
             if cat_type == 'restaurant':
                 try:
                     from app.utils.db import get_conn as _gc_ri
                     with _gc_ri() as _c_ri:
                         with _c_ri.cursor() as _cur_ri:
                             _cur_ri.execute("SELECT column_name FROM information_schema.columns "
-                                "WHERE table_name='restaurant_order_items' AND column_name IN ('quantity','qty') LIMIT 1")
-                            _rr_ri = _cur_ri.fetchone()
-                            if _rr_ri: _rqc_ri = _rr_ri[0]
+                                "WHERE table_name='restaurant_order_items'")
+                            _cols_ri = {r[0] for r in _cur_ri.fetchall()}
+                            if 'quantity' in _cols_ri: _rqc_ri = 'quantity'
+                            elif 'qty' in _cols_ri: _rqc_ri = 'qty'
+                            for _cand in ('name', 'item_name', 'title', 'service_name', 'note'):
+                                if _cand in _cols_ri:
+                                    _rnc_ri = _cand
+                                    break
                 except Exception:
                     pass
+            _item_name_expr = f"roi.{_rnc_ri}" if _rnc_ri else "COALESCE(s2.name, 'Позиція')"
+            _item_join = "" if _rnc_ri else "LEFT JOIN services s2 ON s2.id = roi.service_id"
 
             try:
                 if shift_id:
@@ -18967,13 +18977,9 @@ class ReportsFrame(tk.Frame):
                             ORDER BY so.created_at DESC
                         """, (shift_id,)) or []
                     elif cat_type == 'restaurant':
-                        pay_det = _qr(rf"""
+                        pay_det = _qr("""
                             SELECT p.created_at, '—' AS room, '—' AS guest, '' AS phone,
-                                   p.amount, p.method, p.note, NULL AS check_in, NULL AS check_out,
-                                   COALESCE((SELECT string_agg(roi.name || ' ×' || roi.{_rqc_ri}::text, ', ' ORDER BY roi.id)
-                                             FROM restaurant_order_items roi
-                                             WHERE roi.order_id = NULLIF(substring(p.note from '#(\d+)'), '')::bigint
-                                            ), '') AS items
+                                   p.amount, p.method, p.note, NULL AS check_in, NULL AS check_out
                             FROM payments p
                             WHERE p.shift_id=%s AND p.amount>0
                               AND p.note LIKE 'Ресторан %%'
@@ -19001,13 +19007,9 @@ class ReportsFrame(tk.Frame):
                             ORDER BY p.created_at DESC
                         """, (_today_s2,)) or []
                     elif cat_type == 'restaurant':
-                        pay_det = _qr(rf"""
+                        pay_det = _qr("""
                             SELECT p.created_at, '—' AS room, '—' AS guest, '' AS phone,
-                                   p.amount, p.method, p.note, NULL AS check_in, NULL AS check_out,
-                                   COALESCE((SELECT string_agg(roi.name || ' ×' || roi.{_rqc_ri}::text, ', ' ORDER BY roi.id)
-                                             FROM restaurant_order_items roi
-                                             WHERE roi.order_id = NULLIF(substring(p.note from '#(\d+)'), '')::bigint
-                                            ), '') AS items
+                                   p.amount, p.method, p.note, NULL AS check_in, NULL AS check_out
                             FROM payments p
                             WHERE DATE(p.created_at)=%s AND p.amount>0
                               AND p.note LIKE 'Ресторан %%'
@@ -19018,6 +19020,71 @@ class ReportsFrame(tk.Frame):
             except Exception as _ex2:
                 pay_det = []
                 lbl(sc2, f"Помилка: {_ex2}", 11, color=C['red']).pack(padx=15, pady=10)
+
+            # Для ресторану — окремим кроком підтягуємо склад кожного
+            # замовлення (простіше і надійніше за вкладений SQL-підзапит з
+            # regex: тут одразу видно, скільки id знайдено і скільки позицій
+            # реально прийшло з БД). Джерело назви — ЯК і в робочому звіті
+            # "Ресторан" (Позиція/Категорія/Замовлень/К-сть/Дохід): спершу
+            # services.name, і лише якщо його нема — колонка в самій roi.
+            _items_load_failed = False
+            _debug_oid_info = {}  # діагностика: order_id -> текст для показу, якщо позицій не знайдено
+            if cat_type == 'restaurant' and pay_det:
+                import re as _re_items
+                _oid_of = {}
+                for _r in pay_det:
+                    _m = _re_items.search(r'#(\d+)', str(_r.get('note') or ''))
+                    _oid_of[id(_r)] = int(_m.group(1)) if _m else None
+                _all_oids = sorted({v for v in _oid_of.values() if v is not None})
+                _items_map = {}
+                if _all_oids:
+                    try:
+                        _ph = ','.join(['%s'] * len(_all_oids))
+                        _name_sql = (f"COALESCE(s2.name, roi.{_rnc_ri}, '—')" if _rnc_ri
+                                     else "COALESCE(s2.name, '—')")
+                        _rows_it = _qr(
+                            f"SELECT roi.order_id, {_name_sql} AS nm, roi.{_rqc_ri} AS q "
+                            f"FROM restaurant_order_items roi "
+                            f"LEFT JOIN services s2 ON s2.id = roi.service_id "
+                            f"WHERE roi.order_id IN ({_ph}) ORDER BY roi.id",
+                            tuple(_all_oids)) or []
+                        for _ri in _rows_it:
+                            _items_map.setdefault(_ri['order_id'], []).append(
+                                f"{_ri.get('nm','?')} ×{_ri.get('q','?')}")
+                        # ── Діагностика для тих id, по яких нічого не знайшлось:
+                        # перевіряємо, чи є ВЗАГАЛІ рядки в roi з таким order_id
+                        # (без JOIN на services) і який реальний тип/значення
+                        # order_id лежить у самій таблиці — щоб було видно,
+                        # чи це справді порожньо, чи проблема в порівнянні.
+                        _missing_oids = [o for o in _all_oids if o not in _items_map]
+                        if _missing_oids:
+                            try:
+                                _ph2 = ','.join(['%s'] * len(_missing_oids))
+                                _raw_rows = _qr(
+                                    f"SELECT order_id, COUNT(*) AS cnt, "
+                                    f"pg_typeof(order_id)::text AS typ "
+                                    f"FROM restaurant_order_items "
+                                    f"WHERE order_id IN ({_ph2}) GROUP BY order_id, pg_typeof(order_id)",
+                                    tuple(_missing_oids)) or []
+                                _cnt_by_oid = {r['order_id']: r for r in _raw_rows}
+                                for _mo in _missing_oids:
+                                    _rr = _cnt_by_oid.get(_mo)
+                                    if _rr:
+                                        _debug_oid_info[_mo] = f"тип order_id={_rr.get('typ')}, знайдено рядків={_rr.get('cnt')} (але без назви/JOIN)"
+                                    else:
+                                        _debug_oid_info[_mo] = f"у restaurant_order_items НЕМАЄ жодного рядка з order_id={_mo}"
+                            except Exception as _e_dbg:
+                                _debug_oid_info = {o: f"діагностика не вдалась: {_e_dbg}" for o in _missing_oids}
+                    except Exception as _e_items:
+                        _items_load_failed = True
+                        try: log_error("restaurant report items lookup", _e_items)
+                        except Exception: pass
+                for _r in pay_det:
+                    _oid = _oid_of.get(id(_r))
+                    _r['items'] = ', '.join(_items_map.get(_oid, [])) if _oid else ''
+                    _r['_debug_oid'] = _oid
+
+
 
             METHOD_UA2 = {'cash':'💵 Готівка','card':'💳 Картка','transfer':'🏦 Переказ','online':'🌐 Онлайн'}
 
@@ -19057,8 +19124,19 @@ class ReportsFrame(tk.Frame):
                     if cat_type == 'restaurant':
                         _items_txt = str(row2.get('items') or '').strip()
                         if _items_txt:
-                            lbl(rf3, f"🧾 {_items_txt}", 10, color=C['text2'],
-                                wraplength=650, justify='left').pack(anchor='w', padx=12, pady=(0,4))
+                            _it_txt, _it_color = f"🧾 {_items_txt}", C['text2']
+                        elif _items_load_failed:
+                            _it_txt, _it_color = "⚠️ Не вдалося завантажити склад (проблема з'єднання) — спробуйте ще раз", C['red']
+                        else:
+                            _dbg = _debug_oid_info.get(row2.get('_debug_oid'))
+                            _it_txt = f"🧾 (склад не знайдено; {_dbg})" if _dbg else "🧾 (склад замовлення не знайдено в БД)"
+                            _it_color = C['yellow']
+                        _it_lbl = lbl(rf3, _it_txt, 10, color=_it_color)
+                        try:
+                            _it_lbl.configure(wraplength=650, justify='left')
+                        except Exception:
+                            pass
+                        _it_lbl.pack(anchor='w', padx=12, pady=(0,4))
 
             btn_f2 = tk.Frame(win2, bg=C['bg']); btn_f2.pack(fill='x', padx=15, pady=8)
             btn(btn_f2, "✖ Закрити", win2.destroy, C['card2'], 120, height=36).pack(side='right')
