@@ -4117,6 +4117,21 @@ class HotelApp(ctk.CTk):
             _mbu.showinfo("Оновлено", "Оновлено " + str(_ok) + " файлів.\nПерезапустіть програму вручну.")
 
 
+    def _check_mega_update_periodic(self):
+        """Раз на годину (поки вікно програми відкрите) повторює перевірку
+        оновлень — щоб нова версія помічалась не тільки при запуску, а й
+        під час роботи, без потреби перезапускати програму вручну."""
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+        self._check_mega_update_bg()
+        try:
+            self.after(3600_000, self._check_mega_update_periodic)
+        except Exception:
+            pass
+
     def _check_mega_update_bg(self):
         """Фонова перевірка оновлень на MEGA при запуску."""
         import threading as _thr_mu
@@ -4690,7 +4705,8 @@ class HotelApp(ctk.CTk):
         # Реєстрація callback зміни статусу онлайн/офлайн
         _sync_mgr._on_status_change = self._on_sync_status_change
         self.after(2000, self._update_sync_badge)  # перше оновлення через 2с
-        self.after(8000, self._check_mega_update_bg)  # перевірка оновлень
+        self.after(8000, self._check_mega_update_bg)  # перша перевірка оновлень одразу при старті
+        self.after(3600_000, self._check_mega_update_periodic)  # і далі раз на годину, поки програма відкрита
 
         # Кнопки навігації — звичайний фрейм (швидший рендер)
         sb_nav = ctk.CTkScrollableFrame(sb, fg_color=C['card'],
