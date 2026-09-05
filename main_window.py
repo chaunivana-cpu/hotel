@@ -98,7 +98,7 @@ import time as _time_mod
 import queue as _queue_mod
 import traceback as _tb_mod
 
-APP_VERSION = "1.0.4"  # Версія — змінюйте при кожному оновленні
+APP_VERSION = "1.0.5"  # Версія — змінюйте при кожному оновленні
 SYNC_INTERVAL = 60    # секунд між автосинхронізаціями
 
 
@@ -3339,6 +3339,11 @@ class SetupWindow(ctk.CTk):
                                        button_color=C['border'], button_hover_color=C['accent'])
         self.e_user.set('')
         self.e_user.pack(side='left')
+        # Підвантажуємо СПРАВЖНІ логіни з БД (таблиця users) у фоні — щоб у
+        # випадаючому списку були реальні активні акаунти, а не лише ті,
+        # що вводились на цьому комп'ютері раніше. Локальна історія лишається
+        # як миттєвий/офлайн fallback, поки триває запит.
+        self._populate_login_usernames_bg()
         f2=row_frm(lg); ctk.CTkLabel(f2,text="Пароль",font=('Segoe UI',11),text_color=C['text2'],width=80,anchor='w').pack(side='left')
         self.e_pass=ent(f2,w=310,show='*'); self.e_pass.pack(side='left')
         # ── Галочка "Запам'ятати логін" ──
@@ -3405,6 +3410,7 @@ class SetupWindow(ctk.CTk):
                 self._save_cfg()
                 self._save_last_profile(name)
                 self.db_lbl.configure(text=f"✓ Профіль «{name}» завантажено", text_color=C['green'])
+                self._populate_login_usernames_bg()
                 break
 
     def _save_profile(self):
@@ -3499,6 +3505,37 @@ class SetupWindow(ctk.CTk):
         p = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),'..','..','config','login_history.json'))
         os.makedirs(os.path.dirname(p), exist_ok=True)
         return p
+
+    def _populate_login_usernames_bg(self):
+        """Тягне список активних логінів з таблиці users поточної БД у
+        фоновому потоці (щоб не блокувати відкриття вікна логіну) і
+        підставляє їх у випадаючий список поля 'Логін'. Якщо БД недоступна
+        (офлайн/ще не налаштована) — тихо лишає локальну історію логінів."""
+        def _bg():
+            usernames = []
+            try:
+                from app.utils.db import query as _ql
+                rows = _ql("SELECT username FROM users WHERE active=TRUE ORDER BY username",
+                           fetch='all')
+                usernames = [r['username'] for r in rows] if rows else []
+            except Exception:
+                usernames = []
+            if not usernames:
+                return
+            def _apply():
+                try:
+                    if hasattr(self, 'e_user') and self.e_user.winfo_exists():
+                        _cur = self.e_user.get()
+                        self.e_user.configure(values=usernames)
+                        if _cur:
+                            self.e_user.set(_cur)
+                except Exception:
+                    pass
+            try:
+                self.after(0, _apply)
+            except Exception:
+                pass
+        threading.Thread(target=_bg, daemon=True).start()
 
     def _load_login_history(self):
         try:
@@ -18880,6 +18917,21 @@ class ReportsFrame(tk.Frame):
             else:
                 cat_cond = "1=1"
 
+            # Для ресторану — визначаємо реальну назву колонки кількості
+            # (quantity/qty) один раз, щоб підтягнути склад замовлення.
+            _rqc_ri = 'quantity'
+            if cat_type == 'restaurant':
+                try:
+                    from app.utils.db import get_conn as _gc_ri
+                    with _gc_ri() as _c_ri:
+                        with _c_ri.cursor() as _cur_ri:
+                            _cur_ri.execute("SELECT column_name FROM information_schema.columns "
+                                "WHERE table_name='restaurant_order_items' AND column_name IN ('quantity','qty') LIMIT 1")
+                            _rr_ri = _cur_ri.fetchone()
+                            if _rr_ri: _rqc_ri = _rr_ri[0]
+                except Exception:
+                    pass
+
             try:
                 if shift_id:
                     if cat_type in ('rooms','bani','besidky'):
@@ -18915,9 +18967,13 @@ class ReportsFrame(tk.Frame):
                             ORDER BY so.created_at DESC
                         """, (shift_id,)) or []
                     elif cat_type == 'restaurant':
-                        pay_det = _qr("""
+                        pay_det = _qr(rf"""
                             SELECT p.created_at, '—' AS room, '—' AS guest, '' AS phone,
-                                   p.amount, p.method, p.note, NULL AS check_in, NULL AS check_out
+                                   p.amount, p.method, p.note, NULL AS check_in, NULL AS check_out,
+                                   COALESCE((SELECT string_agg(roi.name || ' ×' || roi.{_rqc_ri}::text, ', ' ORDER BY roi.id)
+                                             FROM restaurant_order_items roi
+                                             WHERE roi.order_id = NULLIF(substring(p.note from '#(\d+)'), '')::bigint
+                                            ), '') AS items
                             FROM payments p
                             WHERE p.shift_id=%s AND p.amount>0
                               AND p.note LIKE 'Ресторан %%'
@@ -18945,9 +19001,13 @@ class ReportsFrame(tk.Frame):
                             ORDER BY p.created_at DESC
                         """, (_today_s2,)) or []
                     elif cat_type == 'restaurant':
-                        pay_det = _qr("""
+                        pay_det = _qr(rf"""
                             SELECT p.created_at, '—' AS room, '—' AS guest, '' AS phone,
-                                   p.amount, p.method, p.note, NULL AS check_in, NULL AS check_out
+                                   p.amount, p.method, p.note, NULL AS check_in, NULL AS check_out,
+                                   COALESCE((SELECT string_agg(roi.name || ' ×' || roi.{_rqc_ri}::text, ', ' ORDER BY roi.id)
+                                             FROM restaurant_order_items roi
+                                             WHERE roi.order_id = NULLIF(substring(p.note from '#(\d+)'), '')::bigint
+                                            ), '') AS items
                             FROM payments p
                             WHERE DATE(p.created_at)=%s AND p.amount>0
                               AND p.note LIKE 'Ресторан %%'
@@ -18994,6 +19054,11 @@ class ReportsFrame(tk.Frame):
                     lbl(r3b, _meth, 11, color=C['green']).pack(side='left', padx=6)
                     if cat_type != 'restaurant':
                         lbl(r3b, _note[:40], 10, color=C['text2']).pack(side='left', padx=4)
+                    if cat_type == 'restaurant':
+                        _items_txt = str(row2.get('items') or '').strip()
+                        if _items_txt:
+                            lbl(rf3, f"🧾 {_items_txt}", 10, color=C['text2'],
+                                wraplength=650, justify='left').pack(anchor='w', padx=12, pady=(0,4))
 
             btn_f2 = tk.Frame(win2, bg=C['bg']); btn_f2.pack(fill='x', padx=15, pady=8)
             btn(btn_f2, "✖ Закрити", win2.destroy, C['card2'], 120, height=36).pack(side='right')
