@@ -23107,9 +23107,24 @@ class SettingsFrame(tk.Frame):
         self.cloud_info = lbl(cl_card, "", 11, color=C['green'])
         self.cloud_info.configure(wraplength=850, justify='left')
         self.cloud_info.pack(anchor='w', padx=12, pady=(0,6))
-        # Показати час останнього оновлення довідників у хмарі одразу при
-        # відкритті вкладки — не лише одразу після натискання кнопки. Це
-        # охоплює і ручні оновлення, і автоматичні (раз на 6 год у фоні).
+        self.cloud_backend_lbl = lbl(cl_card, "", 11, True, C['text2'])
+        self.cloud_backend_lbl.pack(anchor='w', padx=12, pady=(0,12))
+        # Живе оновлення міток: показуємо стан одразу при відкритті вкладки
+        # І далі самі себе перечитуємо раз на 30с — щоб було видно, коли
+        # спрацював фоновий автосинк (раз на 6 год), без потреби перезаходити
+        # у Налаштування.
+        self._refresh_cloud_status_labels()
+
+    def _refresh_cloud_status_labels(self):
+        """Оновлює написи 'Востаннє оновлено в хмарі' та 'Зараз працює: ...'.
+        Викликається одразу при побудові вкладки і далі сама себе перезапускає
+        кожні 30с (поки вкладка відкрита), щоб автоматичний фоновий синк
+        (раз на 6 год) було видно без перезаходу в Налаштування."""
+        try:
+            if not (hasattr(self, 'cloud_info') and self.cloud_info.winfo_exists()):
+                return
+        except Exception:
+            return
         try:
             from app.utils.db import get_cloud_sync_status as _get_cloud_sync_status
             _cs = _get_cloud_sync_status()
@@ -23119,18 +23134,25 @@ class SettingsFrame(tk.Frame):
                     text=f"🕒 Востаннє оновлено в хмарі: {_cs['last_sync']}  ("
                          + ", ".join(f"{k}={v}" for k, v in _cs_res.items()) + ")",
                     text_color=C['text2'])
+            else:
+                self.cloud_info.configure(
+                    text="🕒 Ще не було синхронізації довідників у хмару",
+                    text_color=C['yellow'])
         except Exception:
             pass
         try:
             from app.utils.db import get_backend_status as _get_backend_status
             _bst = _get_backend_status()
-            _cur_backend_txt = ("🟢 Зараз працює: основний сервер" if _bst.get('backend')=='main'
-                                 else "🟠 Зараз працює: ХМАРА (основний недоступний)")
-            _cur_backend_color = C['green'] if _bst.get('backend')=='main' else C['yellow']
+            if _bst.get('backend') == 'main':
+                self.cloud_backend_lbl.configure(text="🟢 Зараз працює: основний сервер", text_color=C['green'])
+            else:
+                self.cloud_backend_lbl.configure(text="🟠 Зараз працює: ХМАРА (основний недоступний)", text_color=C['yellow'])
         except Exception:
-            _cur_backend_txt, _cur_backend_color = "", C['text2']
-        self.cloud_backend_lbl = lbl(cl_card, _cur_backend_txt, 11, True, _cur_backend_color)
-        self.cloud_backend_lbl.pack(anchor='w', padx=12, pady=(0,12))
+            pass
+        try:
+            self.after(30000, self._refresh_cloud_status_labels)
+        except Exception:
+            pass
 
         # ── Локальна SQLite база (кеш) ────────────────────────────────────
         lc = card(scroll); lc.pack(fill='x', padx=10, pady=(0,10))
