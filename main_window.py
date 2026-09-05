@@ -98,7 +98,7 @@ import time as _time_mod
 import queue as _queue_mod
 import traceback as _tb_mod
 
-APP_VERSION = "1.0.6"  # Версія — змінюйте при кожному оновленні
+APP_VERSION = "1.0.7"  # Версія — змінюйте при кожному оновленні
 SYNC_INTERVAL = 60    # секунд між автосинхронізаціями
 
 
@@ -17266,7 +17266,7 @@ class ReportsFrame(tk.Frame):
             self.e_to.pack(side='left',padx=(0,8))
             self.rep_type=ctk.StringVar(value='Дохід')
             ctk.CTkOptionMenu(cf,
-                values=['Дохід','Завантаженість','Послуги','Ресторан','Платежі','Заїзди','Виїзди','X-звіт','Z-звіт'],
+                values=['Дохід','Завантаженість','Послуги','Ресторан','Платежі','Заїзди','Виїзди','Прибирання','Зміни','X-звіт','Z-звіт'],
                 variable=self.rep_type,width=160,fg_color=C['card2'],button_color=C['accent']).pack(side='left',padx=8)
             btn(cf,"📊 Показати",self._show,width=130).pack(side='left',padx=5,pady=8)
             btn(cf,"📥 Excel",self._export_excel_report,'#27ae60',100).pack(side='left',padx=5,pady=8)
@@ -17602,6 +17602,11 @@ class ReportsFrame(tk.Frame):
         is_admin = self.user.get('role') in ('admin','manager')
         if not is_admin and rt not in ('X-звіт','Z-звіт'):
             messagebox.showwarning("🔐 Доступ","Цей звіт доступний тільки адміністратору.")
+            return
+
+        if rt == 'Зміни':
+            self._show_shifts_list(df, dt)
+            self.after(400, self._rebind_report_scroll)
             return
 
         if rt in ('X-звіт','Z-звіт'):
@@ -18238,7 +18243,117 @@ class ReportsFrame(tk.Frame):
                 self._rebind_safe(self.result)
         except Exception: pass
 
-    def _show_xz_report(self, report_date, report_type, shift_start=None, shift_id=None):
+    def _show_shifts_list(self, df, dt):
+        """Список змін (усіх користувачів) за обраний період — для адміна.
+        По кожній зміні можна відкрити повний звіт: каса, номери, бані,
+        бесідки/альтанки, ресторан, послуги, прибирання."""
+        from app.utils.db import query as _qsh
+        try:
+            shifts_rows = _qsh("""
+                SELECT id, username, full_name, opened_at, closed_at, status,
+                       COALESCE(opening_cash,0) AS opening_cash,
+                       COALESCE(opening_deposits,0) AS opening_deposits
+                FROM shifts
+                WHERE opened_at::date BETWEEN %s AND %s
+                ORDER BY opened_at DESC
+            """, (df, dt)) or []
+        except Exception as _e_sh:
+            lbl(self.result, f"❌ Помилка завантаження змін: {_e_sh}", 12, color=C['red']).pack(pady=20)
+            return
+
+        hdr = card(self.result); hdr.pack(fill='x', padx=15, pady=(5,3))
+        lbl(hdr, f"🕓 Зміни  |  {df.strftime('%d.%m.%Y')} — {dt.strftime('%d.%m.%Y')}",
+            13, True, C['accent']).pack(anchor='w', padx=12, pady=8)
+        lbl(hdr, f"Записів: {len(shifts_rows)}", 11, color=C['text2']).pack(anchor='w', padx=12, pady=(0,8))
+
+        if not shifts_rows:
+            lbl(self.result, "Немає змін за вказаний період", 13, color=C['text2']).pack(pady=30)
+            return
+
+        def _fmt_dt(v):
+            if not v: return '—'
+            s = str(v)
+            return s[:16].replace('T', ' ')
+
+        for sh in shifts_rows:
+            rf = tk.Frame(self.result, bg=C['card2']); rf.pack(fill='x', padx=15, pady=3)
+            name = sh.get('full_name') or sh.get('username') or '—'
+            lbl(rf, f"👤 {name}", 12, True, C['text']).pack(side='left', padx=(12,10), pady=8)
+            lbl(rf, f"🟢 {_fmt_dt(sh.get('opened_at'))}  →  🔴 {_fmt_dt(sh.get('closed_at')) if sh.get('closed_at') else 'ще відкрита'}",
+                11, color=C['text2']).pack(side='left', padx=6)
+            _st_ua = "🔓 Відкрита" if sh.get('status') == 'open' else "🔒 Закрита"
+            lbl(rf, _st_ua, 11, color=C['green'] if sh.get('status')=='open' else C['text2']).pack(side='left', padx=10)
+            btn(rf, "👁 Переглянути", lambda s=sh: self._show_shift_detail(s), C['accent'], 150).pack(side='right', padx=10, pady=6)
+
+    def _show_shift_detail(self, shift):
+        """Повний звіт по одній конкретній зміні: усе, що вже показує
+        X/Z-звіт (каса, номери, бані, бесідки/альтанки, ресторан, послуги,
+        закриті замовлення) + окремо журнал прибирань за час цієї зміни."""
+        for w in self.result.winfo_children():
+            w.destroy()
+        self._canvas.yview_moveto(0)
+
+        back_bar = tk.Frame(self.result, bg=C['bg']); back_bar.pack(fill='x', padx=15, pady=(5,0))
+        btn(back_bar, "⬅ До списку змін", lambda: self._show(), C['card2'], 160).pack(side='left')
+
+        opened_at = shift.get('opened_at')
+        try:
+            _report_date = opened_at.date() if hasattr(opened_at, 'date') else date.fromisoformat(str(opened_at)[:10])
+        except Exception:
+            _report_date = date.today()
+
+        try:
+            self._show_xz_report(_report_date, 'Z-звіт', opened_at, shift.get('id'), table_mode=True)
+        except Exception as _e_xz:
+            log_error("_show_shift_detail xz", _e_xz)
+            lbl(self.result, f"❌ Помилка звіту зміни: {_e_xz}", 12, color=C['red']).pack(pady=10)
+
+        # ── Журнал прибирань за час цієї зміни ──
+        try:
+            _clog = _cl_load()
+            _op = opened_at
+            _cl_at = shift.get('closed_at')
+            import datetime as _dtcl2
+            def _parse_logged(e):
+                try:
+                    return _dtcl2.datetime.strptime(e.get('logged_at','')[:16], '%d.%m.%Y %H:%M')
+                except Exception:
+                    return None
+            def _to_naive(v):
+                if v is None: return None
+                if hasattr(v, 'tzinfo') and v.tzinfo is not None:
+                    return v.replace(tzinfo=None)
+                return v
+            _op_n = _to_naive(_op)
+            _cl_n = _to_naive(_cl_at) or _dtcl2.datetime.now()
+            _shift_clean = []
+            for e in _clog:
+                _ld = _parse_logged(e)
+                if _ld and _op_n and _op_n <= _ld <= _cl_n:
+                    _shift_clean.append(e)
+            log_f = card(self.result); log_f.pack(fill='x', padx=10, pady=(10,4))
+            lbl(log_f, f"🧹 Прибирання за цю зміну ({len(_shift_clean)})", 13, True, C['yellow']).pack(anchor='w', padx=12, pady=(8,4))
+            if _shift_clean:
+                ff_cl, cl_t = mktree(log_f, ('room','cleaner','started','finished','status','note'),
+                                      14, [70,150,120,120,110,180])
+                for c,h in zip(('room','cleaner','started','finished','status','note'),
+                               ['Кімн.','Прибиральник','Початок','Кінець','Статус','Нотатка']):
+                    cl_t.heading(c, text=h)
+                status_map3 = {'free':'✅ Вільний','cleaning':'🧹 Прибирання','repair':'🔧 Ремонт','blocked':'🔒 Заблокований'}
+                for e in reversed(_shift_clean):
+                    cl_t.insert('','end',values=(e.get('room',''), e.get('cleaner',''),
+                        e.get('started',''), e.get('finished',''),
+                        status_map3.get(e.get('new_status',''), e.get('new_status','')),
+                        e.get('note','')))
+                ff_cl.pack(fill='both', expand=True, padx=10, pady=(0,10))
+            else:
+                lbl(log_f, "Прибирань за цю зміну не зафіксовано", 11, color=C['text2']).pack(anchor='w', padx=12, pady=(0,10))
+        except Exception as _e_cl:
+            log_error("_show_shift_detail cleaning", _e_cl)
+
+        self.after(300, self._rebind_report_scroll)
+
+    def _show_xz_report(self, report_date, report_type, shift_start=None, shift_id=None, table_mode=False):
         from app.utils.db import query
         is_z = report_type == 'Z-звіт'
         today = report_date
@@ -18820,6 +18935,212 @@ class ReportsFrame(tk.Frame):
         lbl(hdr, f"📅  {shift_info}", 12, color=C['yellow']).pack(anchor='w', padx=15, pady=(0,4))
         lbl(hdr, f"Сформовано: {__import__('datetime').datetime.now().strftime('%d.%m.%Y %H:%M:%S')}",
             11, color=C['text2']).pack(anchor='w', padx=15, pady=(0,10))
+
+        if table_mode:
+            # ── Один консолідований звіт-таблиця: усе видно одразу ──────
+            ci_rooms  = int(checkin_stats.get('rooms_ci') or 0)
+            ci_bani   = int(checkin_stats.get('bani_ci') or 0)
+            ci_besid  = int(checkin_stats.get('besidky_ci') or 0)
+            bk_rooms  = int(booked_stats.get('rooms_bk') or 0)
+            bk_bani   = int(booked_stats.get('bani_bk') or 0)
+            bk_besid  = int(booked_stats.get('besidky_bk') or 0)
+            _cat_total = _rooms_r + _bani_r + _besid_r + svc_rev + rest_total
+
+            tbl_card = card(self.result); tbl_card.pack(fill='both', expand=True, padx=5, pady=5)
+            lbl(tbl_card, "📋  Повний звіт по зміні", 14, True).pack(anchor='w', padx=12, pady=(10,6))
+            ff_sh, tv_sh = mktree(tbl_card, ('metric','value'), 24, [420, 220])
+            tv_sh.heading('metric', text='Показник')
+            tv_sh.heading('value', text='Значення')
+            tv_sh.column('metric', anchor='w')
+            tv_sh.column('value', anchor='e')
+            tv_sh.tag_configure('section', background=C['card'], foreground=C['accent'])
+            tv_sh.tag_configure('total',   background='#1c2b1c', foreground=C['green'])
+            tv_sh.tag_configure('odd',  background=C['card'])
+            tv_sh.tag_configure('even', background=C['card2'])
+
+            def _sec(title_):
+                tv_sh.insert('', 'end', values=(title_, ''), tags=('section',))
+
+            _rows_i = 0
+            def _row(label, value, total=False, parent=''):
+                nonlocal _rows_i
+                tag = 'total' if total else ('odd' if _rows_i % 2 == 0 else 'even')
+                iid = tv_sh.insert(parent, 'end', values=(label, value), tags=(tag,))
+                _rows_i += 1
+                return iid
+
+            def _child(parent_iid, label, value=''):
+                tv_sh.insert(parent_iid, 'end', values=(f"    {label}", value), tags=('child',))
+            tv_sh.tag_configure('child', foreground=C['text2'])
+
+            from app.utils.db import query as _qtbl
+
+            def _cat_cond_for(ctype, alias_r='r', alias_rc='rc'):
+                if ctype == 'rooms':
+                    return f"""lower(COALESCE({alias_rc}.name,'')) NOT LIKE '%%бан%%'
+                        AND lower(COALESCE({alias_rc}.name,'')) NOT LIKE '%%saun%%'
+                        AND lower(COALESCE({alias_rc}.name,'')) NOT LIKE '%%бесід%%'
+                        AND lower(COALESCE({alias_rc}.name,'')) NOT LIKE '%%альтанк%%'
+                        AND lower(COALESCE({alias_rc}.description,'')) NOT LIKE '%%[tariff:hour]%%'
+                        AND CAST(COALESCE({alias_r}.number,'') AS text) NOT ILIKE '%%баня%%'
+                        AND CAST(COALESCE({alias_r}.number,'') AS text) NOT ILIKE '%%бесід%%'
+                        AND CAST(COALESCE({alias_r}.number,'') AS text) NOT ILIKE '%%альтанк%%'"""
+                elif ctype == 'bani':
+                    return f"""(lower(COALESCE({alias_rc}.name,'')) LIKE '%%бан%%'
+                        OR lower(COALESCE({alias_rc}.name,'')) LIKE '%%saun%%'
+                        OR lower(COALESCE({alias_rc}.description,'')) LIKE '%%[tariff:hour]%%'
+                        OR CAST(COALESCE({alias_r}.number,'') AS text) ILIKE '%%баня%%')"""
+                else:
+                    return f"""(lower(COALESCE({alias_rc}.name,'')) LIKE '%%бесід%%'
+                        OR lower(COALESCE({alias_rc}.name,'')) LIKE '%%альтанк%%'
+                        OR CAST(COALESCE({alias_r}.number,'') AS text) ILIKE '%%бесід%%'
+                        OR CAST(COALESCE({alias_r}.number,'') AS text) ILIKE '%%альтанк%%')"""
+
+            def _add_checkedin_children(parent_iid, ctype):
+                """Список номерів, які ЗАРАЗ заселені (той самий підрахунок,
+                що й у цифрі 'Заселено ...' — без прив'язки до конкретної
+                зміни, бо саме так тут завжди рахувалось)."""
+                try:
+                    rows_ci = _qtbl(f"""
+                        SELECT r.number AS num, g.name AS guest, b.check_in, b.check_out
+                        FROM bookings b
+                        JOIN rooms r ON b.room_id=r.id
+                        LEFT JOIN room_categories rc ON r.category_id=rc.id
+                        LEFT JOIN guests g ON b.guest_id=g.id
+                        WHERE b.status='checkedin' AND {_cat_cond_for(ctype)}
+                        ORDER BY r.number
+                    """) or []
+                    for rr in rows_ci:
+                        _co = rr.get('check_out')
+                        _co_s = _co.strftime('%d.%m') if hasattr(_co, 'strftime') else str(_co or '')[:10]
+                        _child(parent_iid, f"№{rr.get('num','')} — {rr.get('guest') or '—'} (до {_co_s})")
+                except Exception:
+                    pass
+
+            def _add_booked_children(parent_iid, ctype):
+                """Список нових бронювань, створених за цю зміну."""
+                try:
+                    rows_bk = _qtbl(f"""
+                        SELECT r.number AS num, g.name AS guest, b.check_in, b.check_out
+                        FROM bookings b
+                        JOIN rooms r ON b.room_id=r.id
+                        LEFT JOIN room_categories rc ON r.category_id=rc.id
+                        LEFT JOIN guests g ON b.guest_id=g.id
+                        WHERE b.status='confirmed' AND {_cat_cond_for(ctype)}
+                          AND b.created_at >= (SELECT opened_at FROM shifts WHERE id=%s)
+                          AND b.created_at <= COALESCE((SELECT closed_at FROM shifts WHERE id=%s), NOW())
+                        ORDER BY r.number
+                    """, (shift_id, shift_id)) or []
+                    for rr in rows_bk:
+                        _ci = rr.get('check_in')
+                        _ci_s = _ci.strftime('%d.%m') if hasattr(_ci, 'strftime') else str(_ci or '')[:10]
+                        _child(parent_iid, f"№{rr.get('num','')} — {rr.get('guest') or '—'} (заїзд {_ci_s})")
+                except Exception:
+                    pass
+
+            _sec("💰  КАСА")
+            _row("💵 Готівка в касі", f"{cash_total:.2f}₴")
+            _row("💳 Картка", f"{card_total:.2f}₴")
+            _row("🏦 Переказ", f"{transfer_total:.2f}₴")
+            _row("✅ Всього отримано (без залогів)", f"{grand_total:.2f}₴", total=True)
+            _row("🧾 Кількість транзакцій", str(tx_count))
+
+            _sec("🔒  ЗАЛОГИ")
+            if _opening_dep_sr > 0:
+                _row("🔒 Передано з попередньої зміни", f"{_opening_dep_sr:.2f}₴")
+            _row("🔒 Прийнято цієї зміни", f"{xz_dep:.2f}₴")
+            _row("↩️ Повернено залогів", f"{xz_ret:.2f}₴")
+            _row("💸 Залишок залогів (всього)", f"{xz_dep_balance:.2f}₴", total=True)
+
+            _sec("🏨  ДОХІД ЗА КАТЕГОРІЯМИ")
+            _iid_rooms = _row("🛏 Номери (готель)", f"{_rooms_r:.2f}₴")
+            _add_checkedin_children(_iid_rooms, 'rooms')
+            _iid_bani = _row("🛁 Бані", f"{_bani_r:.2f}₴")
+            _add_checkedin_children(_iid_bani, 'bani')
+            _iid_besid = _row("⛺ Бесідки/Альтанки", f"{_besid_r:.2f}₴")
+            _add_checkedin_children(_iid_besid, 'besidky')
+            _row("🍽 Послуги готелю", f"{svc_rev:.2f}₴")
+            _iid_rest = _row("🍴 Ресторан", f"{rest_total:.2f}₴")
+            _row("📊 РАЗОМ дохід", f"{_cat_total:.2f}₴", total=True)
+            _row("🍴 Закритих замовлень ресторану", str(rest_cnt))
+
+            # ── Склад ресторанних замовлень (що і скільки купили) ──
+            try:
+                import re as _re_tbl
+                pay_rest = _qtbl("""
+                    SELECT created_at, amount, method, note FROM payments
+                    WHERE shift_id=%s AND amount>0 AND note LIKE 'Ресторан %%'
+                    ORDER BY created_at
+                """, (shift_id,)) or []
+                if pay_rest:
+                    from app.utils.db import get_conn as _gc_tb
+                    with _gc_tb() as _c_tb:
+                        with _c_tb.cursor() as _cur_tb:
+                            _cur_tb.execute("SELECT column_name FROM information_schema.columns "
+                                "WHERE table_name='restaurant_order_items'")
+                            _cols_tb = {r[0] for r in _cur_tb.fetchall()}
+                    _qc_tb = 'quantity' if 'quantity' in _cols_tb else ('qty' if 'qty' in _cols_tb else 'quantity')
+                    _nc_tb = next((c for c in ('name','item_name','title','service_name','note') if c in _cols_tb), None)
+                    _name_sql_tb = f"COALESCE(s2.name, roi.{_nc_tb}, '—')" if _nc_tb else "COALESCE(s2.name, '—')"
+                    _oids_tb = []
+                    _oid_of_tb = {}
+                    for _pr in pay_rest:
+                        _m = _re_tbl.search(r'#(\d+)', str(_pr.get('note') or ''))
+                        _oid = int(_m.group(1)) if _m else None
+                        _oid_of_tb[id(_pr)] = _oid
+                        if _oid: _oids_tb.append(_oid)
+                    _items_map_tb = {}
+                    if _oids_tb:
+                        _ph_tb = ','.join(['%s'] * len(_oids_tb))
+                        _rows_it_tb = _qtbl(
+                            f"SELECT roi.order_id, {_name_sql_tb} AS nm, roi.{_qc_tb} AS q "
+                            f"FROM restaurant_order_items roi "
+                            f"LEFT JOIN services s2 ON s2.id = roi.service_id "
+                            f"WHERE roi.order_id IN ({_ph_tb}) ORDER BY roi.id",
+                            tuple(_oids_tb)) or []
+                        for _ri in _rows_it_tb:
+                            _items_map_tb.setdefault(_ri['order_id'], []).append(f"{_ri.get('nm','?')} ×{_ri.get('q','?')}")
+                    for _pr in pay_rest:
+                        _t = _pr.get('created_at')
+                        _ts = _t.strftime('%H:%M') if hasattr(_t, 'strftime') else str(_t)[:16]
+                        _oid = _oid_of_tb.get(id(_pr))
+                        _its = ', '.join(_items_map_tb.get(_oid, [])) or '(склад не знайдено в БД)'
+                        _child(_iid_rest, f"{_ts}  {_pr.get('note','')} — {_its}", f"{float(_pr.get('amount') or 0):.0f}₴")
+            except Exception as _e_rt:
+                _child(_iid_rest, f"⚠️ Не вдалося завантажити склад: {_e_rt}")
+
+            if transfers_rows:
+                _sec("💸  ПЕРЕМІЩЕННЯ КОШТІВ")
+                for r in transfers_rows:
+                    t = r['created_at']
+                    ts = t.strftime('%H:%M') if hasattr(t, 'strftime') else str(t)[:5]
+                    _row(f"{ts}  {r['reason']}", f"{float(r['amount']):.2f}₴")
+                _row("Разом переміщено", f"{transfers_total:.2f}₴", total=True)
+
+            _sec("📋  ОПЕРАЦІЙНА СТАТИСТИКА")
+            _iid_ci_r = _row("🔑 Заселено номерів", str(ci_rooms)); _add_checkedin_children(_iid_ci_r, 'rooms')
+            _iid_ci_b = _row("🔑 Заселено бань", str(ci_bani)); _add_checkedin_children(_iid_ci_b, 'bani')
+            _iid_ci_g = _row("🔑 Заселено бесідок/альтанок", str(ci_besid)); _add_checkedin_children(_iid_ci_g, 'besidky')
+            _iid_bk_r = _row("📝 Заброньовано номерів", str(bk_rooms)); _add_booked_children(_iid_bk_r, 'rooms')
+            _iid_bk_b = _row("📝 Заброньовано бань", str(bk_bani)); _add_booked_children(_iid_bk_b, 'bani')
+            _iid_bk_g = _row("📝 Заброньовано бесідок/альтанок", str(bk_besid)); _add_booked_children(_iid_bk_g, 'besidky')
+            _row("👥 Унікальних відвідувачів", str(_visitors_total))
+
+            _sec("🏠  СТАТУС НОМЕРІВ (ЗАРАЗ)")
+            _row("✅ Вільних", str(_chess_free))
+            _row("🔴 Зайнятих", str(_chess_occ))
+            _row("🧹 Прибирання", str(_chess_clean))
+            _row("📋 Заброньовано", str(_chess_booked))
+            _row("🔧 Ремонт", str(_chess_repair))
+            _row("🛏 Всього номерів", str(_chess_total), total=True)
+
+            for _iid_open in (_iid_rooms, _iid_bani, _iid_besid, _iid_rest,
+                               _iid_ci_r, _iid_ci_b, _iid_ci_g, _iid_bk_r, _iid_bk_b, _iid_bk_g):
+                try: tv_sh.item(_iid_open, open=True)
+                except Exception: pass
+
+            ff_sh.pack(fill='both', expand=True, padx=10, pady=(0,10))
+            return
 
         # Початковий залишок зміни
         if _opening_cash_sr > 0 or _opening_dep_sr > 0:
