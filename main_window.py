@@ -98,7 +98,7 @@ import time as _time_mod
 import queue as _queue_mod
 import traceback as _tb_mod
 
-APP_VERSION = "1.0.1"  # Версія — змінюйте при кожному оновленні
+APP_VERSION = "1.0.2"  # Версія — змінюйте при кожному оновленні
 SYNC_INTERVAL = 60    # секунд між автосинхронізаціями
 
 
@@ -1095,8 +1095,11 @@ def _get_cleaners_db():
             with _ccl.cursor() as _curcl:
                 _curcl.execute("""
                     CREATE TABLE IF NOT EXISTS hotel_settings
-                    (key TEXT PRIMARY KEY, value TEXT)
+                    (key TEXT PRIMARY KEY, value TEXT, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())
                 """)
+                # ALTER — таблиця могла вже існувати ДО додавання updated_at (старіші БД),
+                # a CREATE TABLE IF NOT EXISTS нічого не змінює в уже існуючій таблиці.
+                _curcl.execute("ALTER TABLE hotel_settings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now()")
                 _ccl.commit()
                 _curcl.execute("SELECT value FROM hotel_settings WHERE key='cleaners'")
                 row = _curcl.fetchone()
@@ -1123,7 +1126,7 @@ def _get_cleaners_db():
                                 if not row_s:
                                     import json as _jss
                                     val_s = _jss.dumps(result, ensure_ascii=False)
-                                    _curs.execute("""INSERT INTO hotel_settings(key,value) VALUES('cleaners',%s)
+                                    _curs.execute("""INSERT INTO hotel_settings(key,value,updated_at) VALUES('cleaners',%s,now())
                                         ON CONFLICT(key) DO NOTHING""", (val_s,))
                             _ccs.commit()
                     except Exception: pass
@@ -1135,7 +1138,12 @@ def _get_cleaners_db():
     return list(_cleaners_cache) if _cleaners_cache is not None else []
 
 def _save_cleaners_db(cleaners_list):
-    """Зберігає прибиральниць в БД + локально + оновлює кеш."""
+    """Зберігає прибиральниць в БД + локально + оновлює кеш.
+    Запис у БД — СИНХРОННИЙ (раніше був у фоновому потоці, але це давало
+    гонку умов: якщо одразу після видалення натиснути "Синхр.", воно могло
+    прочитати з БД ще СТАРЕ значення, поки фоновий запис ще не завершився,
+    і видалене ім'я "воскресало" назад. Ця дія нечаста, тож секунда
+    очікування некритична, а коректність важливіша за швидкість тут)."""
     import json as _jcls3, os, time
     global _cleaners_cache, _cleaners_cache_ts
     # Оновити кеш одразу — UI не підвисне
@@ -1146,28 +1154,42 @@ def _save_cleaners_db(cleaners_list):
         with open(os.path.join(get_data_dir(),'cleaners.json'),'w',encoding='utf-8') as _fp2:
             _jcls3.dump(cleaners_list, _fp2, ensure_ascii=False, indent=2)
     except Exception: pass
-    # Зберегти в БД у фоні — не блокуємо UI
-    import threading
-    def _db_save():
-        try:
-            from app.utils.db import get_conn as _gcl2
-            with _gcl2() as _ccl2:
-                with _ccl2.cursor() as _curcl2:
-                    _curcl2.execute("""
-                        CREATE TABLE IF NOT EXISTS hotel_settings
-                        (key TEXT PRIMARY KEY, value TEXT)
-                    """)
-                    # Записуємо список як є (перезапис, БЕЗ merge) — інакше видалені
-                    # імена "воскресали", бо старий код підмішував їх назад зі старого
-                    # значення в БД замість того, щоб довіряти новому списку від UI.
-                    val = _jcls3.dumps(list(cleaners_list), ensure_ascii=False)
-                    _curcl2.execute("""
-                        INSERT INTO hotel_settings(key,value) VALUES('cleaners',%s)
-                        ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value
-                    """, (val,))
-                _ccl2.commit()
+    # Зберегти в БД СИНХРОННО — щоб наступний читаючий виклик (напр. "Синхр.")
+    # вже гарантовано бачив нове значення, а не встиг проскочити раніше запису.
+    try:
+        from app.utils.db import get_conn as _gcl2, mirror_execute_to_cloud as _mirr_cl
+        _wcl2 = _gcl2()
+        with _wcl2 as _ccl2:
+            with _ccl2.cursor() as _curcl2:
+                _curcl2.execute("""
+                    CREATE TABLE IF NOT EXISTS hotel_settings
+                    (key TEXT PRIMARY KEY, value TEXT, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())
+                """)
+                # ALTER — таблиця могла вже існувати ДО додавання updated_at (старіші БД),
+                # a CREATE TABLE IF NOT EXISTS нічого не змінює в уже існуючій таблиці.
+                _curcl2.execute("ALTER TABLE hotel_settings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now()")
+                # Записуємо список як є (перезапис, БЕЗ merge) — інакше видалені
+                # імена "воскресали", бо старий код підмішував їх назад зі старого
+                # значення в БД замість того, щоб довіряти новому списку від UI.
+                val = _jcls3.dumps(list(cleaners_list), ensure_ascii=False)
+                _sql_cl = """
+                    INSERT INTO hotel_settings(key,value,updated_at) VALUES('cleaners',%s,now())
+                    ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()
+                """
+                _curcl2.execute(_sql_cl, (val,))
+            _ccl2.commit()
+        # Дзеркалюємо в хмару одразу (ключ текстовий — id-колізій тут бути
+        # не може, тому просто повторюємо той самий запис).
+        if getattr(_wcl2, 'backend', None) == 'main':
+            _mirr_cl(_sql_cl, (val,))
+        # Після успішного запису кеш точно синхронний з БД — не потрібно чекати.
+        _cleaners_cache = list(cleaners_list)
+        _cleaners_cache_ts = time.monotonic()
+        return True, None
+    except Exception as _e:
+        try: log_error("_save_cleaners_db (БД)", _e)
         except Exception: pass
-    threading.Thread(target=_db_save, daemon=True).start()
+        return False, str(_e)
 
 def _ensure_restaurant_payments_col():
     """Гарантує що payments.booking_id може бути NULL (для ресторану/каси)."""
@@ -1607,6 +1629,80 @@ def mktree(parent, cols, h=8, widths=None):
     t._prevent_auto_scroll = True
     return f, t
 
+
+def make_sortable_filterable(tree, headings_map, get_row_key=None):
+    """Додає до вже створеного Treeview (з mktree) сортування по кліку на
+    заголовок колонки та можливість фільтрувати рядки текстовим пошуком.
+
+    tree — сам ttk.Treeview.
+    headings_map — {col_id: 'Текст заголовка'} — той самий текст, що вже
+    виставлений через tree.heading(), функція лише ДОДАЄ до нього стрілочку
+    сортування та клік-обробник, підпис не змінює.
+    get_row_key — необов'язкова функція (col_id, value_str) -> порівнюваний
+    ключ; за замовчуванням намагається сортувати як число, якщо не вдається —
+    як звичайний текст (без урахування регістру).
+
+    Повертає функцію apply_filter(text), яку треба викликати з поля пошуку
+    (наприклад через <KeyRelease>), щоб приховати рядки, які не містять
+    введений текст у жодній з колонок (регістр не враховується)."""
+    state = {'sort_col': None, 'reverse': False, 'filter': ''}
+
+    def _default_key(col, val):
+        try:
+            return (0, float(str(val).replace('₴','').replace('%','').replace(',','.').strip() or 0))
+        except Exception:
+            return (1, str(val).lower())
+
+    _key_fn = get_row_key or _default_key
+
+    def _sort_by(col):
+        if state['sort_col'] == col:
+            state['reverse'] = not state['reverse']
+        else:
+            state['sort_col'] = col
+            state['reverse'] = False
+        _refresh_headings()
+        items = list(tree.get_children(''))
+        items.sort(key=lambda iid: _key_fn(col, tree.set(iid, col)), reverse=state['reverse'])
+        for idx, iid in enumerate(items):
+            tree.move(iid, '', idx)
+
+    def _refresh_headings():
+        for c, text in headings_map.items():
+            suffix = ''
+            if state['sort_col'] == c:
+                suffix = '  ▾' if state['reverse'] else '  ▴'
+            tree.heading(c, text=text + suffix, command=lambda cc=c: _sort_by(cc))
+
+    def apply_filter(text):
+        state['filter'] = (text or '').strip().lower()
+        # Treeview не вміє "ховати" рядки нативно — тому детач/реаттач:
+        # відфільтровані відкріплюємо (detach), решту повертаємо назад у
+        # тому ж порядку, в якому вони зберігались у списку all-elements.
+        if not hasattr(tree, '_all_iids_cache'):
+            return
+        for iid in tree._all_iids_cache:
+            if not state['filter']:
+                tree.reattach(iid, '', 'end')
+                continue
+            vals = tree.item(iid, 'values')
+            if any(state['filter'] in str(v).lower() for v in vals):
+                tree.reattach(iid, '', 'end')
+            else:
+                tree.detach(iid)
+
+    def remember_all_rows():
+        """Викликати одразу ПІСЛЯ повного перезаповнення таблиці (в кінці
+        _load_...), щоб фільтр знав повний список рядків для detach/reattach."""
+        tree._all_iids_cache = list(tree.get_children(''))
+        if state['filter']:
+            apply_filter(state['filter'])
+
+    _refresh_headings()
+    tree._remember_all_rows = remember_all_rows
+    tree._apply_filter = apply_filter
+    return apply_filter
+
 def btn(p, text, cmd, color=None, w=130, **kw):
     w = kw.pop('width', w)  # підтримка обох: w= та width=
     return ctk.CTkButton(p, text=text, command=cmd, fg_color=color or C['accent'],
@@ -1667,14 +1763,100 @@ def refresh_btn(parent, cmd, size=50, side='right', padx=8, pady=10):
     b.pack(side='left')
     return frame
 
+def _attach_entry_clipboard(e):
+    """Права кнопка миші (Вирізати/Копіювати/Вставити/Виділити все) +
+    явні біндинги Ctrl+X/C/V/A. CTkEntry в цьому середовищі не завжди
+    підтримує стандартну вставку через Ctrl+V, особливо коли активна
+    українська розкладка клавіатури (фізичні V/C/X/A дають інші keysym'и
+    — Cyrillic_em/es/che/ef), тож дублюємо біндинги і на них."""
+    try:
+        _menu = tk.Menu(e, tearoff=0, bg=C['card2'], fg=C['text'],
+                         activebackground=C['accent'], activeforeground='white')
+        _menu.add_command(label="✂️  Вирізати",     command=lambda: e.event_generate("<<Cut>>"))
+        _menu.add_command(label="📋  Копіювати",    command=lambda: e.event_generate("<<Copy>>"))
+        _menu.add_command(label="📌  Вставити",     command=lambda: e.event_generate("<<Paste>>"))
+        _menu.add_separator()
+        _menu.add_command(label="🔘  Виділити все", command=lambda: e.select_range(0,'end'))
+        def _popup(ev):
+            try: _menu.tk_popup(ev.x_root, ev.y_root)
+            finally: _menu.grab_release()
+        e.bind('<Button-3>', _popup)
+        for _ks in ('v','V','Cyrillic_em'):
+            e.bind(f'<Control-{_ks}>', lambda ev: (e.event_generate('<<Paste>>'), 'break')[1])
+        for _ks in ('c','C','Cyrillic_es'):
+            e.bind(f'<Control-{_ks}>', lambda ev: (e.event_generate('<<Copy>>'), 'break')[1])
+        for _ks in ('x','X','Cyrillic_che'):
+            e.bind(f'<Control-{_ks}>', lambda ev: (e.event_generate('<<Cut>>'), 'break')[1])
+        for _ks in ('a','A','Cyrillic_ef'):
+            e.bind(f'<Control-{_ks}>', lambda ev: (e.select_range(0,'end'), 'break')[1])
+    except Exception:
+        pass
+
 def ent(p, ph='', w=200, show=None):
     e = ctk.CTkEntry(p, placeholder_text=ph, width=w, fg_color=C['card2'],
                      border_color=C['border'], text_color=C['text'], font=('Segoe UI',12))
     if show: e.configure(show=show)
+    _attach_entry_clipboard(e)
     return e
 
 def card(p, **kw):
     return ctk.CTkFrame(p, fg_color=C['card'], corner_radius=12, **kw)
+
+
+def run_with_hourglass(win, btn_widget, status_lbl, work_fn, on_success,
+                        base_btn_text="💾 Зберегти", saving_text="⏳ Зберігаю..."):
+    """Універсальний хелпер для вікон збереження: виконує work_fn() у фоновому
+    потоці (щоб не заморожувати вікно), а поки чекає — показує в status_lbl
+    секундомір із піщаним годинником, що перемикається ⏳/⌛ (видно, що
+    програма реально працює, а не зависла). Якщо сервер відповідає довше
+    ~5 секунд — напис жовтіє і додається лічильник секунд, щоб було зрозуміло,
+    що причина саме в повільній мережі до сервера.
+    work_fn — функція без аргументів, що виконує сам запис (може повернути
+    будь-яке значення або нічого). on_success(result) викликається в
+    головному потоці Tkinter після успішного завершення. При помилці
+    показується messagebox.showerror і кнопка розблоковується для повтору."""
+    import threading as _thr_hg, time as _t_hg
+    btn_widget.configure(state='disabled', text=saving_text)
+    status_lbl.configure(text="")
+    _result = {}
+    _t0 = _t_hg.monotonic()
+
+    def _bg():
+        try:
+            _result['value'] = work_fn()
+            _result['ok'] = True
+        except Exception as _e:
+            _result['ok'] = False
+            _result['err'] = str(_e)
+    _th = _thr_hg.Thread(target=_bg, daemon=True)
+    _th.start()
+
+    _frames = ['⏳', '⌛']
+    _tick = {'i': 0}
+
+    def _poll():
+        if _th.is_alive():
+            elapsed = _t_hg.monotonic() - _t0
+            icon = _frames[_tick['i'] % 2]
+            _tick['i'] += 1
+            if elapsed < 5:
+                status_lbl.configure(text=f"{icon} Зберігаю…", text_color=C['text2'])
+            else:
+                status_lbl.configure(
+                    text=f"{icon} Зберігаю… {elapsed:.0f}с (повільна мережа до сервера)",
+                    text_color=C.get('orange', C['text2']))
+            try: win.after(500, _poll)
+            except Exception: pass
+            return
+        try:
+            btn_widget.configure(state='normal', text=base_btn_text)
+            status_lbl.configure(text="")
+        except Exception: pass
+        if _result.get('ok'):
+            on_success(_result.get('value'))
+        else:
+            messagebox.showerror("Помилка збереження", _result.get('err', ''))
+    win.after(200, _poll)
 
 
 # ══════════════════════════════════════════════════════
@@ -1931,7 +2113,10 @@ def _get_hotel_info_db():
         with _gchi() as _chi:
             with _chi.cursor() as _curhi:
                 _curhi.execute("""CREATE TABLE IF NOT EXISTS hotel_settings
-                    (key TEXT PRIMARY KEY, value TEXT)""")
+                    (key TEXT PRIMARY KEY, value TEXT, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
+                # ALTER — таблиця могла вже існувати ДО додавання updated_at (старіші БД),
+                # a CREATE TABLE IF NOT EXISTS нічого не змінює в уже існуючій таблиці.
+                _curhi.execute("ALTER TABLE hotel_settings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now()")
                 _chi.commit()
                 _curhi.execute("SELECT value FROM hotel_settings WHERE key='hotel_info'")
                 row = _curhi.fetchone()
@@ -1947,15 +2132,22 @@ def _save_hotel_info_db(info_dict):
     _info_copy = dict(info_dict)
     def _do():
         try:
-            from app.utils.db import get_conn as _gchi2
-            with _gchi2() as _chi2:
+            from app.utils.db import get_conn as _gchi2, mirror_execute_to_cloud as _mirr_hi
+            _whi2 = _gchi2()
+            with _whi2 as _chi2:
                 with _chi2.cursor() as _curhi2:
                     _curhi2.execute("""CREATE TABLE IF NOT EXISTS hotel_settings
-                        (key TEXT PRIMARY KEY, value TEXT)""")
+                        (key TEXT PRIMARY KEY, value TEXT, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
+                    # ALTER — таблиця могла вже існувати ДО додавання updated_at (старіші БД),
+                    # a CREATE TABLE IF NOT EXISTS нічого не змінює в уже існуючій таблиці.
+                    _curhi2.execute("ALTER TABLE hotel_settings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now()")
                     val = _jhi2.dumps(_info_copy, ensure_ascii=False)
-                    _curhi2.execute("""INSERT INTO hotel_settings(key,value) VALUES('hotel_info',%s)
-                        ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value""", (val,))
+                    _sql_hi = """INSERT INTO hotel_settings(key,value,updated_at) VALUES('hotel_info',%s,now())
+                        ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()"""
+                    _curhi2.execute(_sql_hi, (val,))
                 _chi2.commit()
+            if getattr(_whi2, 'backend', None) == 'main':
+                _mirr_hi(_sql_hi, (val,))
         except Exception as _e:
             try: log_error("_save_hotel_info_db", _e)
             except Exception: pass
@@ -2015,7 +2207,10 @@ def _get_sidebar_cfg_db():
         with _gcsi() as _csi:
             with _csi.cursor() as _cursi:
                 _cursi.execute("""CREATE TABLE IF NOT EXISTS hotel_settings
-                    (key TEXT PRIMARY KEY, value TEXT)""")
+                    (key TEXT PRIMARY KEY, value TEXT, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
+                # ALTER — таблиця могла вже існувати ДО додавання updated_at (старіші БД),
+                # a CREATE TABLE IF NOT EXISTS нічого не змінює в уже існуючій таблиці.
+                _cursi.execute("ALTER TABLE hotel_settings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now()")
                 _csi.commit()
                 _cursi.execute("SELECT value FROM hotel_settings WHERE key='sidebar_config'")
                 row = _cursi.fetchone()
@@ -2031,15 +2226,22 @@ def _save_sidebar_cfg_db(cfg_dict):
     _cfg_copy = dict(cfg_dict)
     def _do():
         try:
-            from app.utils.db import get_conn as _gcsi2
-            with _gcsi2() as _csi2:
+            from app.utils.db import get_conn as _gcsi2, mirror_execute_to_cloud as _mirr_si
+            _wsi2 = _gcsi2()
+            with _wsi2 as _csi2:
                 with _csi2.cursor() as _cursi2:
                     _cursi2.execute("""CREATE TABLE IF NOT EXISTS hotel_settings
-                        (key TEXT PRIMARY KEY, value TEXT)""")
+                        (key TEXT PRIMARY KEY, value TEXT, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
+                    # ALTER — таблиця могла вже існувати ДО додавання updated_at (старіші БД),
+                    # a CREATE TABLE IF NOT EXISTS нічого не змінює в уже існуючій таблиці.
+                    _cursi2.execute("ALTER TABLE hotel_settings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now()")
                     val = _jsi2.dumps(_cfg_copy, ensure_ascii=False)
-                    _cursi2.execute("""INSERT INTO hotel_settings(key,value) VALUES('sidebar_config',%s)
-                        ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value""", (val,))
+                    _sql_si = """INSERT INTO hotel_settings(key,value,updated_at) VALUES('sidebar_config',%s,now())
+                        ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()"""
+                    _cursi2.execute(_sql_si, (val,))
                 _csi2.commit()
+            if getattr(_wsi2, 'backend', None) == 'main':
+                _mirr_si(_sql_si, (val,))
         except Exception as _e:
             try: log_error("_save_sidebar_cfg_db", _e)
             except Exception: pass
@@ -2986,14 +3188,50 @@ class SetupWindow(ctk.CTk):
         self._build()
         self.update_idletasks()
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        w, h = min(520, sw - 40), min(620, sh - 40)
-        x = (sw - w) // 2; y = (sh - h) // 2
-        self.geometry(f"{w}x{h}+{x}+{y}")
+        _saved_geom = self._load_setup_geom()
+        if _saved_geom:
+            self.geometry(_saved_geom)
+        else:
+            w, h = min(520, sw - 40), min(620, sh - 40)
+            x = (sw - w) // 2; y = (sh - h) // 2
+            self.geometry(f"{w}x{h}+{x}+{y}")
         self.minsize(400, 480)
+        self.protocol("WM_DELETE_WINDOW", self._on_setup_close)
         try:
             log_info(f"[STARTUP] SetupWindow.__init__: вікно входу намальоване за "
                      f"{(_time_mod.monotonic()-_setup_t0)*1000:.0f}мс — очікую дію користувача")
         except Exception: pass
+
+    # ── Розмір/позиція вікна входу — запам'ятовуються між запусками ────────
+    def _setup_geom_path(self):
+        p = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),'..','..','config','setup_window_geom.json'))
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        return p
+
+    def _load_setup_geom(self):
+        try:
+            with open(self._setup_geom_path(), encoding='utf-8') as f:
+                geom = json.load(f).get('geometry', '')
+            # Базова перевірка, що розмір адекватний (не з'їхав за межі екрана
+            # чи не залишився від іншого, набагато більшого монітора)
+            if geom and 'x' in geom:
+                dims = geom.split('+')[0].split('x')
+                if len(dims) == 2 and int(dims[0]) >= 400 and int(dims[1]) >= 480:
+                    return geom
+        except Exception:
+            pass
+        return None
+
+    def _save_setup_geom(self):
+        try:
+            with open(self._setup_geom_path(), 'w', encoding='utf-8') as f:
+                json.dump({'geometry': self.geometry()}, f, ensure_ascii=False)
+        except Exception as e:
+            log_error("_save_setup_geom", e)
+
+    def _on_setup_close(self):
+        self._save_setup_geom()
+        self.destroy()
 
     def _build(self):
         # Прокручуваний контейнер
@@ -3005,9 +3243,34 @@ class SetupWindow(ctk.CTk):
         lbl(hdr,"Система управління готелем",12,color=C['text2']).pack(pady=(0,15))
 
         db = card(scroll); db.pack(fill='x', padx=25, pady=5)
-        lbl(db,"⚙️  База даних",13,True).pack(anchor='w', padx=12, pady=(10,6))
+        _db_hdr = ctk.CTkFrame(db, fg_color='transparent'); _db_hdr.pack(fill='x', padx=12, pady=(10,6))
+        lbl(_db_hdr,"⚙️  База даних",13,True).pack(side='left')
 
-        # ── Збережені профілі підключення (декілька готелів) ───────────────
+        self._db_content = ctk.CTkFrame(db, fg_color='transparent')
+
+        def _toggle_db_section():
+            _was_expanded = self._db_content.winfo_ismapped()
+            if _was_expanded:
+                self._db_content.pack_forget()
+                _db_toggle_btn.configure(text="▸ Показати")
+            else:
+                self._db_content.pack(fill='x')
+                _db_toggle_btn.configure(text="▾ Сховати")
+            # Після перемикання новий стан "згорнуто" — це якраз те, чим
+            # секція БУЛА розгорнута до кліку (was_expanded True -> тепер
+            # згорнуто -> True; was_expanded False -> тепер розгорнуто -> False).
+            self._save_db_section_collapsed(_was_expanded)
+
+        _db_toggle_btn = ctk.CTkButton(
+            _db_hdr, text="▾ Сховати", command=_toggle_db_section,
+            fg_color='transparent', hover_color=C['card2'], text_color=C['text2'],
+            font=('Segoe UI', 11), width=100, height=24)
+        _db_toggle_btn.pack(side='right')
+
+        # ── Завжди видно (навіть коли розділ згорнуто): профіль, IP сервера,
+        # логін і пароль до БД — щоб можна було перевірити/переключити готель
+        # одним поглядом, не розгортаючи все. Порт/Назва БД/кнопки — нижче,
+        # у частині, що згортається. ──────────────────────────────────────
         _profiles = self._load_profiles()
         _prof_row = row_frm(db)
         ctk.CTkLabel(_prof_row,text="Готель",font=('Segoe UI',11),text_color=C['text2'],width=90,anchor='w').pack(side='left')
@@ -3019,22 +3282,40 @@ class SetupWindow(ctk.CTk):
             dropdown_fg_color=C['card2'], text_color=C['text'],
             command=self._on_profile_selected)
         self._prof_menu.pack(side='left')
-        _prof_bf = ctk.CTkFrame(db, fg_color='transparent'); _prof_bf.pack(fill='x', padx=12, pady=(2,8))
-        btn(_prof_bf,"💾 Зберегти як новий профіль",self._save_profile,C['card2'],220).pack(side='left',padx=(0,6))
-        btn(_prof_bf,"🗑 Видалити профіль",self._delete_profile,C['red'],170).pack(side='left')
 
         cfg = self._load_cfg()
         self.dbf = {}
-        for label_text, key in [("Host",'host'),("Port",'port'),("Database",'dbname'),("User",'user'),("Password",'password')]:
+        for label_text, key in [("Host",'host')]:
             f = row_frm(db)
             ctk.CTkLabel(f,text=label_text,font=('Segoe UI',11),text_color=C['text2'],width=90,anchor='w').pack(side='left')
             e = ent(f, w=300, show='*' if key=='password' else None)
             e.insert(0, str(cfg.get(key,''))); e.pack(side='left')
             self.dbf[key] = e
-        bf = ctk.CTkFrame(db, fg_color='transparent'); bf.pack(fill='x', padx=12, pady=(6,12))
+
+        # ── Решта (Port, Database, User, Password, кнопки профілю, Тест/Зберегти) — згортається ──
+        _prof_bf = ctk.CTkFrame(self._db_content, fg_color='transparent'); _prof_bf.pack(fill='x', padx=12, pady=(2,8))
+        btn(_prof_bf,"💾 Зберегти як новий профіль",self._save_profile,C['card2'],220).pack(side='left',padx=(0,6))
+        btn(_prof_bf,"🗑 Видалити профіль",self._delete_profile,C['red'],170).pack(side='left')
+
+        for label_text, key in [("Port",'port'),("Database",'dbname'),("User",'user'),("Password",'password')]:
+            f = row_frm(self._db_content)
+            ctk.CTkLabel(f,text=label_text,font=('Segoe UI',11),text_color=C['text2'],width=90,anchor='w').pack(side='left')
+            e = ent(f, w=300, show='*' if key=='password' else None)
+            e.insert(0, str(cfg.get(key,''))); e.pack(side='left')
+            self.dbf[key] = e
+        bf = ctk.CTkFrame(self._db_content, fg_color='transparent'); bf.pack(fill='x', padx=12, pady=(6,12))
         btn(bf,"🔗 Тест",self._test,C['green'],100).pack(side='left',padx=(0,6))
         btn(bf,"💾 Зберегти",self._save_cfg,C['card2'],120).pack(side='left')
         self.db_lbl = lbl(bf,"",11,color=C['green']); self.db_lbl.pack(side='left',padx=10)
+
+        # Стан згорнуто/розгорнуто — те, що користувач сам обрав минулого разу
+        # (запам'ятовується у файлі, а не вираховується щоразу наново).
+        if self._load_db_section_collapsed():
+            self._db_content.pack_forget()
+            _db_toggle_btn.configure(text="▸ Показати")
+        else:
+            self._db_content.pack(fill='x')
+            _db_toggle_btn.configure(text="▾ Сховати")
 
         lg = card(scroll); lg.pack(fill='x', padx=25, pady=5)
         lbl(lg,"🔐  Вхід",13,True).pack(anchor='w', padx=12, pady=(10,6))
@@ -3177,6 +3458,30 @@ class SetupWindow(ctk.CTk):
                 json.dump({'name': name}, f, ensure_ascii=False)
         except Exception as e:
             log_error("_save_last_profile", e)
+
+    # ── Стан "згорнуто/розгорнуто" секції "База даних" (запам'ятовується) ──
+    def _db_section_state_path(self):
+        p = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),'..','..','config','db_section_state.json'))
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        return p
+
+    def _load_db_section_collapsed(self):
+        """True — секцію треба показати згорнутою при відкритті вікна.
+        За замовчуванням (якщо ще жодного разу не перемикали вручну):
+        згорнуто, якщо є збережений останній профіль (поля вже заповнені),
+        розгорнуто — якщо профілів ще немає (треба заповнити вручну)."""
+        try:
+            with open(self._db_section_state_path(), encoding='utf-8') as f:
+                return bool(json.load(f).get('collapsed'))
+        except Exception:
+            return bool(self._load_last_profile())
+
+    def _save_db_section_collapsed(self, collapsed):
+        try:
+            with open(self._db_section_state_path(), 'w', encoding='utf-8') as f:
+                json.dump({'collapsed': bool(collapsed)}, f, ensure_ascii=False)
+        except Exception as e:
+            log_error("_save_db_section_collapsed", e)
 
     # ── Історія логінів (для випадаючого списку на полі "Логін") ──────────
     def _login_history_path(self):
@@ -3370,7 +3675,7 @@ class SetupWindow(ctk.CTk):
             # Адміністратор/менеджер — може зайти завжди, не створює нову зміну
             if role in ('admin','manager'):
                 self.user = u
-                self.destroy()
+                self._on_setup_close()
                 return
 
             # Рецепціоніст — перевірка відкритої зміни
@@ -3398,7 +3703,7 @@ class SetupWindow(ctk.CTk):
                 owner = open_shift.get('username','')
                 if owner == username:
                     # Це його зміна — продовжуємо
-                    self.user = u; self.destroy()
+                    self.user = u; self._on_setup_close()
                 else:
                     # Чужа незакрита зміна
                     opened = open_shift.get('opened_at','')
@@ -3433,14 +3738,14 @@ class SetupWindow(ctk.CTk):
                                     _conn_f.commit()
                                 messagebox.showinfo("✅ Зміну закрито",
                                     f"Зміну касира {owner_name} примусово закрито.\nМожна входити.")
-                                self.user = u; self.destroy()
+                                self.user = u; self._on_setup_close()
                             except Exception as _fe:
                                 messagebox.showerror("Помилка", f"Не вдалося закрити зміну:\n{_fe}")
                     else:
                         messagebox.showerror("Зміна не закрита", msg)
             else:
                 # Немає відкритої зміни — входимо і створюємо нову
-                self.user = u; self.destroy()
+                self.user = u; self._on_setup_close()
         except Exception as e:
             messagebox.showerror("Помилка БД", f"{e}")
 
@@ -3619,9 +3924,18 @@ class HotelApp(ctk.CTk):
             # 0. Мігрувати SQLite схему ПЕРШИМ — ще до install_cache,
             #    щоб перша синхронізація не давала WARNING про deposit_amount
             _step("0. _migrate_sqlite_cache", self._migrate_sqlite_cache)
-            # 1. Підключити кеш — патчить query(), далі читання йдуть з SQLite
-            if _install_db_cache is not None:
-                _step("1. _install_db_cache", _install_db_cache)
+            # 1. Кеш ВІДКЛЮЧЕНО за рішенням користувача (26.08.2026): читання
+            # більше НЕ йде через локальний SQLite — завжди напряму до БД
+            # (основний сервер, з автоматичним переключенням на хмару при
+            # недоступності — цей механізм не залежить від кешу і працює як
+            # раніше). Причина: кеш синхронізувався раз на 120с, і зміни
+            # (ціна категорії, нові користувачі/прибиральниці тощо) могли
+            # показуватись із затримкою до ~2 хвилин після збереження.
+            # Повний офлайн-режим (одночасна недоступність і основного
+            # сервера, і хмари) визнано прийнятним ризиком.
+            # Якщо колись знадобиться повернути кеш — розкоментувати рядок нижче.
+            # if _install_db_cache is not None:
+            #     _step("1. _install_db_cache", _install_db_cache)
             # 1b. Патч logic.get_rooms — при офлайні повертає дані з SQLite кешу
             def _patch_get_rooms():
                 import app.modules.logic as _logic_mod
@@ -3659,6 +3973,18 @@ class HotelApp(ctk.CTk):
                     start_reference_sync_scheduler()
                 except Exception as _e_fw:
                     log_error("[DB failover] не вдалося запустити watcher", _e_fw)
+                # Самозцілення: якщо VIEW "categories" (псевдонім room_categories,
+                # потрібен для запитів дашборду) відсутній на цій БД — створити.
+                # Актуально для баз, ініціалізованих ДО цього виправлення.
+                try:
+                    from app.utils.db import get_conn as _gcv
+                    with _gcv() as _cv:
+                        with _cv.cursor() as _curv:
+                            _curv.execute(
+                                "CREATE OR REPLACE VIEW categories AS SELECT * FROM room_categories")
+                        _cv.commit()
+                except Exception as _e_cv:
+                    log_error("[categories VIEW] не вдалося створити", _e_cv)
             _step("4. _sync_mgr.start() + on_shift_open", _start_sync)
             log_info("[STARTUP] _bg_init: ВСІ кроки фонової ініціалізації завершено")
         _thr_init.Thread(target=_bg_init, daemon=True).start()
@@ -4106,43 +4432,25 @@ class HotelApp(ctk.CTk):
             pass
 
     def _maximize_window(self):
-        """Відновлює збережений розмір вікна або розгортає на весь екран."""
-        import json as _jmw, os as _omw
-        _mw_path = None
+        """Розгортає вікно на весь екран при кожному запуску програми.
+        Раніше тут відновлювався розмір, збережений при попередньому закритті —
+        але якщо вікно було закрите НЕ розгорнутим (випадково стиснуте/
+        пересунуте), програма щоразу відкривалась маленькою. Тепер завжди
+        розгортаємо на весь екран, незалежно від попереднього стану."""
+        try:
+            self.state('zoomed')
+        except Exception:
+            try: self.attributes('-zoomed', True)
+            except Exception:
+                sw = self.winfo_screenwidth(); sh = self.winfo_screenheight()
+                self.geometry(f"{sw}x{sh}+0+0")
+        import os as _omw
         try:
             base = _omw.path.normpath(_omw.path.join(
                 _omw.path.dirname(_omw.path.abspath(__file__)), '..', '..', 'data'))
-            _mw_path = _omw.path.join(base, 'main_window_geom.json')
+            self._main_geom_path = _omw.path.join(base, 'main_window_geom.json')
         except Exception:
-            try: _mw_path = _omw.path.join(_omw.path.expanduser('~'), 'hotel_main_geom.json')
-            except Exception: pass
-        # Спробувати відновити збережений розмір
-        _restored = False
-        if _mw_path and _omw.path.exists(_mw_path):
-            try:
-                with open(_mw_path, 'r', encoding='utf-8') as _f:
-                    _g = _jmw.load(_f)
-                _state = _g.get('state','')
-                _geom  = _g.get('geometry','')
-                if _state == 'zoomed':
-                    self.state('zoomed')
-                    _restored = True
-                elif _geom and 'x' in _geom:
-                    # Перевірити що розмір розумний
-                    _parts = _geom.split('+')
-                    _sz = _parts[0].split('x')
-                    if len(_sz)==2 and int(_sz[0])>=800 and int(_sz[1])>=500:
-                        self.geometry(_geom)
-                        _restored = True
-            except Exception: pass
-        if not _restored:
-            try: self.state('zoomed')
-            except Exception:
-                try: self.attributes('-zoomed', True)
-                except Exception:
-                    sw=self.winfo_screenwidth(); sh=self.winfo_screenheight()
-                    self.geometry(f"{sw}x{sh}+0+0")
-        self._main_geom_path = _mw_path
+            self._main_geom_path = _omw.path.join(_omw.path.expanduser('~'), 'hotel_main_geom.json')
 
     def _on_close(self):
         self._db_check_running = False
@@ -4807,6 +5115,76 @@ def _sqlite_select(sql, params=()):
     except Exception:
         return []
 
+import re as _re_room_sort
+
+def _room_sort_key(number):
+    """Ключ сортування номерів так, щоб однотипні йшли разом: спочатку
+    групуємо за "типом" (останнє слово в номері — золотий/рожевий/номер/
+    будиночок тощо), а вже всередині групи — за числовою частиною номера
+    (з підтримкою "1/1", "1/2" тощо). Наприклад:
+      №1 будиночок, №2 будиночок, ...
+      №10 золотий, №11 золотий, №12 золотий, ...
+      №10 номер, №11 номер, №12 номер, ...
+      №1/1 рожевий, №1/2 рожевий, ...
+    замість поточного хаотичного текстового сортування, де "10 золотий"
+    і "10 номер" і "1/1 рожевий" перемішані одне з одним."""
+    s = str(number or '').strip()
+    m = _re_room_sort.match(r'^([\d/]+)\s*(.*)$', s)
+    if m:
+        numpart, typepart = m.group(1), m.group(2)
+    else:
+        numpart, typepart = '', s
+    typepart = typepart.strip().lower()
+    try:
+        num_key = tuple(int(x) for x in numpart.split('/') if x != '')
+    except ValueError:
+        num_key = ()
+    if not num_key:
+        num_key = (999999,)
+    return (typepart, num_key, s)
+
+def _sort_rooms_by_type(rooms):
+    try:
+        return sorted(rooms, key=lambda r: _room_sort_key(r.get('number')))
+    except Exception:
+        return rooms
+
+def _room_type_of(number):
+    """Повертає лише 'тип' номера (золотий/рожевий/номер/будиночок тощо),
+    той самий, що використовується для групування в _room_sort_key —
+    потрібен окремо для фільтра за типом на Шахматці."""
+    s = str(number or '').strip()
+    m = _re_room_sort.match(r'^([\d/]+)\s*(.*)$', s)
+    typepart = m.group(2) if m else s
+    return typepart.strip().lower() or '—'
+
+# ── Фіксовані групи фільтра на Шахматці (замість автовизначення з номера) ──
+def _room_in_group_zoloti(r):
+    return 'золот' in str(r.get('number','')).lower()
+
+def _room_in_group_rozhevi(r):
+    return 'рожев' in str(r.get('number','')).lower()
+
+def _room_in_group_besidky(r):
+    kws = ('бесідк','беседк','альтанк')
+    txt = (str(r.get('cat_name','')) + ' ' + str(r.get('number',''))).lower()
+    return any(k in txt for k in kws)
+
+def _room_in_group_nomery(r):
+    # "Номери" — все, що не потрапило в жодну з інших спеціальних груп
+    # (золоті, рожеві, бесідки/альтанки, бані). Так група лишається
+    # коректною, навіть якщо з'являться нові типи номерів у майбутньому.
+    return not (_room_in_group_zoloti(r) or _room_in_group_rozhevi(r)
+                or _room_in_group_besidky(r) or 'бан' in str(r.get('cat_name','')).lower())
+
+_ROOM_TYPE_GROUPS = [
+    ("Усі", None),
+    ("Бесідки та Альтанки", _room_in_group_besidky),
+    ("Номери", _room_in_group_nomery),
+    ("Золоті", _room_in_group_zoloti),
+    ("Рожеві", _room_in_group_rozhevi),
+]
+
 def _get_rooms_cached(force=False):
     """Повертає список кімнат з кешу (max 15с) або свіжі з БД, або SQLite при офлайні."""
     global _ROOMS_CACHE, _ROOMS_CACHE_TS
@@ -4817,6 +5195,7 @@ def _get_rooms_cached(force=False):
         from app.modules.logic import get_rooms
         rooms = get_rooms() or []
         if rooms:
+            rooms = _sort_rooms_by_type(rooms)
             _ROOMS_CACHE    = rooms
             _ROOMS_CACHE_TS = _time_mod.perf_counter()
             return list(rooms)
@@ -4825,7 +5204,7 @@ def _get_rooms_cached(force=False):
         # PG недоступний — in-memory кеш або SQLite
         if _ROOMS_CACHE:
             return list(_ROOMS_CACHE)
-        sqlite_rooms = _get_rooms_from_sqlite()
+        sqlite_rooms = _sort_rooms_by_type(_get_rooms_from_sqlite() or [])
         if sqlite_rooms:
             _ROOMS_CACHE    = sqlite_rooms
             _ROOMS_CACHE_TS = _time_mod.perf_counter()
@@ -6272,8 +6651,9 @@ class CleaningFrame(tk.Frame):
                 _cl_update(log_idx, self._log, self._log[log_idx])
             # Оновити статус кімнати в БД напряму
             try:
-                from app.utils.db import get_conn as _gce
-                with _gce() as _ce:
+                from app.utils.db import get_conn as _gce, mirror_execute_to_cloud as _mirr_rm1
+                _wce = _gce()
+                with _wce as _ce:
                     with _ce.cursor() as _cure:
                         # Шукаємо кімнату за точним збігом поля number (текстовий або числовий)
                         _cure.execute(
@@ -6282,8 +6662,12 @@ class CleaningFrame(tk.Frame):
                         )
                         row_e = _cure.fetchone()
                         if row_e:
-                            _cure.execute("UPDATE rooms SET status=%s WHERE id=%s", (new_st, row_e[0]))
+                            _sql_rm1 = "UPDATE rooms SET status=%s WHERE id=%s"
+                            _params_rm1 = (new_st, row_e[0])
+                            _cure.execute(_sql_rm1, _params_rm1)
                     _ce.commit()
+                if row_e and getattr(_wce, 'backend', None) == 'main':
+                    _mirr_rm1(_sql_rm1, _params_rm1)
             except Exception as _ex_upd:
                 import traceback; traceback.print_exc()
             win.destroy(); self._load_log()
@@ -6654,11 +7038,12 @@ class RoomsFrame(tk.Frame):
         except: messagebox.showerror("","Введіть числове значення"); return
         _EXCL=['бесідк','беседк','альтанк','gazebo','баня','бані','sauna','лазня']
         try:
-            from app.utils.db import get_conn as _gcSD
-            with _gcSD() as _c:
+            from app.utils.db import get_conn as _gcSD, mirror_execute_to_cloud as _mirr_rm2
+            _wSD = _gcSD()
+            with _wSD as _c:
                 with _c.cursor() as _cur:
                     # Застосувати до всіх номерів (НЕ бань і НЕ бесідок)
-                    _cur.execute("""UPDATE rooms SET deposit_amount=%s
+                    _sql_rm2 = """UPDATE rooms SET deposit_amount=%s
                                     WHERE id IN (
                                         SELECT r.id FROM rooms r
                                         LEFT JOIN categories c ON r.category_id=c.id
@@ -6668,8 +7053,11 @@ class RoomsFrame(tk.Frame):
                                                 '%баня%','%бані%','%sauna%','%лазня%'
                                             ])
                                         )
-                                    )""", (amount,))
+                                    )"""
+                    _cur.execute(_sql_rm2, (amount,))
                 _c.commit()
+            if getattr(_wSD, 'backend', None) == 'main':
+                _mirr_rm2(_sql_rm2, (amount,))
             self._load_room_deposits()
             messagebox.showinfo("✅", f"Залог {amount:.0f}₴ встановлено для всіх номерів")
         except Exception as ex: messagebox.showerror("Помилка",str(ex))
@@ -9174,7 +9562,46 @@ class ChessFrame(tk.Frame):
         for lbl_t, d in [("1М",30),("3М",90),("6М",180),("1Р",365)]:
             btn(tb, lbl_t, lambda d=d:(setattr(self,'days',d),self.days_var.set(str(d)),self._redraw()),
                 C['card2'], 44).pack(side='left', padx=2, pady=8)
+        # ── Фільтр за типом номера (фіксований список: Усі, Бесідки та
+        # Альтанки, Номери, Золоті, Рожеві) ─────────────────────────────
+        lbl(tb,"Тип:",11,color=C['text2']).pack(side='left',padx=(14,3))
+        self._room_type_filter = "Усі"
+        self.room_type_var = ctk.StringVar(value="Усі")
+        self.room_type_menu = ctk.CTkOptionMenu(
+            tb, values=["Усі","Бесідки та Альтанки","Номери","Золоті","Рожеві"],
+            variable=self.room_type_var,
+            width=190, fg_color=C['card2'], button_color=C['accent'],
+            command=self._on_room_type_filter_change)
+        self.room_type_menu.pack(side='left', pady=8)
         self.tb = tb
+
+    def _on_room_type_filter_change(self, value):
+        self._room_type_filter = value
+        # Перемальовуємо з уже завантажених даних — без повторного запиту до БД.
+        if hasattr(self, '_last_rooms_full') and hasattr(self, '_last_chess_raw'):
+            self._render_chess(self._last_rooms_full, self._last_chess_raw,
+                                self._last_start_snap, self._last_days_snap)
+
+    @staticmethod
+    def _room_matches_filter(r, filter_value):
+        """Перевіряє, чи номер r підходить під обраний фільтр типу.
+        'Золоті'/'Рожеві'/'Номери' — за суфіксом у номері кімнати
+        (напр. '10 золотий' → тип 'золотий'). 'Бесідки та Альтанки' —
+        за НАЗВОЮ КАТЕГОРІЇ (бо це не частина номера, а окрема категорія)."""
+        if filter_value == "Усі":
+            return True
+        if filter_value == "Бесідки та Альтанки":
+            _cat = str(r.get('cat_name') or '').lower()
+            return ('бесідк' in _cat or 'беседк' in _cat
+                    or 'альтанк' in _cat or 'gazebo' in _cat)
+        _type = _room_sort_key(r.get('number'))[0]
+        if filter_value == "Номери":
+            return _type == "номер"
+        if filter_value == "Золоті":
+            return _type == "золотий"
+        if filter_value == "Рожеві":
+            return _type == "рожевий"
+        return True
 
     def _shift(self,d): self.start+=timedelta(days=d); self._redraw()
     def _today(self):   self.start=date.today();       self._redraw()
@@ -9244,6 +9671,28 @@ class ChessFrame(tk.Frame):
         try:
             for w in self.canvas_area.winfo_children(): w.destroy()
         except Exception: pass
+        # Зберігаємо ПОВНИЙ список (до фільтрації) — щоб зміна фільтра типу
+        # номера могла перемалювати без повторного запиту до БД.
+        self._last_rooms_full = rooms
+        self._last_chess_raw = chess
+        self._last_start_snap = start_snap
+        self._last_days_snap = days_snap
+        # Список фіксований (Усі / Бесідки та Альтанки / Номери / Золоті /
+        # Рожеві) — НЕ перезаписуємо його автовизначеними типами.
+        try:
+            _values = [g[0] for g in _ROOM_TYPE_GROUPS]
+            if getattr(self, '_room_type_filter', 'Усі') not in _values:
+                self._room_type_filter = "Усі"
+                self.room_type_var.set("Усі")
+        except Exception:
+            pass
+        # Застосовуємо фільтр за типом номера (для зручності — обрав "Рожеві",
+        # бачиш тільки рожеві номери в шахматці).
+        _cur_filter = getattr(self, '_room_type_filter', 'Усі')
+        if _cur_filter != 'Усі':
+            _predicate = dict(_ROOM_TYPE_GROUPS).get(_cur_filter)
+            if _predicate:
+                rooms = [r for r in rooms if _predicate(r)]
         self._rooms = rooms
         # Нормалізуємо дати в chess — конвертуємо str→date якщо потрібно
         import datetime as _dtn
@@ -9261,17 +9710,48 @@ class ChessFrame(tk.Frame):
         # Оновлюємо self.days якщо не змінився
         if self.start == start_snap: self.days = days_snap
         today=date.today()
-        CW,CH,LW,LH=48,38,210,40
+        CW,CH,LW,LH=48,38,320,40
         self._CW=CW; self._CH=CH; self._LW=LW; self._LH=LH
-        W=LW+days_snap*CW+20; H=LH+len(self._rooms)*CH+20
+        BODY_W=days_snap*CW+20; BODY_H=len(self._rooms)*CH+20
 
-        canvas=tk.Canvas(self.canvas_area,bg=C['bg'],highlightthickness=0)
-        sx=tk.Scrollbar(self.canvas_area,orient='horizontal',command=canvas.xview)
-        sy=tk.Scrollbar(self.canvas_area,orient='vertical',command=canvas.yview)
-        canvas.configure(xscrollcommand=sx.set,yscrollcommand=sy.set,scrollregion=(0,0,W,H))
-        sx.pack(side='bottom',fill='x'); sy.pack(side='right',fill='y')
-        canvas.pack(side='left',fill='both',expand=True)
-        self._canvas=canvas
+        # ── 4 canvas'и з "заморозкою" (excel-style): дати зверху та номери
+        # зліва лишаються на місці, скролиться тільки саме тіло сітки. ──────
+        grid_wrap = tk.Frame(self.canvas_area, bg=C['bg'])
+        grid_wrap.pack(fill='both', expand=True)
+        grid_wrap.grid_rowconfigure(1, weight=1)
+        grid_wrap.grid_columnconfigure(1, weight=1)
+
+        corner = tk.Canvas(grid_wrap, width=LW, height=LH, bg=C['card'],
+                            highlightthickness=0)
+        corner.grid(row=0, column=0, sticky='nw')
+        corner.create_rectangle(0,0,LW,LH,fill=C['card'],outline=C['border'])
+
+        header=tk.Canvas(grid_wrap, height=LH, bg=C['bg'], highlightthickness=0)
+        header.grid(row=0, column=1, sticky='ew')
+
+        left=tk.Canvas(grid_wrap, width=LW, bg=C['bg'], highlightthickness=0)
+        left.grid(row=1, column=0, sticky='ns')
+
+        canvas=tk.Canvas(grid_wrap,bg=C['bg'],highlightthickness=0)
+        canvas.grid(row=1, column=1, sticky='nsew')
+        self._canvas=canvas; self._header_canvas=header; self._left_canvas=left
+
+        def _sync_xscroll(*args):
+            canvas.xview(*args); header.xview(*args)
+        def _sync_yscroll(*args):
+            canvas.yview(*args); left.yview(*args)
+        sx=tk.Scrollbar(grid_wrap,orient='horizontal',command=_sync_xscroll)
+        sy=tk.Scrollbar(grid_wrap,orient='vertical',command=_sync_yscroll)
+        sx.grid(row=2, column=1, sticky='ew'); sy.grid(row=1, column=2, sticky='ns')
+
+        def _canvas_xscroll(a,b):
+            sx.set(a,b); header.xview_moveto(a)
+        def _canvas_yscroll(a,b):
+            sy.set(a,b); left.yview_moveto(a)
+        canvas.configure(xscrollcommand=_canvas_xscroll, yscrollcommand=_canvas_yscroll,
+                          scrollregion=(0,0,BODY_W,BODY_H))
+        header.configure(scrollregion=(0,0,BODY_W,LH))
+        left.configure(scrollregion=(0,0,LW,BODY_H))
 
         # ── Overlay прострочених виїздів поверх canvas шахматки ─────────────
         def _chess_overdue_overlay():
@@ -9339,7 +9819,7 @@ class ChessFrame(tk.Frame):
                            f"⚠️  Виїзд сьогодні: {len(_today_co)} номерів — Виселити або Продовжити")
 
                 # Overlay прикріплюємо до canvas (вже намальованого)
-                ov = tk.Frame(canvas, bg=_bg_c,
+                ov = tk.Frame(grid_wrap, bg=_bg_c,
                               highlightbackground=_brd_c, highlightthickness=2)
                 ov.place(relx=0.0, rely=0.0, anchor='nw', relwidth=1.0, y=0)
 
@@ -9370,23 +9850,23 @@ class ChessFrame(tk.Frame):
         self.after(50, _chess_overdue_overlay)
 
         for i in range(days_snap):
-            d=start_snap+timedelta(days=i); x=LW+i*CW
+            d=start_snap+timedelta(days=i); x=i*CW
             bg=C['red'] if d==today else (C['card2'] if d.weekday()>=5 else C['card'])
-            canvas.create_rectangle(x,0,x+CW,LH,fill=bg,outline=C['border'])
-            canvas.create_text(x+CW//2,LH//2,
+            header.create_rectangle(x,0,x+CW,LH,fill=bg,outline=C['border'])
+            header.create_text(x+CW//2,LH//2,
                 text=f"{d.day}\n{['Пн','Вт','Ср','Чт','Пт','Сб','Нд'][d.weekday()]}",
                 fill=C['text'],font=('Segoe UI',9,'bold'),justify='center')
 
         end = start_snap + timedelta(days=days_snap)
         for ri,room in enumerate(self._rooms):
-            y=LH+ri*CH
-            canvas.create_rectangle(0,y,LW,y+CH,fill=C['card'],outline=C['border'])
-            canvas.create_rectangle(2,y+2,7,y+CH-2,fill=STATUS_COLOR.get(room['status'],C['gray']),outline='')
-            canvas.create_text(LW//2+5,y+CH//2,
+            y=ri*CH
+            left.create_rectangle(0,y,LW,y+CH,fill=C['card'],outline=C['border'])
+            left.create_rectangle(2,y+2,7,y+CH-2,fill=STATUS_COLOR.get(room['status'],C['gray']),outline='')
+            left.create_text(10,y+CH//2,
                 text=f"№{room['number']}  {(room.get('cat_name') or '')}",
-                fill=C['text'],font=('Segoe UI',10,'bold'))
+                fill=C['text'],font=('Segoe UI',10,'bold'),anchor='w')
             for i in range(days_snap):
-                x=LW+i*CW
+                x=i*CW
                 bg='#141828' if (self.start+timedelta(days=i)).weekday()>=5 else C['bg']
                 canvas.create_rectangle(x,y,x+CW,y+CH,fill=bg,outline=C['border'])
 
@@ -9399,7 +9879,7 @@ class ChessFrame(tk.Frame):
             if st not in _statuses_to_show: continue
             _st_color = _status_colors.get(st, C['gray'])
             _st_text  = STATUS_UA.get(st, '')
-            y = LH + ri * CH
+            y = ri * CH
             # Знаходимо дні які НЕ покриті бронюванням
             _booked_days = set()
             for b2 in self._chess:
@@ -9409,7 +9889,7 @@ class ChessFrame(tk.Frame):
             # Статус відображаємо тільки на сьогодні (поточний стан номера)
             if today >= start_snap and today < end and today not in _booked_days:
                 i = (today - start_snap).days
-                x = LW + i * CW
+                x = i * CW
                 canvas.create_rectangle(x+1, y+1, x+CW-1, y+CH-1, fill=_st_color, outline='', stipple='gray25')
                 if CW > 30:
                     canvas.create_text(x+CW//2, y+CH//2, text=_st_text[:5],
@@ -9422,85 +9902,95 @@ class ChessFrame(tk.Frame):
             ci=max(b['check_in'],start_snap)
             co_raw=min(b['check_out'],end)
             co=co_raw if co_raw > ci else ci+timedelta(days=1)
-            x1=LW+(ci-start_snap).days*CW+2; x2=LW+(co-start_snap).days*CW-2
+            x1=(ci-start_snap).days*CW+2; x2=(co-start_snap).days*CW-2
             # Гарантуємо мінімальну ширину 1 клітинки
             if x2 < x1+4: x2=x1+CW-4
-            y1=LH+ri*CH+3;                   y2=LH+ri*CH+CH-3
+            y1=ri*CH+3;                   y2=ri*CH+CH-3
             color=C['green'] if b['status']=='checkedin' else C['accent']
             canvas.create_rectangle(x1,y1,x2,y2,fill=color,outline='')
             if x2-x1>20:
                 name=(b.get('guest_name') or '').split()[0]
                 canvas.create_text((x1+x2)//2,(y1+y2)//2,text=name,fill='white',font=('Segoe UI',8),width=x2-x1-4)
 
-        def _chess_scroll_v(e): self._canvas.yview_scroll(int(-1*(e.delta/120)), 'units')
-        def _chess_scroll_h(e): self._canvas.xview_scroll(int(-1*(e.delta/120)), 'units')
-        # Скрол тільки на canvas шахматки — БЕЗ bind_all (він ламає скрол у всій програмі)
-        canvas.bind('<MouseWheel>', lambda e: (self._canvas.yview_scroll(int(-1*(e.delta/120)),'units'), 'break')[1])
-        canvas.bind('<Shift-MouseWheel>', lambda e: (self._canvas.xview_scroll(int(-1*(e.delta/120)),'units'), 'break')[1])
-        canvas.bind('<Button-1>', self._on_click)
+        # Скрол тільки на canvas'ах шахматки — БЕЗ bind_all (він ламає скрол
+        # у всій програмі). Вертикальний скрол синхронізує тіло й ліву
+        # колонку з номерами; горизонтальний — тіло й шапку з датами, щоб
+        # при прокрутці і дати, і номери лишались на місці.
+        def _wheel_v(e):
+            canvas.yview_scroll(int(-1*(e.delta/120)),'units')
+            left.yview_scroll(int(-1*(e.delta/120)),'units')
+            return 'break'
+        def _wheel_h(e):
+            canvas.xview_scroll(int(-1*(e.delta/120)),'units')
+            header.xview_scroll(int(-1*(e.delta/120)),'units')
+            return 'break'
+        canvas.bind('<MouseWheel>', _wheel_v)
+        canvas.bind('<Shift-MouseWheel>', _wheel_h)
+        left.bind('<MouseWheel>', _wheel_v)
+        header.bind('<MouseWheel>', _wheel_h)
+        canvas.bind('<Button-1>', self._on_cell_click)
+        left.bind('<Button-1>', self._on_room_click)
 
-    def _on_click(self, event):
-        """Клік на шахматці — визначає що клікнули: номер чи клітинку."""
+    def _on_room_click(self, event):
+        """Клік на назву номера в лівій (замороженій) колонці."""
+        cy = self._left_canvas.canvasy(event.y)
+        CH = self._CH
+        ri = int(cy // CH)
+        if not (0 <= ri < len(self._rooms)): return
+        room = self._rooms[ri]
+        # Завжди шукаємо активне бронювання в БД (незалежно від статусу в кеші)
+        _found_b = None
+        try:
+            import datetime as _dtt
+            _today = _dtt.date.today()
+            # 1. Шукаємо в кеші шахматки
+            _found_b = next((b for b in self._chess
+                if int(b['room_id'])==int(room['id'])
+                and b['check_in'] <= _today < b['check_out']), None)
+            # 2. Якщо не знайшли — запит до БД
+            if not _found_b:
+                from app.utils.db import get_conn as _gc_lc
+                with _gc_lc() as _clc:
+                    with _clc.cursor() as _curlc:
+                        _curlc.execute(
+                            "SELECT id,room_id,guest_id,check_in,check_out,"
+                            "status,total_amount,nights,note FROM bookings "
+                            "WHERE room_id=%s AND status IN ('checkedin','confirmed') "
+                            "ORDER BY check_in DESC LIMIT 1", (room['id'],))
+                        _br = _curlc.fetchone()
+                        if _br:
+                            _found_b = dict(zip(
+                                ['id','room_id','guest_id','check_in','check_out',
+                                 'status','total_amount','nights','note'], _br))
+                            _found_b['room_number'] = room.get('number','')
+                            _found_b['cat_name']    = room.get('cat_name','')
+        except Exception as _elc:
+            log_error("chess left col click", _elc)
+        if _found_b:
+            self._booking_action_dlg(_found_b)
+        else:
+            self._room_status_dlg(room)
+
+    def _on_cell_click(self, event):
+        """Клік на клітинку сітки (тіло шахматки)."""
         cx = self._canvas.canvasx(event.x)
         cy = self._canvas.canvasy(event.y)
-        CW,CH,LW,LH = self._CW,self._CH,self._LW,self._LH
+        CW,CH = self._CW,self._CH
+        col = int(cx // CW)
+        ri  = int(cy // CH)
+        if col >= self.days or col < 0 or ri >= len(self._rooms) or ri < 0: return
+        click_date = self.start + timedelta(days=col)
+        room = self._rooms[ri]
 
-        # Клік на назву номера (ліва колонка)
-        if cx < LW and cy >= LH:
-            ri = int((cy - LH) // CH)
-            if ri < len(self._rooms):
-                room = self._rooms[ri]
-                # Завжди шукаємо активне бронювання в БД (незалежно від статусу в кеші)
-                _found_b = None
-                try:
-                    import datetime as _dtt
-                    _today = _dtt.date.today()
-                    # 1. Шукаємо в кеші шахматки
-                    _found_b = next((b for b in self._chess
-                        if int(b['room_id'])==int(room['id'])
-                        and b['check_in'] <= _today < b['check_out']), None)
-                    # 2. Якщо не знайшли — запит до БД
-                    if not _found_b:
-                        from app.utils.db import get_conn as _gc_lc
-                        with _gc_lc() as _clc:
-                            with _clc.cursor() as _curlc:
-                                _curlc.execute(
-                                    "SELECT id,room_id,guest_id,check_in,check_out,"
-                                    "status,total_amount,nights,note FROM bookings "
-                                    "WHERE room_id=%s AND status IN ('checkedin','confirmed') "
-                                    "ORDER BY check_in DESC LIMIT 1", (room['id'],))
-                                _br = _curlc.fetchone()
-                                if _br:
-                                    _found_b = dict(zip(
-                                        ['id','room_id','guest_id','check_in','check_out',
-                                         'status','total_amount','nights','note'], _br))
-                                    _found_b['room_number'] = room.get('number','')
-                                    _found_b['cat_name']    = room.get('cat_name','')
-                except Exception as _elc:
-                    log_error("chess left col click", _elc)
-                if _found_b:
-                    self._booking_action_dlg(_found_b)
-                else:
-                    self._room_status_dlg(room)
-            return
+        # Перевірити чи є бронювання на цей день
+        existing = next((b for b in self._chess
+            if int(b['room_id'])==int(room['id'])
+            and b['check_in'] <= click_date < b['check_out']), None)
 
-        # Клік на клітинку сітки
-        if cx >= LW and cy >= LH:
-            col = int((cx - LW) // CW)
-            ri  = int((cy - LH) // CH)
-            if col >= self.days or ri >= len(self._rooms): return
-            click_date = self.start + timedelta(days=col)
-            room = self._rooms[ri]
-
-            # Перевірити чи є бронювання на цей день
-            existing = next((b for b in self._chess
-                if int(b['room_id'])==int(room['id'])
-                and b['check_in'] <= click_date < b['check_out']), None)
-
-            if existing:
-                self._booking_action_dlg(existing)
-            else:
-                self._new_booking_dlg(room, click_date)
+        if existing:
+            self._booking_action_dlg(existing)
+        else:
+            self._new_booking_dlg(room, click_date)
 
     def _room_status_dlg(self, room):
         """Діалог зміни статусу номера."""
@@ -11508,16 +11998,26 @@ class BookingDetailDlg(ctk.CTkToplevel):
             reason=e_reason.get().strip() or reason_var.get()
             detail=e_note.get().strip()
             note_text=f"fine:{reason}:{detail}"
-            first_svc=query("SELECT id FROM services LIMIT 1",fetch='one')
-            sid=first_svc['id'] if first_svc else 1
-            query("""INSERT INTO service_orders (booking_id,room_id,service_id,quantity,price,total,note,created_at)
-                      VALUES (%s,%s,%s,1,%s,%s,%s,NOW())""",
-                  (self.bid,b['room_id'],sid,amt,amt,note_text))
-            messagebox.showinfo("✅",f"Штраф {amt:.0f}₴ додано!\nПричина: {reason}")
-            win.destroy(); self._rebuild()
 
+            def _do_save():
+                first_svc=query("SELECT id FROM services LIMIT 1",fetch='one')
+                sid=first_svc['id'] if first_svc else 1
+                query("""INSERT INTO service_orders (booking_id,room_id,service_id,quantity,price,total,note,created_at)
+                          VALUES (%s,%s,%s,1,%s,%s,%s,NOW())""",
+                      (self.bid,b['room_id'],sid,amt,amt,note_text))
+
+            def _on_success(_r):
+                try:
+                    win.destroy(); self._rebuild()
+                    messagebox.showinfo("✅",f"Штраф {amt:.0f}₴ додано!\nПричина: {reason}")
+                except Exception: pass
+
+            run_with_hourglass(win, save_btn, status_lbl, _do_save, _on_success, base_btn_text="💾 Додати штраф")
+
+        status_lbl=lbl(scroll,"",10); status_lbl.pack(anchor='w',padx=15)
         bf=ctk.CTkFrame(scroll,fg_color='transparent'); bf.pack(fill='x',pady=8)
-        btn(bf,"💾 Додати штраф",save,C['red'],180,height=40).pack(side='left',padx=5)
+        save_btn=btn(bf,"💾 Додати штраф",save,C['red'],180,height=40)
+        save_btn.pack(side='left',padx=5)
         btn(bf,"✖ Скасувати",win.destroy,C['card2'],120,height=40).pack(side='left',padx=5)
 
     def _print_receipt(self, b, bal, svc, pay, deposits=None, fines=None):
@@ -20362,9 +20862,22 @@ class SettingsFrame(tk.Frame):
         btn(tb,"📤 Експорт Excel",self._rooms_export_excel,C['accent'],150).pack(side='left',padx=4)
         btn(tb,"📥 Імпорт Excel",lambda:self._rooms_import_excel(p),C['green'],150).pack(side='left',padx=4)
         refresh_btn(tb, lambda:self._load_rooms(), side='left', padx=4, pady=6)
+
+        # ── Фільтр (шукає одразу по всіх колонках: номер, категорія, статус тощо) ──
+        _filt_row = tk.Frame(p, bg=C['bg']); _filt_row.pack(fill='x', pady=(0,4))
+        lbl(_filt_row, "🔍", 12).pack(side='left', padx=(2,4))
+        _rooms_filter_var = tk.StringVar()
+        _filt_entry = ctk.CTkEntry(_filt_row, textvariable=_rooms_filter_var, width=260,
+                                    placeholder_text="Фільтр: номер, категорія, статус…",
+                                    fg_color=C['card2'], border_color=C['border'], text_color=C['text'])
+        _filt_entry.pack(side='left')
+        _rooms_filter_var.trace_add('write', lambda *_: self.rooms_t._apply_filter(_rooms_filter_var.get()))
+
         ff,self.rooms_t=mktree(p,('id','number','cat','floor','status','price'),14,[50,80,160,60,120,100])
-        for c,h in zip(('id','number','cat','floor','status','price'),['ID','Кімн.','Категорія','Пов.','Статус','Ціна/ніч']):
+        _rooms_headings = {'id':'ID','number':'Кімн.','cat':'Категорія','floor':'Пов.','status':'Статус','price':'Ціна/ніч'}
+        for c,h in _rooms_headings.items():
             self.rooms_t.heading(c,text=h)
+        make_sortable_filterable(self.rooms_t, _rooms_headings)
         ff.pack(fill='both',expand=True)
 
         # Журнал прибирань
@@ -20506,6 +21019,8 @@ class SettingsFrame(tk.Frame):
             self.rooms_t.insert('','end',iid=r['id'],
                 values=(r['id'],r['number'],r.get('cat_name','—'),r.get('floor',1),
                         STATUS_UA.get(r.get('status',''),''),f"{float(r.get('base_price') or 0):.0f}₴"))
+        if hasattr(self.rooms_t, '_remember_all_rows'):
+            self.rooms_t._remember_all_rows()
 
     def _room_dlg(self,p,room=None):
         from app.modules.logic import get_categories,save_room
@@ -20544,12 +21059,21 @@ class SettingsFrame(tk.Frame):
         def save():
             if not flds['number'].get().strip(): messagebox.showerror("","Введіть номер"); return
             chosen_status=status_vals[status_labels.index(stv.get())] if stv.get() in status_labels else 'free'
-            save_room({'number':flds['number'].get().strip(),'floor':int(flds['floor'].get() or 1),
-                       'notes':flds['notes'].get(),'category_id':cat_map.get(cv.get()),
-                       'status':chosen_status},
-                      room['id'] if room else None)
-            self._load_rooms(); win.destroy()
-        btn(f,"💾 Зберегти",save,height=40).pack(fill='x',padx=10,pady=15)
+
+            def _do_save():
+                save_room({'number':flds['number'].get().strip(),'floor':int(flds['floor'].get() or 1),
+                           'notes':flds['notes'].get(),'category_id':cat_map.get(cv.get()),
+                           'status':chosen_status},
+                          room['id'] if room else None)
+
+            def _on_success(_r):
+                try: self._load_rooms(); win.destroy()
+                except Exception: pass
+
+            run_with_hourglass(win, save_btn, status_lbl, _do_save, _on_success)
+        status_lbl = lbl(f, "", 10); status_lbl.pack(anchor='w', padx=10)
+        save_btn = btn(f,"💾 Зберегти",save,height=40)
+        save_btn.pack(fill='x',padx=10,pady=15)
 
     def _room_edit(self,p):
         from app.modules.logic import get_room
@@ -21004,9 +21528,7 @@ class SettingsFrame(tk.Frame):
             msg = f"✅ Оброблено рядків: {ok} з {len(rows)}."
             if errors:
                 msg += f"\n⚠️ Помилок: {len(errors)} (перша: {errors[0][:150]})"
-            messagebox.showinfo("Імпорт завершено", msg +
-                "\n\n💡 Якщо якісь рядки одразу не з'явились/не оновились у списку —"
-                " натисніть 🔄 (можлива невелика затримка кешу).")
+            messagebox.showinfo("Імпорт завершено", msg)
             self._load_cats()
         except Exception as e:
             messagebox.showerror("Помилка імпорту", str(e))
@@ -21081,20 +21603,22 @@ class SettingsFrame(tk.Frame):
                 _cap_val = int(flds['capacity'].get() or 2)
             except ValueError:
                 messagebox.showerror("","Місць має бути цілим числом"); return
-            try:
-                # Зберігаємо тип тарифу в опис (додаємо мітку якщо немає)
+
+            def _do_save():
                 save_category({'name':flds['name'].get().strip(),
                                'description': desc.replace('[tariff:hour]','').replace('[tariff:night]','').strip() + f' [tariff:{tariff_var.get()}]',
                                'base_price':_price_val,
                                'capacity':_cap_val}, cat['id'] if cat else None)
-            except Exception as e:
-                messagebox.showerror("Помилка збереження", str(e))
-                return
-            self._load_cats(); win.destroy()
-            messagebox.showinfo("✅ Збережено",
-                "Категорію збережено.\nЯкщо зміни одразу не з'явились у списку — "
-                "натисніть 🔄 (можлива невелика затримка кешу).")
-        btn(f,"💾 Зберегти",save,height=40).pack(fill='x',padx=10,pady=12)
+
+            def _on_success(_r):
+                try: self._load_cats(); win.destroy()
+                except Exception: pass
+
+            run_with_hourglass(win, save_btn, status_lbl, _do_save, _on_success)
+
+        status_lbl = lbl(f, "", 10); status_lbl.pack(anchor='w', padx=10)
+        save_btn = btn(f,"💾 Зберегти",save,height=40)
+        save_btn.pack(fill='x',padx=10,pady=12)
 
     def _cat_edit(self,p):
         from app.modules.logic import get_categories
@@ -21857,7 +22381,8 @@ class SettingsFrame(tk.Frame):
             try: _quantity=int(flds['quantity'].get().replace(',','.').strip() or 0)
             except: _st.configure(text="❌ Кількість — ціле число",text_color=C['red']); return
             _cat=_cv.get(); _active=_av.get(); _barcode=_bc_ent.get().strip() or None
-            try:
+
+            def _do_save():
                 from app.utils.db import get_conn as _gc_svc
                 with _gc_svc() as _c:
                     with _c.cursor() as _cur:
@@ -21870,10 +22395,16 @@ class SettingsFrame(tk.Frame):
                         else:
                             _cur.execute("INSERT INTO services(name,category,price,unit,active,quantity,barcode) VALUES(%s,%s,%s,%s,%s,%s,%s)",(_name,_cat,_price,_unit,_active,_quantity,_barcode))
                     _c.commit()
-                self._load_svcs(expand_cat=_cat); win.destroy(); messagebox.showinfo("✅","Збережено")
-            except Exception as _ex: _st.configure(text=f"❌ {_ex}",text_color=C['red']); messagebox.showerror("Помилка",str(_ex))
+
+            def _on_success(_r):
+                try:
+                    self._load_svcs(expand_cat=_cat); win.destroy()
+                except Exception: pass
+
+            run_with_hourglass(win, _save_btn, _st, _do_save, _on_success)
         _bf=tk.Frame(f,bg=C['card']); _bf.pack(fill='x',padx=12,pady=6)
-        btn(_bf,"💾 Зберегти",_save,C['green'],height=38).pack(side='left',padx=(0,8))
+        _save_btn=btn(_bf,"💾 Зберегти",_save,C['green'],height=38)
+        _save_btn.pack(side='left',padx=(0,8))
         btn(_bf,"✖ Скасувати",win.destroy,C['card2'],height=38).pack(side='left')
 
     def _svc_edit(self, p):
@@ -22111,7 +22642,14 @@ class SettingsFrame(tk.Frame):
             global _cleaners_cache, _cleaners_cache_ts
             _cleaners_cache = None  # Скинути кеш після збереження
             _cleaners_cache_ts = 0.0
-            _save_cleaners_db(lst)
+            ok, err = _save_cleaners_db(lst)
+            if not ok:
+                messagebox.showwarning(
+                    "Помилка збереження",
+                    "Не вдалось зберегти зміну на сервері:\n\n"
+                    f"{err}\n\n"
+                    "Зміна застосована лише локально й може \"відкотитись\"\n"
+                    "при наступній синхронізації.")
 
         hdr=card(p); hdr.pack(fill='x',padx=5,pady=(8,4))
         lbl(hdr,"👤  Список прибиральниць",14,True).pack(anchor='w',padx=12,pady=(10,4))
@@ -22240,16 +22778,18 @@ class SettingsFrame(tk.Frame):
             if not usr: data['username']=flds.get('username',type('',(),{'get':lambda s:''})()).get().strip()
             if not data['full_name']: messagebox.showerror("","Введіть ім'я"); return
             if not usr and not data['username']: messagebox.showerror("","Введіть логін"); return
-            try:
+
+            def _do_save():
                 save_user(data,usr['id'] if usr else None)
-            except Exception as e:
-                messagebox.showerror("Помилка збереження", str(e))
-                return
-            self._load_users(); win.destroy()
-            messagebox.showinfo("✅ Збережено",
-                "Користувача збережено.\nЯкщо він одразу не з'явився у списку — "
-                "натисніть 🔄 (можлива невелика затримка кешу).")
-        btn(f,"💾 Зберегти",save,height=40).pack(fill='x',padx=10,pady=12)
+
+            def _on_success(_r):
+                try: self._load_users(); win.destroy()
+                except Exception: pass
+
+            run_with_hourglass(win, save_btn, status_lbl, _do_save, _on_success)
+        status_lbl = lbl(f, "", 10); status_lbl.pack(anchor='w', padx=10)
+        save_btn = btn(f,"💾 Зберегти",save,height=40)
+        save_btn.pack(fill='x',padx=10,pady=12)
 
     def _user_edit(self,p):
         from app.modules.logic import get_users
@@ -22454,6 +22994,20 @@ class SettingsFrame(tk.Frame):
         self.cloud_info = lbl(cl_card, "", 11, color=C['green'])
         self.cloud_info.configure(wraplength=850, justify='left')
         self.cloud_info.pack(anchor='w', padx=12, pady=(0,6))
+        # Показати час останнього оновлення довідників у хмарі одразу при
+        # відкритті вкладки — не лише одразу після натискання кнопки. Це
+        # охоплює і ручні оновлення, і автоматичні (раз на 6 год у фоні).
+        try:
+            from app.utils.db import get_cloud_sync_status as _get_cloud_sync_status
+            _cs = _get_cloud_sync_status()
+            if _cs and _cs.get('last_sync'):
+                _cs_res = _cs.get('result') or {}
+                self.cloud_info.configure(
+                    text=f"🕒 Востаннє оновлено в хмарі: {_cs['last_sync']}  ("
+                         + ", ".join(f"{k}={v}" for k, v in _cs_res.items()) + ")",
+                    text_color=C['text2'])
+        except Exception:
+            pass
         try:
             from app.utils.db import get_backend_status as _get_backend_status
             _bst = _get_backend_status()
@@ -22723,9 +23277,14 @@ class SettingsFrame(tk.Frame):
         def _bg():
             try:
                 from app.utils.db import push_reference_data_to_cloud
+                import datetime as _dtpc
                 res = push_reference_data_to_cloud()
-                txt = "✓ Оновлено: " + ", ".join(f"{k}={v}" for k,v in res.items()) if res else "✗ Хмара недоступна або не налаштована"
-                clr = C['green'] if res else C['red']
+                if res:
+                    _now = _dtpc.datetime.now().strftime('%H:%M:%S')
+                    txt = f"✓ Оновлено о {_now}: " + ", ".join(f"{k}={v}" for k,v in res.items())
+                    clr = C['green']
+                else:
+                    txt, clr = "✗ Хмара недоступна або не налаштована", C['red']
             except Exception as _e:
                 txt, clr = f"✗ {_e}", C['red']
             def _apply():
