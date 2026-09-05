@@ -98,7 +98,7 @@ import time as _time_mod
 import queue as _queue_mod
 import traceback as _tb_mod
 
-APP_VERSION = "1.0.3"  # Версія — змінюйте при кожному оновленні
+APP_VERSION = "1.0.4"  # Версія — змінюйте при кожному оновленні
 SYNC_INTERVAL = 60    # секунд між автосинхронізаціями
 
 
@@ -11582,6 +11582,8 @@ class BookingDetailDlg(ctk.CTkToplevel):
             btn(af2, "🚪 Виселити",  lambda: self._do_checkout(b, dep_active, fine_total, bal), C['yellow'], 110).pack(side='left', padx=3)
             btn(af2, "❌ Скасувати", lambda: self._do('cancelled'),                             C['red'],    110).pack(side='left', padx=3)
             btn(af2, "🖨 Чек",       lambda: self._print_receipt(b, bal, svc, pay, deposits, fines), C['card2'], 90).pack(side='left', padx=3)
+            if self._is_admin_user():
+                btn(af2, "✏️ Ред.", lambda: self._edit_booking_dlg(b), C['card2'], 90).pack(side='left', padx=3)
             log_info(f"[BookingDlg #{self.bid}] _render: УСПІШНО завершено")
 
         except Exception as e:
@@ -11720,6 +11722,8 @@ class BookingDetailDlg(ctk.CTkToplevel):
             btn(af2, "🚪 Виселити",  lambda: self._do_checkout(b, dep_active, fine_total, bal),C['yellow'], 110).pack(side='left', padx=3)
             btn(af2, "❌ Скасувати", lambda: self._do('cancelled'),                            C['red'],    110).pack(side='left', padx=3)
             btn(af2, "🖨 Чек",       lambda: self._print_receipt(b, bal, svc, pay, deposits, fines), C['card2'], 90).pack(side='left', padx=3)
+            if self._is_admin_user():
+                btn(af2, "✏️ Ред.", lambda: self._edit_booking_dlg(b), C['card2'], 90).pack(side='left', padx=3)
 
         except Exception as e:
             log_error(f"BookingDetailDlg._render bid={self.bid}", e)
@@ -11904,6 +11908,8 @@ class BookingDetailDlg(ctk.CTkToplevel):
         btn(af2, "🚪 Виселити",  lambda: self._do_checkout(b, dep_active, fine_total, bal), C['yellow'], 120).pack(side='left', padx=3)
         btn(af2, "❌ Скасувати", lambda: self._do('cancelled'),                             C['red'],    120).pack(side='left', padx=3)
         btn(af2, "🖨 Чек",       lambda: self._print_receipt(b, bal, svc, pay, deposits, fines), C['card2'], 100).pack(side='left', padx=3)
+        if self._is_admin_user():
+            btn(af2, "✏️ Ред.", lambda: self._edit_booking_dlg(b), C['card2'], 100).pack(side='left', padx=3)
 
     def _add_svc(self,tree):
         from app.modules.logic import get_booking,add_service
@@ -11921,6 +11927,92 @@ class BookingDetailDlg(ctk.CTkToplevel):
     def _do_checkout(self, b, dep_active, fine_total, bal):
         """Виселення — відкриває повноцінне вікно з поверненням залогу."""
         _open_checkout_dlg(self, self.bid, self._rebuild)
+
+    def _is_admin_user(self):
+        """Чи поточний користувач — адміністратор/менеджер (доступ до редагування)."""
+        try:
+            _app = _find_hotel_app(self)
+            if _app and hasattr(_app, 'user'):
+                return _app.user.get('role') in ('admin', 'manager')
+        except Exception:
+            pass
+        return False
+
+    def _edit_booking_dlg(self, b):
+        """Редагування бронювання/заселення (тільки для адміністратора):
+        дати, гість, телефон, кількість дорослих, ціна за добу, нотатки."""
+        from app.utils.db import query as _qe
+        win = dlg_win(self, f"✏️ Редагувати бронювання #{self.bid}", "420x520")
+        scroll = ctk.CTkScrollableFrame(win, fg_color=C['bg'])
+        scroll.pack(fill='both', expand=True, padx=10, pady=10)
+
+        def _row(label_text):
+            r = row_frm(scroll); r.pack(fill='x', padx=4, pady=4)
+            ctk.CTkLabel(r, text=label_text, font=('Segoe UI',11), text_color=C['text2'],
+                         width=110, anchor='w').pack(side='left')
+            return r
+
+        r1 = _row("Гість:")
+        e_name = ent(r1, w=230); e_name.insert(0, str(b.get('guest_name','')))
+
+        r2 = _row("Телефон:")
+        e_phone = ent(r2, w=230); e_phone.insert(0, str(b.get('phone','')))
+
+        r3 = _row("Заїзд (РРРР-ММ-ДД):")
+        e_ci = ent(r3, w=230); e_ci.insert(0, str(b.get('check_in','')))
+
+        r4 = _row("Виїзд (РРРР-ММ-ДД):")
+        e_co = ent(r4, w=230); e_co.insert(0, str(b.get('check_out','')))
+
+        r5 = _row("Дорослих:")
+        e_ad = ent(r5, w=230); e_ad.insert(0, str(b.get('adults','') or ''))
+
+        r6 = _row("Ціна/добу:")
+        e_price = ent(r6, w=230); e_price.insert(0, str(b.get('price_per_day','') or ''))
+
+        r7 = _row("Сума всього:")
+        e_total = ent(r7, w=230); e_total.insert(0, str(b.get('total_amount','') or ''))
+
+        lbl(scroll, "Нотатки:", 11, color=C['text2']).pack(anchor='w', padx=4, pady=(8,2))
+        e_notes = ctk.CTkTextbox(scroll, height=70, fg_color=C['card2'])
+        e_notes.pack(fill='x', padx=4)
+        e_notes.insert('1.0', str(b.get('notes','') or ''))
+
+        _st = lbl(scroll, "", 10)
+        _st.pack(anchor='w', padx=4, pady=(8,0))
+
+        def _save():
+            import datetime as _dted
+            try:
+                ci = _dted.date.fromisoformat(e_ci.get().strip())
+                co = _dted.date.fromisoformat(e_co.get().strip())
+                if co <= ci:
+                    _st.configure(text="❌ Виїзд має бути пізніше заїзду", text_color=C['red']); return
+            except Exception:
+                _st.configure(text="❌ Невірний формат дати (РРРР-ММ-ДД)", text_color=C['red']); return
+            try:
+                adults = int(e_ad.get().strip() or 1)
+                price  = float((e_price.get().strip() or '0').replace(',', '.'))
+                total  = float((e_total.get().strip() or '0').replace(',', '.'))
+            except ValueError:
+                _st.configure(text="❌ Дорослі/ціна/сума мають бути числами", text_color=C['red']); return
+            name  = e_name.get().strip()
+            phone = e_phone.get().strip()
+            notes = e_notes.get('1.0','end').strip()
+            try:
+                if b.get('guest_id'):
+                    _qe("UPDATE guests SET name=%s, phone=%s WHERE id=%s",
+                        (name, phone, b['guest_id']), fetch=None)
+                _qe("""UPDATE bookings SET check_in=%s, check_out=%s, adults=%s,
+                       price_per_day=%s, total_amount=%s, notes=%s WHERE id=%s""",
+                    (ci, co, adults, price, total, notes, self.bid), fetch=None)
+            except Exception as _ex:
+                _st.configure(text=f"❌ {_ex}", text_color=C['red']); return
+            win.destroy(); self._rebuild()
+
+        bf = ctk.CTkFrame(scroll, fg_color='transparent'); bf.pack(fill='x', pady=12)
+        btn(bf, "💾 Зберегти", _save, C['accent'], 150, height=38).pack(side='left', padx=5)
+        btn(bf, "✖ Скасувати", win.destroy, C['card2'], 130, height=38).pack(side='left', padx=5)
 
     def _deposit_dlg(self, action):
         """Діалог: взяти / повернути / утримати залог."""
@@ -14865,7 +14957,8 @@ class RestaurantFrame(tk.Frame):
         if iid not in item_map:
             messagebox.showwarning("","Оберіть рядок позиції (не заголовок замовлення)"); return
         info = item_map[iid]
-        if not info.get('is_open'):
+        _is_admin = self.user.get('role') in ('admin', 'manager')
+        if not info.get('is_open') and not _is_admin:
             messagebox.showwarning("","Це замовлення вже закрите — редагування недоступне"); return
         item_id  = info['item_id']
         order_id = info['order_id']
@@ -14878,6 +14971,9 @@ class RestaurantFrame(tk.Frame):
         dlg.geometry("320x200")
         dlg.grab_set(); dlg.resizable(False, False)
         dlg.configure(fg_color=C['bg'])
+        if not info.get('is_open'):
+            lbl(dlg, "⚠️ Замовлення закрите — редагування адміністратором", 9,
+                color=C['yellow']).pack(padx=16, pady=(10,0), anchor='w')
         lbl(dlg, f"Позиція: {name}", 11, color=C['text2']).pack(pady=(14,4), padx=16, anchor='w')
         lbl(dlg, "Нова кількість:", 11).pack(padx=16, anchor='w')
         qty_var = ctk.StringVar(value=str(cur_qty))
@@ -15038,6 +15134,12 @@ class RestaurantFrame(tk.Frame):
             order_id = self.cur_order
         if not order_id:
             messagebox.showwarning("", "Оберіть замовлення для видалення"); return
+        from app.utils.db import query as _qd
+        _ord_row = _qd("SELECT status FROM restaurant_orders WHERE id=%s", (order_id,), fetch='one') or {}
+        _is_admin = self.user.get('role') in ('admin', 'manager')
+        if str(_ord_row.get('status','')).lower() not in ('open','') and not _is_admin:
+            messagebox.showwarning("", "Це замовлення вже закрите — видалення доступне тільки адміністратору")
+            return
         if not messagebox.askyesno("Підтвердження", f"Видалити замовлення #{order_id}?"):
             return
         try:
