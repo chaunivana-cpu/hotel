@@ -17478,6 +17478,16 @@ class ReportsFrame(tk.Frame):
                 cols = ['room_number','guest_name','phone','check_in','check_out','nights','total','paid']
                 headers = ['Номер','Гість','Телефон','Заїзд','Виїзд','Ночей','Сума','Сплачено']
             else:
+                if rt == 'Зміни':
+                    if getattr(self, '_current_shift_detail_export_fn', None):
+                        self._current_shift_detail_export_fn()
+                    else:
+                        _sel = [s for var, s in getattr(self, '_shifts_vars', {}).values() if var.get()]
+                        if not _sel:
+                            messagebox.showinfo("", "Оберіть галочкою потрібні зміни, або відкрийте конкретну зміну кнопкою 'Переглянути'")
+                        else:
+                            self._export_shifts_summary_excel(_sel)
+                    return
                 messagebox.showinfo("", f"Excel-вигрузка для '{rt}' доступна через кнопку 'Вигрузити Excel' у самому звіті.")
                 return
         except Exception as _erd:
@@ -18270,6 +18280,36 @@ class ReportsFrame(tk.Frame):
             lbl(self.result, "Немає змін за вказаний період", 13, color=C['text2']).pack(pady=30)
             return
 
+        self._current_shift_detail_export_fn = None
+        self._shifts_vars = {}  # shift_id -> (tk.BooleanVar, shift_dict)
+
+        actions_bar = tk.Frame(self.result, bg=C['bg']); actions_bar.pack(fill='x', padx=15, pady=(0,6))
+        _all_var = tk.BooleanVar(value=False)
+        def _toggle_all():
+            v = _all_var.get()
+            for var, _s in self._shifts_vars.values():
+                var.set(v)
+        ctk.CTkCheckBox(actions_bar, text="Обрати всі", variable=_all_var, command=_toggle_all,
+                        font=('Segoe UI',11)).pack(side='left', padx=(0,14))
+
+        def _selected_shifts():
+            return [s for var, s in self._shifts_vars.values() if var.get()]
+
+        def _print_selected():
+            sel = _selected_shifts()
+            if not sel:
+                messagebox.showinfo("", "Оберіть хоча б одну зміну галочкою"); return
+            self._print_shifts_summary(sel)
+
+        def _export_selected():
+            sel = _selected_shifts()
+            if not sel:
+                messagebox.showinfo("", "Оберіть хоча б одну зміну галочкою"); return
+            self._export_shifts_summary_excel(sel)
+
+        btn(actions_bar, "🖨 Друкувати обрані", _print_selected, C['card2'], 190).pack(side='left', padx=4)
+        btn(actions_bar, "📊 Excel обрані", _export_selected, '#27ae60', 160).pack(side='left', padx=4)
+
         def _fmt_dt(v):
             if not v: return '—'
             s = str(v)
@@ -18277,13 +18317,105 @@ class ReportsFrame(tk.Frame):
 
         for sh in shifts_rows:
             rf = tk.Frame(self.result, bg=C['card2']); rf.pack(fill='x', padx=15, pady=3)
+            var = tk.BooleanVar(value=False)
+            self._shifts_vars[sh.get('id')] = (var, sh)
+            ctk.CTkCheckBox(rf, text="", variable=var, width=24).pack(side='left', padx=(10,4), pady=8)
             name = sh.get('full_name') or sh.get('username') or '—'
-            lbl(rf, f"👤 {name}", 12, True, C['text']).pack(side='left', padx=(12,10), pady=8)
+            lbl(rf, f"👤 {name}", 12, True, C['text']).pack(side='left', padx=(2,10), pady=8)
             lbl(rf, f"🟢 {_fmt_dt(sh.get('opened_at'))}  →  🔴 {_fmt_dt(sh.get('closed_at')) if sh.get('closed_at') else 'ще відкрита'}",
                 11, color=C['text2']).pack(side='left', padx=6)
             _st_ua = "🔓 Відкрита" if sh.get('status') == 'open' else "🔒 Закрита"
             lbl(rf, _st_ua, 11, color=C['green'] if sh.get('status')=='open' else C['text2']).pack(side='left', padx=10)
             btn(rf, "👁 Переглянути", lambda s=sh: self._show_shift_detail(s), C['accent'], 150).pack(side='right', padx=10, pady=6)
+
+        self._do_print_report_fn = lambda: self._print_shifts_summary(_selected_shifts() or shifts_rows)
+
+    def _shift_cash_totals(self, shift_id):
+        """Швидкі підсумки по одній зміні — для зведеного друку/Excel
+        по кількох обраних змінах (без повного побудування картки)."""
+        from app.utils.db import query as _qst
+        pay = _qst("""
+            SELECT method, COALESCE(SUM(amount),0) AS total FROM payments
+            WHERE shift_id=%s AND amount>0
+              AND (note IS NULL OR (note NOT LIKE 'Залог%%' AND note NOT LIKE 'Повернення залогу%%'))
+            GROUP BY method
+        """, (shift_id,)) or []
+        by_m = {r['method']: float(r['total'] or 0) for r in pay}
+        cash = by_m.get('cash', 0.0); card = by_m.get('card', 0.0); transfer = by_m.get('transfer', 0.0)
+        dep = _qst("""SELECT COALESCE(SUM(amount),0) AS t FROM payments
+                       WHERE shift_id=%s AND amount>0 AND note LIKE 'Залог%%'""", (shift_id,), fetch='one') or {}
+        ret = _qst("""SELECT COALESCE(SUM(-amount),0) AS t FROM payments
+                       WHERE shift_id=%s AND amount<0 AND note LIKE 'Повернення залогу%%'""", (shift_id,), fetch='one') or {}
+        rest = _qst("""SELECT COALESCE(SUM(amount),0) AS t, COUNT(*) AS c FROM payments
+                        WHERE shift_id=%s AND amount>0 AND note LIKE 'Ресторан %%'""", (shift_id,), fetch='one') or {}
+        return {
+            'cash': cash, 'card': card, 'transfer': transfer,
+            'total': cash+card+transfer,
+            'dep_taken': float(dep.get('t') or 0), 'dep_returned': float(ret.get('t') or 0),
+            'restaurant': float(rest.get('t') or 0), 'restaurant_cnt': int(rest.get('c') or 0),
+        }
+
+    def _print_shifts_summary(self, shifts):
+        """Друк зведеної таблиці по обраних змінах."""
+        lines = ["  ЗВІТ ПО ЗМІНАХ (обрано: %d)" % len(shifts), f"{'─'*70}"]
+        gt_cash=gt_card=gt_transfer=gt_total=gt_rest=0.0
+        for sh in shifts:
+            t = self._shift_cash_totals(sh.get('id'))
+            name = sh.get('full_name') or sh.get('username') or '—'
+            op = str(sh.get('opened_at') or '')[:16]
+            cl = str(sh.get('closed_at') or 'відкрита')[:16]
+            lines += [
+                f"  👤 {name}   {op} → {cl}",
+                f"    {'Готівка':<20}{t['cash']:>10.2f}₴   {'Картка':<10}{t['card']:>10.2f}₴   {'Переказ':<10}{t['transfer']:>10.2f}₴",
+                f"    {'Разом':<20}{t['total']:>10.2f}₴   {'Ресторан':<10}{t['restaurant']:>10.2f}₴   {'Залоги':<10}{t['dep_taken']:>10.2f}₴",
+                f"{'─'*70}",
+            ]
+            gt_cash+=t['cash']; gt_card+=t['card']; gt_transfer+=t['transfer']; gt_total+=t['total']; gt_rest+=t['restaurant']
+        lines += [
+            f"  ЗАГАЛОМ ПО ОБРАНИХ ЗМІНАХ:",
+            f"    {'Готівка':<20}{gt_cash:>10.2f}₴   {'Картка':<10}{gt_card:>10.2f}₴   {'Переказ':<10}{gt_transfer:>10.2f}₴",
+            f"    {'РАЗОМ':<20}{gt_total:>10.2f}₴   {'Ресторан':<10}{gt_rest:>10.2f}₴",
+        ]
+        print_text("Звіт по змінах", lines)
+
+    def _export_shifts_summary_excel(self, shifts):
+        """Excel-вигрузка зведеної таблиці по обраних змінах."""
+        import os, datetime as _dte
+        if not _OPENPYXL_OK:
+            messagebox.showerror("Помилка", "Бібліотека openpyxl не знайдена.\nВстановіть: pip install openpyxl")
+            return
+        wb = openpyxl.Workbook()
+        ws = wb.active; ws.title = "Зміни"
+        headers = ['Касир','Відкрита','Закрита','Готівка','Картка','Переказ','Разом','Ресторан','Залоги прийнято','Залоги повернено']
+        ws.append(headers)
+        for c in range(1, len(headers)+1):
+            cell = ws.cell(1, c)
+            cell.font = Font(bold=True, color='FFFFFF')
+            cell.fill = PatternFill('solid', fgColor='2C3E50')
+            cell.alignment = Alignment(horizontal='center')
+        for sh in shifts:
+            t = self._shift_cash_totals(sh.get('id'))
+            name = sh.get('full_name') or sh.get('username') or '—'
+            ws.append([
+                name, str(sh.get('opened_at') or '')[:16], str(sh.get('closed_at') or 'відкрита')[:16],
+                round(t['cash'],2), round(t['card'],2), round(t['transfer'],2), round(t['total'],2),
+                round(t['restaurant'],2), round(t['dep_taken'],2), round(t['dep_returned'],2),
+            ])
+        for col, w in zip('ABCDEFGHIJ', [22,16,16,12,12,12,12,12,14,14]):
+            ws.column_dimensions[col].width = w
+        try:
+            out_dir = os.path.join(os.path.expanduser('~'), 'Desktop')
+            if not os.path.isdir(out_dir): out_dir = os.path.expanduser('~')
+            fname = f"Зміни_{_dte.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            fpath = os.path.join(out_dir, fname)
+            wb.save(fpath)
+            messagebox.showinfo("Готово", f"Excel-файл збережено:\n{fpath}")
+            try:
+                os.startfile(fpath)
+            except Exception:
+                pass
+        except Exception as _e_sv:
+            messagebox.showerror("Помилка збереження", str(_e_sv))
 
     def _show_shift_detail(self, shift):
         """Повний звіт по одній конкретній зміні: усе, що вже показує
@@ -18960,17 +19092,21 @@ class ReportsFrame(tk.Frame):
 
             def _sec(title_):
                 tv_sh.insert('', 'end', values=(title_, ''), tags=('section',))
+                _flat_rows.append(('section', title_, ''))
 
             _rows_i = 0
+            _flat_rows = []  # (kind, label, value) — для друку/Excel цього звіту
             def _row(label, value, total=False, parent=''):
                 nonlocal _rows_i
                 tag = 'total' if total else ('odd' if _rows_i % 2 == 0 else 'even')
                 iid = tv_sh.insert(parent, 'end', values=(label, value), tags=(tag,))
                 _rows_i += 1
+                _flat_rows.append(('total' if total else 'row', label, value))
                 return iid
 
             def _child(parent_iid, label, value=''):
                 tv_sh.insert(parent_iid, 'end', values=(f"    {label}", value), tags=('child',))
+                _flat_rows.append(('child', label, value))
             tv_sh.tag_configure('child', foreground=C['text2'])
 
             from app.utils.db import query as _qtbl
@@ -19138,6 +19274,64 @@ class ReportsFrame(tk.Frame):
                                _iid_ci_r, _iid_ci_b, _iid_ci_g, _iid_bk_r, _iid_bk_b, _iid_bk_g):
                 try: tv_sh.item(_iid_open, open=True)
                 except Exception: pass
+
+            # ── Друк і Excel-вигрузка саме ЦІЄЇ зміни (на основі вже
+            # зібраних _flat_rows — без дублювання всієї логіки картко-звіту) ──
+            def _do_print_shift_table():
+                lines = [f"  ПОВНИЙ ЗВІТ ПО ЗМІНІ", f"  {shift_info}", f"{'─'*60}"]
+                for kind, label, value in _flat_rows:
+                    lbl_clean = label.replace('    ', '  ↳ ') if kind == 'child' else label
+                    if kind == 'section':
+                        lines.append(f"{'─'*60}"); lines.append(f"  {lbl_clean}")
+                    else:
+                        lines.append(f"  {lbl_clean:<46} {str(value):>12}")
+                print_text("Звіт по зміні", lines)
+
+            def _do_export_shift_table_excel():
+                import os, datetime as _dte
+                if not _OPENPYXL_OK:
+                    messagebox.showerror("Помилка", "Бібліотека openpyxl не знайдена.\nВстановіть: pip install openpyxl")
+                    return
+                wb = openpyxl.Workbook()
+                ws = wb.active; ws.title = "Звіт по зміні"
+                ws.column_dimensions['A'].width = 50
+                ws.column_dimensions['B'].width = 18
+                ws.append([f"ПОВНИЙ ЗВІТ ПО ЗМІНІ"]); ws.cell(1,1).font = Font(bold=True, size=14)
+                ws.append([shift_info]); ws.cell(2,1).font = Font(color='666666')
+                ws.append([])
+                for kind, label, value in _flat_rows:
+                    lbl_clean = label.replace('    ', '    ↳ ') if kind == 'child' else label
+                    r = ws.max_row + 1
+                    ws.cell(r, 1, lbl_clean)
+                    ws.cell(r, 2, value)
+                    if kind == 'section':
+                        ws.cell(r,1).font = Font(bold=True, color='FFFFFF')
+                        ws.cell(r,1).fill = PatternFill('solid', fgColor='2C3E50')
+                        ws.cell(r,2).fill = PatternFill('solid', fgColor='2C3E50')
+                    elif kind == 'total':
+                        ws.cell(r,1).font = Font(bold=True, color='117A65')
+                        ws.cell(r,2).font = Font(bold=True, color='117A65')
+                    elif kind == 'child':
+                        ws.cell(r,1).font = Font(color='888888', italic=True)
+                    ws.cell(r,2).alignment = Alignment(horizontal='right')
+                try:
+                    out_dir = os.path.join(os.path.expanduser('~'), 'Desktop')
+                    if not os.path.isdir(out_dir): out_dir = os.path.expanduser('~')
+                    fname = f"Зміна_{shift_id}_{_dte.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                    fpath = os.path.join(out_dir, fname)
+                    wb.save(fpath)
+                    messagebox.showinfo("Готово", f"Excel-файл збережено:\n{fpath}")
+                    try: os.startfile(fpath)
+                    except Exception: pass
+                except Exception as _e_sv:
+                    messagebox.showerror("Помилка збереження", str(_e_sv))
+
+            self._do_print_report_fn = _do_print_shift_table
+            self._current_shift_detail_export_fn = _do_export_shift_table_excel
+
+            btns_row = tk.Frame(tbl_card, bg=C['card']); btns_row.pack(fill='x', padx=12, pady=(0,10))
+            btn(btns_row, "🖨 Друкувати цю зміну", _do_print_shift_table, C['card2'], 190).pack(side='left', padx=4)
+            btn(btns_row, "📊 Excel цієї зміни", _do_export_shift_table_excel, '#27ae60', 170).pack(side='left', padx=4)
 
             ff_sh.pack(fill='both', expand=True, padx=10, pady=(0,10))
             return
