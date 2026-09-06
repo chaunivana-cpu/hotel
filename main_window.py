@@ -98,7 +98,7 @@ import time as _time_mod
 import queue as _queue_mod
 import traceback as _tb_mod
 
-APP_VERSION = "1.0.7"  # Версія — змінюйте при кожному оновленні
+APP_VERSION = "1.0.8"  # Версія — змінюйте при кожному оновленні
 SYNC_INTERVAL = 60    # секунд між автосинхронізаціями
 
 
@@ -5463,10 +5463,17 @@ class DashboardFrame(tk.Frame):
                 pass
         self.after(200, _check_test_mode_dash)
 
-        # ── Банер "Доступне оновлення" (перевіряється у фоні одноразово за сесію) ──
+        # ── Банер "Доступне оновлення" ───────────────────────────────────────
+        # Перевірка НЕ одноразова: після запуску перша перевірка через 60 с,
+        # далі — кожні 5 хвилин. Тому якщо нова версія з'явилась вже після
+        # запуску програми, користувач все одно побачить банер без перезапуску.
         self._update_banner = None
         self._update_data = None
-        self.after(4000, self._check_for_app_update)
+        self._update_remote_version = None
+        self._update_dismissed_version = None
+        self._update_check_after_id = None
+        self._update_check_interval_ms = 5 * 60 * 1000
+        self.after(60000, self._update_check_tick)
 
         # Статистичні картки — будуємо одразу зі статичним скелетом
         self._st = tk.Frame(self, bg=C['bg']); self._st.pack(fill='x', padx=20, pady=5)
@@ -5521,84 +5528,195 @@ class DashboardFrame(tk.Frame):
         except Exception:
             pass
 
+    def _update_check_tick(self):
+        """Періодична перевірка оновлення.
+
+        Схема:
+          • перша перевірка виконується через 60 секунд після запуску;
+          • після цього перевірка повторюється кожні 5 хвилин;
+          • мережевий запит виконується у фоні, тому UI не зависає;
+          • якщо нова версія з'явилась під час роботи — банер з'явиться
+            автоматично, без перезапуску програми.
+        """
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+
+        # Наступний запуск плануємо одразу. Навіть якщо мережевий запит
+        # зависне/завершиться помилкою, цикл перевірки не зупиниться.
+        try:
+            self._update_check_after_id = self.after(
+                self._update_check_interval_ms, self._update_check_tick
+            )
+        except Exception:
+            self._update_check_after_id = None
+
+        self._check_for_app_update()
+
     def _check_for_app_update(self):
-        """Одноразова (за сесію) фонова перевірка оновлення — показує банер
-        зверху дашборду, якщо на сервері є новіша версія main_window.py."""
+        """Фонова перевірка наявності новішої версії.
+
+        Метод можна викликати багато разів протягом сесії. На відміну від
+        старої реалізації, перевірка не обмежена одним запуском програми.
+        Версія на сервері порівнюється з APP_VERSION у _upd_check_available().
+        """
         import threading
+
         def _bg():
             try:
                 res = _upd_check_available(timeout=12)
-            except Exception:
-                res = {'available': False, 'data': None, 'error': None}
+            except Exception as e:
+                res = {
+                    'available': False,
+                    'data': None,
+                    'error': str(e),
+                    'remote_version': None,
+                    'local_version': globals().get('APP_VERSION', '0.0.0'),
+                }
+
             if res.get('available') and res.get('data'):
                 def _show():
                     try:
                         if self.winfo_exists():
                             self._show_update_banner(res)
-                    except Exception:
-                        pass
-                try: self.after(0, _show)
-                except Exception: pass
-        threading.Thread(target=_bg, daemon=True).start()
+                    except Exception as e:
+                        log_error('Помилка показу банера оновлення', e)
+                try:
+                    self.after(0, _show)
+                except Exception:
+                    pass
+
+        threading.Thread(target=_bg, daemon=True, name='AppUpdateCheck').start()
 
     def _show_update_banner(self, res):
-        if self._update_banner is not None:
-            return  # вже показано (або вже закрито користувачем)
-        data = res['data']
-        self._update_data = data
-        kb = len(data) // 1024
+        """Показує банер оновлення та керує його станом.
+
+        Важливо: після натискання ✕ ми запам'ятовуємо саме версію, яку
+        користувач закрив. Та сама версія повторно не показується, але коли
+        на сервері з'явиться, наприклад, v1.0.3 після закритої v1.0.2 —
+        банер знову з'явиться автоматично.
+        """
+        data = res.get('data')
+        if not data:
+            return
+
         remote_ver = res.get('remote_version')
-        local_ver = res.get('local_version', '')
+        local_ver = res.get('local_version', globals().get('APP_VERSION', ''))
         size_only = res.get('size_only', False)
+
+        # Для надійного режиму з APP_VERSION: не показуємо ту саму версію,
+        # яку користувач уже закрив. Для старого size-only режиму version=None,
+        # тому банер може знову з'явитися після наступної перевірки — це свідомо,
+        # бо без номера версії неможливо визначити, чи це справді новий реліз.
+        if remote_ver and remote_ver == self._update_dismissed_version:
+            return
+
+        # Якщо банер уже є:
+        # • та сама версія — нічого не робимо;
+        # • з'явилась новіша — замінюємо старий банер новим.
+        if self._update_banner is not None:
+            old_ver = getattr(self, '_update_remote_version', None)
+            if remote_ver and old_ver and remote_ver == old_ver:
+                return
+            if remote_ver and old_ver and _upd_version_tuple(remote_ver) <= _upd_version_tuple(old_ver):
+                return
+            try:
+                self._update_banner.destroy()
+            except Exception:
+                pass
+            self._update_banner = None
+            self._update_data = None
+
+        self._update_data = data
+        self._update_remote_version = remote_ver
+        kb = len(data) // 1024
+
         if remote_ver:
             title = f"🆕  Доступне оновлення: v{local_ver} → v{remote_ver}  ({kb} КБ)"
         else:
-            # Немає рядка версії у файлі — порівняння лише за розміром,
-            # менш надійне. Явно попереджаємо, щоб не встановити щось не те.
-            title = f"⚠️  Знайдено ІНШИЙ файл на сервері ({kb} КБ, версію не вдалось визначити — перевірте вручну перед встановленням)"
+            title = (
+                f"⚠️  Знайдено ІНШИЙ файл на сервері ({kb} КБ, версію не вдалось "
+                "визначити — перевірте вручну перед встановленням)"
+            )
+
         clr = C['green'] if not size_only else C['yellow']
         bg_clr = '#1d4d2b' if not size_only else '#4d3d1d'
         b = ctk.CTkFrame(self, fg_color=bg_clr, corner_radius=8)
         b.pack(fill='x', padx=20, pady=(0, 6), before=self._st)
         self._update_banner = b
-        row = tk.Frame(b, bg=bg_clr); row.pack(fill='x', padx=12, pady=8)
+
+        row = tk.Frame(b, bg=bg_clr)
+        row.pack(fill='x', padx=12, pady=8)
         lbl(row, title, 12, True, clr).pack(side='left')
+
         def _do_update_now():
-            btn_ref['widget'].configure(state='disabled', text='⏳ Перевіряємо...')
+            try:
+                btn_ref['widget'].configure(state='disabled', text='⏳ Перевіряємо...')
+            except Exception:
+                pass
+
             import threading
+
             def _bg():
                 try:
                     fresh = _upd_check_available(timeout=15)
                 except Exception as e:
-                    fresh = {'available': False, 'data': None, 'error': str(e)}
+                    fresh = {
+                        'available': False,
+                        'data': None,
+                        'error': str(e),
+                        'remote_version': None,
+                    }
+
                 def _after():
                     try:
-                        btn_ref['widget'].configure(state='normal', text='💾 Оновити зараз')
-                    except Exception: pass
+                        btn_ref['widget'].configure(
+                            state='normal', text='💾 Оновити зараз'
+                        )
+                    except Exception:
+                        pass
+
                     if fresh.get('data'):
-                        # Завжди застосовуємо щойно завантажені (свіжі) дані,
-                        # а не ті, що були отримані під час першої перевірки —
-                        # інакше можна встановити вже застарілу проміжну версію,
-                        # якщо на сервері з'явилось ще новіше оновлення.
+                        # Беремо найсвіжіший файл із сервера.
                         _upd_apply(fresh['data'], parent=self)
+                    elif self._update_data:
+                        # Якщо повторна перевірка тимчасово не пройшла,
+                        # залишаємо можливість встановити файл із банера.
+                        _upd_apply(self._update_data, parent=self)
                     else:
-                        # Свіжої версії вже нема (могли встигнути оновити раніше,
-                        # або сервер тимчасово недоступний) — застосовуємо те, що
-                        # показував банер, як запасний варіант.
-                        if self._update_data:
-                            _upd_apply(self._update_data, parent=self)
-                        else:
-                            messagebox.showwarning("", "Не вдалось перевірити оновлення повторно. Спробуйте пізніше.", parent=self)
-                try: self.after(0, _after)
-                except Exception: pass
-            threading.Thread(target=_bg, daemon=True).start()
+                        messagebox.showwarning(
+                            "Оновлення",
+                            "Не вдалось перевірити оновлення повторно. Спробуйте пізніше.",
+                            parent=self
+                        )
+
+                try:
+                    self.after(0, _after)
+                except Exception:
+                    pass
+
+            threading.Thread(target=_bg, daemon=True, name='AppUpdateDownload').start()
+
         btn_ref = {}
-        btn_ref['widget'] = btn(row, "💾 Оновити зараз", _do_update_now, C['green'], 160, height=32)
-        btn_ref['widget'].pack(side='right', padx=(6,0))
+        btn_ref['widget'] = btn(
+            row, "💾 Оновити зараз", _do_update_now, C['green'], 160, height=32
+        )
+        btn_ref['widget'].pack(side='right', padx=(6, 0))
+
         def _dismiss():
-            try: b.destroy()
-            except Exception: pass
-            self._update_banner = 'dismissed'
+            # Запам'ятовуємо саме версію, яку користувач закрив.
+            # Наступна новіша версія все одно буде показана.
+            if self._update_remote_version:
+                self._update_dismissed_version = self._update_remote_version
+            try:
+                b.destroy()
+            except Exception:
+                pass
+            self._update_banner = None
+            self._update_data = None
+
         btn(row, "✕", _dismiss, C['card2'], 34, height=32).pack(side='right')
 
     def _load_data_async(self):
@@ -9098,7 +9216,7 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
                                 text_color=C['green']); _rz_sum_lbl.pack(side='right', padx=14)
 
     def _get_total_now():
-        """Повертає (сума_за_номер, залог, разом)."""
+        """Повертає (сума_за_номер, залог, разом) — з урахуванням знижки."""
         try:
             _txt = lbl_total.cget('text')  # напр. "770₴  (1 ніч × 770₴)"
             import re as _re
@@ -9107,6 +9225,9 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
         except Exception: _room_sum = 0.0
         try: _dep = float(e_dep.get() or 0)
         except Exception: _dep = 0.0
+        try: _disc = max(float(e_discount.get() or 0), 0.0)
+        except Exception: _disc = 0.0
+        _room_sum = max(_room_sum - _disc, 0.0)
         return _room_sum, _dep, _room_sum + _dep
 
     def _upd_razom_new(*_):
@@ -9183,6 +9304,26 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
                      variable=var_hotels_ci, font=('Segoe UI',11),
                      fg_color=C['accent'], text_color=C['text']).grid(row=7,column=1,padx=(15,0),pady=4,sticky='w')
 
+    # ── Знижка (з обов'язковим коментарем-причиною) ─────────────────────
+    disc_frame = tk.Frame(p_card, bg=C['card']); disc_frame.pack(fill='x', padx=12, pady=(4,10))
+    ctk.CTkLabel(disc_frame, text="🏷 Знижка:", font=('Segoe UI',11),
+                 text_color=C['text2']).pack(side='left', padx=(0,6))
+    e_discount = ent(disc_frame, "0", w=80); e_discount.pack(side='left')
+    ctk.CTkLabel(disc_frame, text="₴", font=('Segoe UI',11), text_color=C['text2']).pack(side='left', padx=(4,14))
+    ctk.CTkLabel(disc_frame, text="Коментар:", font=('Segoe UI',11),
+                 text_color=C['text2']).pack(side='left', padx=(0,6))
+    e_discount_comment = ent(disc_frame, "напр. постійний клієнт", w=220)
+    e_discount_comment.pack(side='left')
+    _disc_hint = ctk.CTkLabel(disc_frame, text="", font=('Segoe UI',11,'bold'), text_color=C['yellow'])
+    _disc_hint.pack(side='left', padx=(10,0))
+    def _upd_disc_hint(*_):
+        try:
+            d = max(float(e_discount.get() or 0), 0.0)
+            _disc_hint.configure(text=f"(-{d:.0f}₴)" if d > 0 else "")
+        except Exception:
+            _disc_hint.configure(text="")
+    e_discount.bind('<KeyRelease>', lambda e: (_upd_disc_hint(), _upd_razom_new(), _upd_chg()))
+
     # ── Додаткові послуги ───────────────────────────────────────────────
     _get_room_svcs = _build_services_block(sc, ['restaurant','minibar','other'],
                                            "🛎 Додаткові послуги до номера",
@@ -9220,6 +9361,11 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
         total  = price * nights
         try: dep = float(e_dep.get() or 0)
         except: dep = 0.0
+        try: discount = max(float(e_discount.get() or 0), 0.0)
+        except: discount = 0.0
+        discount_comment = e_discount_comment.get().strip()
+        if discount > 0 and not discount_comment:
+            messagebox.showerror("", "Вкажіть коментар (причину) знижки"); return
 
         # Створити/знайти гостя
         passport_info = f"{pseries} {pnum}".strip()
@@ -9234,14 +9380,15 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
 
         # Створити бронювання з total_amount
         nights_cnt = (co - ci).days
-        room_total_amt = price * nights_cnt
+        room_total_amt = max(price * nights_cnt - discount, 0)
+        _disc_note = f"Знижка: {discount:.0f}₴ ({discount_comment})  " if discount > 0 else ""
         query("""INSERT INTO bookings
                   (guest_id, room_id, check_in, check_out, price_per_day,
                    adults, notes, status, total_amount, source_hotels, created_at)
                   VALUES (%s,%s,%s,%s,%s,%s,%s,'checkedin',%s,%s,NOW())""",
               (gid, room['id'], ci, co, price,
                int(e_adults.get() or 1),
-               (f"Паспорт: {passport_info}  " if passport_info.strip() else "") + e_note.get().strip(),
+               (f"Паспорт: {passport_info}  " if passport_info.strip() else "") + _disc_note + e_note.get().strip(),
                room_total_amt, bool(var_hotels_ci.get())),
               fetch=None)
         b_row = query("""SELECT id FROM bookings WHERE room_id=%s AND check_in=%s
@@ -10408,12 +10555,15 @@ class CheckedinFrame(tk.Frame):
         self.tree.bind('<Double-1>',lambda e:self._open())
 
         bot=ctk.CTkFrame(self,fg_color=C['card']); bot.pack(fill='x',padx=15,pady=(0,10))
-        for txt,cmd,color in [
+        _btns = [
             ("🚪 Виселити",    self._checkout,  C['yellow']),
             ("📅 Продовжити",  self._extend,    C['green']),
             ("💰 Оплата",      self._pay,        C['accent']),
             ("📋 Деталі",      self._open,       C['card2']),
-        ]:
+        ]
+        if self.user.get('role') in ('admin', 'manager'):
+            _btns.append(("✏️ Редагувати", self._open, '#9b59b6'))
+        for txt,cmd,color in _btns:
             btn(bot,txt,cmd,color,120).pack(side='left',padx=4,pady=8)
         self._load()
 
@@ -10886,12 +11036,15 @@ class BookingsFrame(tk.Frame):
         self.tree.bind('<Double-1>',lambda e:self._open())
 
         bot=ctk.CTkFrame(self,fg_color=C['card']); bot.pack(fill='x',padx=15,pady=(0,10))
-        for txt,cmd,color in [
+        _btns2 = [
             ("✅ Заселити",  self._checkin_dlg,           C['green']),
             ("❌ Скасувати", lambda:self._st('cancelled'), C['red']),
             ("💰 Оплата",    self._pay,                   C['accent']),
             ("📋 Деталі",    self._open,                  C['card2']),
-        ]:
+        ]
+        if self.user.get('role') in ('admin', 'manager'):
+            _btns2.append(("✏️ Редагувати", self._open, '#9b59b6'))
+        for txt,cmd,color in _btns2:
             btn(bot,txt,cmd,color,130).pack(side='left',padx=5,pady=8)
         self._load()
 
@@ -11308,6 +11461,13 @@ class BookingDlg(ctk.CTkToplevel):
             e=ent(f,ph,w=200); e.insert(0,val); e.pack(side='left'); self.fields[key]=e
 
         f=row_frm(b2)
+        ctk.CTkLabel(f,text="🏷 Знижка",font=('Segoe UI',11),text_color=C['text2'],width=120,anchor='w').pack(side='left')
+        disc_f=tk.Frame(f,bg=C['card2']); disc_f.pack(side='left')
+        self.e_discount=ent(disc_f,"0",w=90); self.e_discount.pack(side='left')
+        ctk.CTkLabel(disc_f,text="₴",font=('Segoe UI',11),text_color=C['text2']).pack(side='left',padx=(4,10))
+        self.e_discount_comment=ent(disc_f,"Коментар (причина знижки)",w=220); self.e_discount_comment.pack(side='left')
+
+        f=row_frm(b2)
         ctk.CTkLabel(f,text="Нотатки",font=('Segoe UI',11),text_color=C['text2'],width=120,anchor='w').pack(side='left')
         self.e_notes=ent(f,w=360); self.e_notes.pack(side='left')
 
@@ -11389,16 +11549,41 @@ class BookingDlg(ctk.CTkToplevel):
         if cout<=cin: messagebox.showerror("","Виїзд має бути пізніше заїзду"); return
         name=self.fields['name'].get().strip()
         if not name: messagebox.showerror("","Введіть ім'я гостя"); return
+        try:
+            discount = max(float(self.e_discount.get() or 0), 0.0)
+        except Exception:
+            discount = 0.0
+        discount_comment = self.e_discount_comment.get().strip()
+        if discount > 0 and not discount_comment:
+            messagebox.showerror("", "Вкажіть коментар (причину) знижки"); return
         gid=self.guest_id or save_guest({'name':name,'phone':self.fields['phone'].get().strip()})
         rc=self.room_var.get()
         rid=self.room_map[rc]['id']
         _adv_amount = float(getattr(self,'e_deposit',None) and self.e_deposit.get() or 0)
+        _price_per_day = float(self.fields['price'].get() or 0)
+        _nights = max((cout - cin).days, 1)
+        _notes_full = self.e_notes.get()
+        if discount > 0:
+            _notes_full = f"Знижка: {discount:.0f}₴ ({discount_comment})  " + _notes_full
         _new_bid = create_booking({'room_id':rid,'guest_id':gid,'check_in':cin,'check_out':cout,
-                        'price_per_day':float(self.fields['price'].get() or 0),
+                        'price_per_day':_price_per_day,
                         'adults':int(self.fields['adults'].get() or 1),
                         'children':int(self.fields['kids'].get() or 0),
-                        'notes':self.e_notes.get(),
+                        'notes':_notes_full,
                         'deposit_amount':_adv_amount})
+        if discount > 0:
+            try:
+                from app.utils.db import query as _qdisc
+                _use_bid_d = _new_bid
+                if not _use_bid_d:
+                    _last_d = _qdisc("SELECT id FROM bookings WHERE room_id=%s AND guest_id=%s ORDER BY created_at DESC LIMIT 1",
+                                      (rid, gid), fetch='one')
+                    _use_bid_d = _last_d['id'] if _last_d else None
+                if _use_bid_d:
+                    _qdisc("UPDATE bookings SET total_amount=GREATEST(COALESCE(total_amount,0)-%s,0) WHERE id=%s",
+                           (discount, _use_bid_d), fetch=None)
+            except Exception as _ed:
+                log_error("BookingDlg discount apply", _ed)
         # Позначка "Hotels" (джерело бронювання) — окремим UPDATE, оскільки
         # create_booking() з app.modules.logic може не знати про це поле.
         try:
@@ -11584,10 +11769,11 @@ class BookingDetailDlg(ctk.CTkToplevel):
                 ("❗ Борг",     f"{bal.get('debt',0):.0f}₴",   C['red'] if bal.get('debt',0)>0 else C['gray']),
                 ("⚠️ Штрафи",  f"{fine_total:.0f}₴",           C['red'] if fine_total>0 else C['gray']),
             ]):
-                _cc = ctk.CTkFrame(bf, fg_color=clr, corner_radius=8)
-                _cc.grid(row=0, column=col, padx=5, pady=6, sticky='ew', ipady=6)
-                lbl(_cc, val, 20, True, 'white').pack(pady=(6,1))
-                lbl(_cc, lt, 9, color='white').pack(pady=(0,6))
+                _cc = ctk.CTkFrame(bf, fg_color=clr, corner_radius=8, height=70)
+                _cc.grid(row=0, column=col, padx=5, pady=6, sticky='ew')
+                _cc.grid_propagate(False)
+                lbl(_cc, val, 18, True, 'white').pack(pady=(10,1))
+                lbl(_cc, lt, 9, color='white').pack(pady=(0,4))
 
             # ── Залог ────────────────────────────────────
             df = card(scroll); df.pack(fill='x', pady=4)
@@ -11724,10 +11910,11 @@ class BookingDetailDlg(ctk.CTkToplevel):
                 ("❗ Борг",     f"{bal.get('debt',0):.0f}₴",   C['red'] if bal.get('debt',0)>0 else C['gray']),
                 ("⚠️ Штрафи",  f"{fine_total:.0f}₴",           C['red'] if fine_total>0 else C['gray']),
             ]):
-                _cc = ctk.CTkFrame(bf, fg_color=clr, corner_radius=8)
-                _cc.grid(row=0, column=col, padx=5, pady=6, sticky='ew', ipady=6)
-                lbl(_cc, val, 20, True, 'white').pack(pady=(6,1))
-                lbl(_cc, lt, 9, color='white').pack(pady=(0,6))
+                _cc = ctk.CTkFrame(bf, fg_color=clr, corner_radius=8, height=70)
+                _cc.grid(row=0, column=col, padx=5, pady=6, sticky='ew')
+                _cc.grid_propagate(False)
+                lbl(_cc, val, 18, True, 'white').pack(pady=(10,1))
+                lbl(_cc, lt, 9, color='white').pack(pady=(0,4))
 
             # ── Залог ────────────────────────────────────
             df = card(scroll); df.pack(fill='x', pady=4)
@@ -11893,9 +12080,10 @@ class BookingDetailDlg(ctk.CTkToplevel):
             ("Борг",     f"{bal['debt']:.0f}₴",   C['red'] if bal['debt']>0 else C['gray']),
             ("Штрафи",   f"{fine_total:.0f}₴",    C['red'] if fine_total>0 else C['gray']),
         ]):
-            ctk.CTkFrame(bf, fg_color=color, corner_radius=10).grid(row=0, column=col, padx=6, pady=8, sticky='ew', ipady=10)
-            lbl(bf, val, 22, True, color).grid(row=0, column=col, pady=(14,2))
-            lbl(bf, lt, 10, color=C['text2']).grid(row=1, column=col, pady=(0,10))
+            ctk.CTkFrame(bf, fg_color=color, corner_radius=8, height=64, width=100).grid(row=0, column=col, padx=5, pady=6, sticky='ew')
+            bf.grid_rowconfigure(0, minsize=64)
+            lbl(bf, val, 14, True, color).grid(row=0, column=col, pady=(8,1))
+            lbl(bf, lt, 9, color=C['text2']).grid(row=1, column=col, pady=(0,6))
 
         # ── Залог ─────────────────────────────────────
         df = card(scroll); df.pack(fill='x', pady=5)
@@ -12003,7 +12191,7 @@ class BookingDetailDlg(ctk.CTkToplevel):
         """Редагування бронювання/заселення (тільки для адміністратора):
         дати, гість, телефон, кількість дорослих, ціна за добу, нотатки."""
         from app.utils.db import query as _qe
-        win = dlg_win(self, f"✏️ Редагувати бронювання #{self.bid}", "420x520")
+        win = dlg_win(self, f"✏️ Редагувати бронювання #{self.bid}", "440x580")
         scroll = ctk.CTkScrollableFrame(win, fg_color=C['bg'])
         scroll.pack(fill='both', expand=True, padx=10, pady=10)
 
@@ -12034,6 +12222,12 @@ class BookingDetailDlg(ctk.CTkToplevel):
         r7 = _row("Сума всього:")
         e_total = ent(r7, w=230); e_total.insert(0, str(b.get('total_amount','') or ''))
 
+        r8 = _row("🏷 Знижка:")
+        disc_wrap = tk.Frame(r8, bg=C['card2']); disc_wrap.pack(side='left')
+        e_disc = ent(disc_wrap, "0", w=90); e_disc.pack(side='left')
+        ctk.CTkLabel(disc_wrap, text="₴  Коментар:", font=('Segoe UI',10), text_color=C['text2']).pack(side='left', padx=(6,4))
+        e_disc_comment = ent(disc_wrap, "причина", w=110); e_disc_comment.pack(side='left')
+
         lbl(scroll, "Нотатки:", 11, color=C['text2']).pack(anchor='w', padx=4, pady=(8,2))
         e_notes = ctk.CTkTextbox(scroll, height=70, fg_color=C['card2'])
         e_notes.pack(fill='x', padx=4)
@@ -12055,11 +12249,18 @@ class BookingDetailDlg(ctk.CTkToplevel):
                 adults = int(e_ad.get().strip() or 1)
                 price  = float((e_price.get().strip() or '0').replace(',', '.'))
                 total  = float((e_total.get().strip() or '0').replace(',', '.'))
+                discount = max(float((e_disc.get().strip() or '0').replace(',', '.')), 0.0)
             except ValueError:
-                _st.configure(text="❌ Дорослі/ціна/сума мають бути числами", text_color=C['red']); return
+                _st.configure(text="❌ Дорослі/ціна/сума/знижка мають бути числами", text_color=C['red']); return
+            discount_comment = e_disc_comment.get().strip()
+            if discount > 0 and not discount_comment:
+                _st.configure(text="❌ Вкажіть коментар (причину) знижки", text_color=C['red']); return
             name  = e_name.get().strip()
             phone = e_phone.get().strip()
             notes = e_notes.get('1.0','end').strip()
+            if discount > 0:
+                total = max(total - discount, 0)
+                notes = f"Знижка: {discount:.0f}₴ ({discount_comment})  " + notes
             try:
                 if b.get('guest_id'):
                     _qe("UPDATE guests SET name=%s, phone=%s WHERE id=%s",
@@ -19375,25 +19576,39 @@ class ReportsFrame(tk.Frame):
         lbl(pm, "💳  Розбивка за методом оплати", 13, True).pack(anchor='w', padx=12, pady=(10,5))
         method_names = {'cash':'💵 Готівка','card':'💳 Картка','transfer':'🏦 Переказ','online':'🌐 Онлайн'}
         for r in pay_rows:
-            rf=tk.Frame(pm,bg=C['card2']); rf.pack(fill='x',padx=10,pady=2)
+            rf=tk.Frame(pm,bg=C['card2'],cursor='hand2'); rf.pack(fill='x',padx=10,pady=2)
             lbl(rf, method_names.get(r['method'],r['method']), 12).pack(side='left',padx=10,pady=6)
             lbl(rf, f"{int(r['cnt'])} транз.", 11, color=C['text2']).pack(side='left',padx=10)
-            lbl(rf, f"{float(r['total'] or 0):.2f}₴", 13, True, C['green']).pack(side='right',padx=15)
+            _amt_lbl_m = lbl(rf, f"{float(r['total'] or 0):.2f}₴", 13, True, C['green']); _amt_lbl_m.pack(side='right',padx=15)
+            _arr_m = lbl(rf, "▶", 10, color=C['text2']); _arr_m.pack(side='right', padx=4)
+            _cb_m = lambda ft=f"method:{r['method']}", t=method_names.get(r['method'],r['method']): _show_payment_method_details(t, ft, C['green'])
+            for w in (rf, _amt_lbl_m, _arr_m):
+                w.bind('<Button-1>', lambda e, cb=_cb_m: cb())
+                w.configure(cursor='hand2')
         tk.Frame(pm,bg=C['card'],height=6).pack()
         if xz_dep > 0 or xz_ret > 0 or _opening_dep_sr > 0:
             _dep_bal = xz_dep_balance
             if _opening_dep_sr > 0:
-                rf0=tk.Frame(pm,bg='#784212'); rf0.pack(fill='x',padx=10,pady=2)
+                rf0=tk.Frame(pm,bg='#784212',cursor='hand2'); rf0.pack(fill='x',padx=10,pady=2)
                 lbl(rf0,'🔒 Залоги з попередньої зміни',12,color='white').pack(side='left',padx=10,pady=6)
-                lbl(rf0,f'{_opening_dep_sr:.2f}₴',13,True,'white').pack(side='right',padx=15)
+                _v0=lbl(rf0,f'{_opening_dep_sr:.2f}₴',13,True,'white'); _v0.pack(side='right',padx=15)
+                _a0=lbl(rf0,"▶",10,color='white'); _a0.pack(side='right',padx=4)
+                _cb0 = lambda: _show_payment_method_details("🔒 Залоги з попередньої зміни", 'dep_prev', '#e67e22')
+                for w in (rf0,_v0,_a0): w.bind('<Button-1>', lambda e,cb=_cb0: cb())
             if xz_dep > 0:
-                rf=tk.Frame(pm,bg='#e67e22'); rf.pack(fill='x',padx=10,pady=2)
+                rf=tk.Frame(pm,bg='#e67e22',cursor='hand2'); rf.pack(fill='x',padx=10,pady=2)
                 lbl(rf,'🔒 Залоги прийнято цієї зміни',12,color='white').pack(side='left',padx=10,pady=6)
-                lbl(rf,f'{xz_dep:.2f}₴',13,True,'white').pack(side='right',padx=15)
+                _v1=lbl(rf,f'{xz_dep:.2f}₴',13,True,'white'); _v1.pack(side='right',padx=15)
+                _a1=lbl(rf,"▶",10,color='white'); _a1.pack(side='right',padx=4)
+                _cb1 = lambda: _show_payment_method_details("🔒 Залоги прийнято цієї зміни", 'dep_taken', '#e67e22')
+                for w in (rf,_v1,_a1): w.bind('<Button-1>', lambda e,cb=_cb1: cb())
             if xz_ret > 0:
-                rf2=tk.Frame(pm,bg='#922b21'); rf2.pack(fill='x',padx=10,pady=2)
+                rf2=tk.Frame(pm,bg='#922b21',cursor='hand2'); rf2.pack(fill='x',padx=10,pady=2)
                 lbl(rf2,'↩️ Повернено залогів',12,color='white').pack(side='left',padx=10,pady=6)
-                lbl(rf2,f'-{xz_ret:.2f}₴',13,True,'white').pack(side='right',padx=15)
+                _v2=lbl(rf2,f'-{xz_ret:.2f}₴',13,True,'white'); _v2.pack(side='right',padx=15)
+                _a2=lbl(rf2,"▶",10,color='white'); _a2.pack(side='right',padx=4)
+                _cb2 = lambda: _show_payment_method_details("↩️ Повернено залогів", 'dep_returned', '#e74c3c')
+                for w in (rf2,_v2,_a2): w.bind('<Button-1>', lambda e,cb=_cb2: cb())
             rf3=tk.Frame(pm,bg='#c0392b'); rf3.pack(fill='x',padx=10,pady=2)
             lbl(rf3,'💸 Залишок залогів (всього)',12,True,color='white').pack(side='left',padx=10,pady=6)
             lbl(rf3,f'{_dep_bal:.2f}₴',14,True,'white').pack(side='right',padx=15)
@@ -19663,6 +19878,121 @@ class ReportsFrame(tk.Frame):
 
             btn_f2 = tk.Frame(win2, bg=C['bg']); btn_f2.pack(fill='x', padx=15, pady=8)
             btn(btn_f2, "✖ Закрити", win2.destroy, C['card2'], 120, height=36).pack(side='right')
+
+        def _show_payment_method_details(title, filter_type, icon_color):
+            """Popup з деталями по методу оплати або по залогах — хто платив,
+            за що, коли. Формат рядків — як у 1С: дата/час, гість/номер,
+            призначення платежу, сума."""
+            from app.utils.db import query as _qrp
+            win3 = dlg_win(self, title, "750x560")
+            top3 = tk.Frame(win3, bg=C['bg']); top3.pack(fill='both', expand=True)
+            cv3 = tk.Canvas(top3, bg=C['bg'], highlightthickness=0)
+            sb3 = tk.Scrollbar(top3, orient='vertical', command=cv3.yview)
+            cv3.configure(yscrollcommand=sb3.set)
+            sb3.pack(side='right', fill='y'); cv3.pack(side='left', fill='both', expand=True)
+            sc3 = tk.Frame(cv3, bg=C['bg'])
+            cw3 = cv3.create_window((0,0), window=sc3, anchor='nw')
+            cv3.bind('<Configure>', lambda e: cv3.itemconfig(cw3, width=e.width))
+            sc3.bind('<Configure>', lambda e: cv3.configure(scrollregion=cv3.bbox('all')))
+            cv3.bind('<MouseWheel>', lambda e: cv3.yview_scroll(int(-1*(e.delta/120)),'units'))
+
+            hdr4 = card(sc3); hdr4.pack(fill='x', padx=10, pady=(10,5))
+            lbl(hdr4, title, 14, True, icon_color).pack(anchor='w', padx=12, pady=(10,3))
+            lbl(hdr4, shift_info, 11, color=C['text2']).pack(anchor='w', padx=12, pady=(0,8))
+
+            rows_pm = []
+            is_approx = False
+            try:
+                if filter_type.startswith('method:'):
+                    _meth = filter_type.split(':',1)[1]
+                    rows_pm = _qrp("""
+                        SELECT p.created_at, p.amount, p.method, p.note,
+                               r.number AS room, g.name AS guest
+                        FROM payments p
+                        LEFT JOIN bookings b ON p.booking_id=b.id
+                        LEFT JOIN rooms r ON b.room_id=r.id
+                        LEFT JOIN guests g ON b.guest_id=g.id
+                        WHERE p.shift_id=%s AND p.method=%s AND p.amount>0
+                          AND (p.note IS NULL OR (p.note NOT LIKE 'Залог%%'
+                               AND p.note NOT LIKE 'Повернення залогу%%'))
+                        ORDER BY p.created_at
+                    """, (shift_id, _meth)) or []
+                elif filter_type == 'dep_taken':
+                    rows_pm = _qrp("""
+                        SELECT p.created_at, p.amount, p.method, p.note,
+                               r.number AS room, g.name AS guest
+                        FROM payments p
+                        LEFT JOIN bookings b ON p.booking_id=b.id
+                        LEFT JOIN rooms r ON b.room_id=r.id
+                        LEFT JOIN guests g ON b.guest_id=g.id
+                        WHERE p.shift_id=%s AND p.amount>0 AND p.note LIKE 'Залог%%'
+                        ORDER BY p.created_at
+                    """, (shift_id,)) or []
+                elif filter_type == 'dep_returned':
+                    rows_pm = _qrp("""
+                        SELECT p.created_at, ABS(p.amount) AS amount, p.method, p.note,
+                               r.number AS room, g.name AS guest
+                        FROM payments p
+                        LEFT JOIN bookings b ON p.booking_id=b.id
+                        LEFT JOIN rooms r ON b.room_id=r.id
+                        LEFT JOIN guests g ON b.guest_id=g.id
+                        WHERE p.shift_id=%s AND p.amount<0 AND p.note LIKE 'Повернення залогу%%'
+                        ORDER BY p.created_at
+                    """, (shift_id,)) or []
+                elif filter_type == 'dep_prev':
+                    # Наближено: залоги, взяті ДО початку цієї зміни, для яких
+                    # ще не було повернення до початку цієї зміни.
+                    is_approx = True
+                    rows_pm = _qrp("""
+                        SELECT p.created_at, p.amount, p.method, p.note,
+                               r.number AS room, g.name AS guest
+                        FROM payments p
+                        JOIN bookings b ON p.booking_id=b.id
+                        LEFT JOIN rooms r ON b.room_id=r.id
+                        LEFT JOIN guests g ON b.guest_id=g.id
+                        WHERE p.amount>0 AND p.note LIKE 'Залог%%' AND p.created_at < %s
+                          AND NOT EXISTS (
+                              SELECT 1 FROM payments p2
+                              WHERE p2.booking_id=p.booking_id AND p2.amount<0
+                                AND p2.note LIKE 'Повернення залогу%%' AND p2.created_at < %s
+                          )
+                        ORDER BY p.created_at
+                    """, (shift_start, shift_start)) or []
+            except Exception as _e_pm:
+                lbl(sc3, f"Помилка: {_e_pm}", 11, color=C['red']).pack(padx=15, pady=10)
+
+            if is_approx:
+                lbl(sc3, "ℹ️ Наближений список — залоги, ще не повернуті на момент початку зміни",
+                    10, color=C['yellow']).pack(anchor='w', padx=15, pady=(0,6))
+
+            _tot_pm = sum(float(r.get('amount') or 0) for r in rows_pm)
+            sum_card = card(sc3); sum_card.pack(fill='x', padx=10, pady=(0,8))
+            sf2 = tk.Frame(sum_card, bg=C['card']); sf2.pack(fill='x', padx=8, pady=8)
+            lbl(sf2, f"Транзакцій: {len(rows_pm)}", 12).pack(side='left', padx=10, pady=6)
+            lbl(sf2, f"Разом: {_tot_pm:.2f}₴", 14, True, icon_color).pack(side='right', padx=15)
+
+            method_names_pm = {'cash':'💵 Готівка','card':'💳 Картка','transfer':'🏦 Переказ','online':'🌐 Онлайн'}
+            for r in rows_pm:
+                rf4 = card(sc3); rf4.pack(fill='x', padx=10, pady=3)
+                _t = r.get('created_at')
+                _ts = _t.strftime('%d.%m.%Y %H:%M') if hasattr(_t, 'strftime') else str(_t)[:16]
+                r4a = tk.Frame(rf4, bg=C['card2']); r4a.pack(fill='x', padx=8, pady=(4,1))
+                _who = r.get('guest') or '—'
+                _room_txt = f"  🛏 №{r.get('room')}" if r.get('room') else ""
+                lbl(r4a, f"👤 {_who}{_room_txt}", 12, True, icon_color).pack(side='left', padx=4)
+                lbl(r4a, f"{float(r.get('amount') or 0):.2f}₴", 13, True, icon_color).pack(side='right', padx=8)
+                r4b = tk.Frame(rf4, bg=C['card2']); r4b.pack(fill='x', padx=8, pady=(0,4))
+                lbl(r4b, f"🕐 {_ts}", 11, color=C['text2']).pack(side='left', padx=4)
+                lbl(r4b, method_names_pm.get(r.get('method'), r.get('method') or ''), 11, color=C['green']).pack(side='left', padx=6)
+                _note_txt = str(r.get('note') or '').strip()
+                if _note_txt:
+                    lbl(r4b, f"📝 {_note_txt}", 10, color=C['text2']).pack(side='left', padx=4)
+
+            if not rows_pm:
+                lbl(sc3, "Немає транзакцій за цим фільтром", 12, color=C['text2']).pack(pady=20)
+
+            btn_f3 = tk.Frame(win3, bg=C['bg']); btn_f3.pack(fill='x', padx=15, pady=8)
+            btn(btn_f3, "✖ Закрити", win3.destroy, C['card2'], 120, height=36).pack(side='right')
 
         # Дохід за категоріями — клікабельні рядки
         rv2 = card(self.result); rv2.pack(fill='x', padx=5, pady=5)
