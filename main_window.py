@@ -21387,13 +21387,12 @@ class SettingsFrame(tk.Frame):
             ("🧾 Checkbox РРО",   "_checkbox_tab"),
             ("📋 Лог",            "_log_tab"),
             ("🔄 Оновлення",      "_update_tab"),
-            ("🧠 Логіка",         "_logic_tab"),
         ]
         _tab_map = {name: meth for name, meth in _TAB_LIST}
 
         # ── Дворядкова навігація (кнопки) ──────────────────────────────────
         ROW1 = _TAB_LIST[:7]   # Номери…Залоги
-        ROW2 = _TAB_LIST[7:]   # База даних…Логіка
+        ROW2 = _TAB_LIST[7:]   # База даних…Оновлення
 
         nav_outer = tk.Frame(self, bg=C['bg'])
         nav_outer.pack(fill='x', padx=20, pady=(0, 4))
