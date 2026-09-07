@@ -40,6 +40,25 @@ def log_error(msg, exc=None):
 def log_info(msg):
     _logger.info(msg)
 
+
+def _mark_booking_event_time(booking_id, event):
+    """Зберігає фактичний час заселення/виселення в notes бронювання.
+
+    Не змінює схему БД, тому сумісний зі старими базами.
+    """
+    try:
+        from app.utils.db import query as _qevt
+        _row = _qevt("SELECT notes FROM bookings WHERE id=%s", (booking_id,), fetch='one') or {}
+        _notes = _row.get('notes', '') or ''
+        import re as _re_evt
+        _notes = _re_evt.sub(rf'Фактичне {event}: \[?[^\]\n]+\]?', '', _notes).strip()
+        _label = 'Фактичне заселення' if event == 'заселення' else 'Фактичне виселення'
+        _value = __import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M')
+        _new_notes = (_notes + ('  ' if _notes else '') + f'{_label}: {_value}').strip()
+        _qevt("UPDATE bookings SET notes=%s WHERE id=%s", (_new_notes, booking_id), fetch=None)
+    except Exception as _e_evt:
+        log_error(f'Не вдалося зберегти час {event}', _e_evt)
+
 # Перехоплювати всі необроблені виключення
 import sys as _sys
 _orig_excepthook = _sys.excepthook
@@ -98,7 +117,7 @@ import time as _time_mod
 import queue as _queue_mod
 import traceback as _tb_mod
 
-APP_VERSION = "1.0.8"  # Версія — змінюйте при кожному оновленні
+APP_VERSION = "1.0.9"  # Версія — змінюйте при кожному оновленні
 SYNC_INTERVAL = 60    # секунд між автосинхронізаціями
 
 
@@ -1598,11 +1617,46 @@ _suppress_tk_errors()
 def apply_style():
     s = ttk.Style()
     s.theme_use('clam')
-    s.configure("H.Treeview", background=C['card'], foreground=C['text'],
-                fieldbackground=C['card'], rowheight=28, font=('Segoe UI',10))
-    s.configure("H.Treeview.Heading", background=C['card2'], foreground=C['accent'],
-                font=('Segoe UI',10,'bold'), relief='flat')
-    s.map("H.Treeview", background=[('selected',C['accent'])], foreground=[('selected','white')])
+
+    # ══ ТАБЛИЦІ У СТИЛІ 1С ══
+    # Спокійна шапка, щільні рядки, zebra-чергування, чітке виділення
+    # та нормальний вертикальний/горизонтальний скрол. Такі таблиці
+    # читаються як облікова відомість, а не як набір окремих карток.
+    s.configure("H.Treeview",
+                background=C['card'], foreground=C['text'],
+                fieldbackground=C['card'],
+                rowheight=30,
+                font=('Segoe UI', 10),
+                borderwidth=0, relief='flat')
+    s.configure("H.Treeview.Heading",
+                background='#2b3042',
+                foreground='#dbe4ff',
+                font=('Segoe UI', 10, 'bold'),
+                relief='flat',
+                padding=(10, 8))
+    s.map("H.Treeview",
+          background=[('selected', C['accent']), ('focus', C['card'])],
+          foreground=[('selected', 'white')])
+
+    # Окремий стиль для таблиць звітів, які створюються напряму через ttk.Treeview.
+    for name in ('Rev', 'Pay'):
+        s.configure(f'{name}.Treeview',
+                    background=C['card'], foreground=C['text'],
+                    fieldbackground=C['card'], rowheight=30,
+                    font=('Segoe UI', 10), borderwidth=0, relief='flat')
+        s.configure(f'{name}.Treeview.Heading',
+                    background='#2b3042', foreground='#dbe4ff',
+                    font=('Segoe UI', 10, 'bold'), relief='flat',
+                    padding=(10, 8))
+        s.map(f'{name}.Treeview',
+              background=[('selected', C['accent'])],
+              foreground=[('selected', 'white')])
+
+    # Скролбари теж робимо стриманими, щоб таблиця виглядала цілісно.
+    s.configure('H.Vertical.TScrollbar', troughcolor=C['card'],
+                background='#4b536b', bordercolor=C['card'], arrowcolor=C['text2'])
+    s.configure('H.Horizontal.TScrollbar', troughcolor=C['card'],
+                background='#4b536b', bordercolor=C['card'], arrowcolor=C['text2'])
 
 # 🔧 ГЛОБАЛЬНЕ ВИПРАВЛЕННЯ: Запобігти автоматичному скролюванню Treeview
 # Застосувати один раз на старті
@@ -1616,15 +1670,22 @@ if not hasattr(ttk.Treeview, '_patched_for_auto_scroll'):
     ttk.Treeview._patched_for_auto_scroll = True
 
 def mktree(parent, cols, h=8, widths=None):
-    f = tk.Frame(parent, bg=C['bg'])
+    # Універсальна таблиця для розділів звітів. Зовнішня рамка + шапка +
+    # zebra-рядки дають відчуття повноцінної облікової таблиці у стилі 1С.
+    f = tk.Frame(parent, bg='#11151f', highlightbackground='#343a50',
+                 highlightthickness=1, bd=0)
     t = ttk.Treeview(f, columns=cols, show='headings', height=h, style="H.Treeview")
-    sb = ttk.Scrollbar(f, orient='vertical', command=t.yview)
-    t.configure(yscrollcommand=sb.set)
+    sb = ttk.Scrollbar(f, orient='vertical', command=t.yview, style='H.Vertical.TScrollbar')
+    hsb = ttk.Scrollbar(f, orient='horizontal', command=t.xview, style='H.Horizontal.TScrollbar')
+    t.configure(yscrollcommand=sb.set, xscrollcommand=hsb.set)
     for i,c in enumerate(cols):
         w = widths[i] if widths else 100
-        t.column(c, width=w, anchor='center')
-    sb.pack(side='right', fill='y')
-    t.pack(side='left', fill='both', expand=True)
+        t.column(c, width=w, minwidth=45, anchor='center', stretch=True)
+    t.grid(row=0, column=0, sticky='nsew')
+    sb.grid(row=0, column=1, sticky='ns')
+    hsb.grid(row=1, column=0, sticky='ew')
+    f.grid_rowconfigure(0, weight=1)
+    f.grid_columnconfigure(0, weight=1)
     # 🔧 ВИПРАВЛЕННЯ: Запобігти автоматичному скролюванню вниз
     t._prevent_auto_scroll = True
     return f, t
@@ -7739,6 +7800,7 @@ class RoomsFrame(tk.Frame):
                 f"Виселити {active_bk.get('guest_name','')} з №{room['number']}?"): return
             try:
                 query("UPDATE bookings SET status='checkedout' WHERE id=%s",(active_bk['id'],),fetch=None)
+                _mark_booking_event_time(active_bk['id'], 'виселення')
                 query("UPDATE rooms SET status='cleaning' WHERE id=%s",(rid,),fetch=None)
                 _cl_append({'room': str(room['number']), 'cleaner': '—', 'started': __import__('datetime').datetime.now().strftime('%d.%m.%Y %H:%M'), 'finished': '', 'new_status': 'cleaning', 'note': 'Авто-запис при виселенні', 'logged_at': __import__('datetime').datetime.now().strftime('%d.%m.%Y %H:%M:%S')})
             except Exception as ex: messagebox.showerror("Помилка",str(ex)); return
@@ -8240,6 +8302,7 @@ def _open_checkout_dlg(parent, bid, on_close=None):
         actual_checkout = checkin_date + _dt.timedelta(hours=n) if is_hourly_booking else checkin_date + _dt.timedelta(days=int(n))
         query("UPDATE bookings SET check_out=%s WHERE id=%s", (actual_checkout, bid), fetch=None)
         update_booking_status(bid, 'checkedout')
+        _mark_booking_event_time(bid, 'виселення')
         query("UPDATE rooms SET status='cleaning' WHERE id=%s", (b['room_id'],), fetch=None)
         _cl_append({'room': str(b.get('room_number', b['room_id'])), 'cleaner': '—', 'started': _dt.datetime.now().strftime('%d.%m.%Y %H:%M'), 'finished': '', 'new_status': 'cleaning', 'note': 'Авто-запис при виселенні', 'logged_at': _dt.datetime.now().strftime('%d.%m.%Y %H:%M:%S')})
 
@@ -8534,6 +8597,7 @@ def _open_checkin_existing(parent, b, room, on_save=None):
 
         # Заселити
         update_booking_status(b['id'], 'checkedin')
+        _mark_booking_event_time(b['id'], 'заселення')
         query("UPDATE rooms SET status='occupied' WHERE id=%s", (room['id'],), fetch=None)
 
         # Чек
@@ -9394,6 +9458,7 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
         b_row = query("""SELECT id FROM bookings WHERE room_id=%s AND check_in=%s
                           ORDER BY id DESC LIMIT 1""", (room['id'], ci), fetch='one')
         bid = b_row['id']
+        _mark_booking_event_time(bid, 'заселення')
 
         # Оплата повної суми
         query("""INSERT INTO payments (booking_id, amount, method, note, shift_id, created_at)
@@ -10346,6 +10411,8 @@ class ChessFrame(tk.Frame):
             try:
                 from app.modules.logic import update_booking_status
                 update_booking_status(b['id'], s)
+                if s in ('checkedin', 'checkedout'):
+                    _mark_booking_event_time(b['id'], 'заселення' if s == 'checkedin' else 'виселення')
             except Exception as e:
                 messagebox.showerror("Помилка", str(e)); return
             win.destroy(); self._redraw()
@@ -10548,8 +10615,8 @@ class CheckedinFrame(tk.Frame):
 
         cols=('id','room','guest','phone','cin','cout','n','price','adv','dopla','dep','sплачено','debt')
         widths=[40,90,175,108,88,88,42,85,70,80,70,85,72]
-        ff,self.tree=mktree(self,cols,16,widths)
-        for c,h in zip(cols,['#','Кімн.','Гість','Тел.','Заїзд','Виїзд','Діб','Ціна/ніч','Аванс','Доплата','Залог','Сплачено','Борг']):
+        ff,self.tree=mktree(self,cols,20,widths)
+        for c,h in zip(cols,['#','Кімн.','Гість','Тел.','Заїзд / час','Виїзд','Діб','Ціна/ніч','Аванс','Доплата','Залог','Сплачено','Борг']):
             self.tree.heading(c,text=h)
         ff.pack(fill='both',expand=True,padx=15,pady=5)
         self.tree.bind('<Double-1>',lambda e:self._open())
@@ -10639,28 +10706,149 @@ class CheckedinFrame(tk.Frame):
                 adv_str    = f"{adv:.0f}₴"       if adv > 0       else "—"
                 dopla_str  = f"{paid_dopla:.0f}₴" if paid_dopla > 0 else "—"
                 dep_str    = f"{dep:.0f}₴"       if dep > 0       else "—"
-                rows.append((b['id'], b['room_number'], b.get('guest_name', ''),
-                             b.get('guest_phone', ''), b['check_in'], b['check_out'],
+                # Дата зверху + фактичний час заселення знизу.
+                import re as _re_ci_display
+                _notes_ci = b.get('notes', '') or ''
+                _m_ci = _re_ci_display.search(r'Фактичне заселення:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})', _notes_ci)
+                _ci_raw = _m_ci.group(1) if _m_ci else b.get('created_at')
+                try:
+                    _ci_dt = _ci_raw
+                    if hasattr(_ci_dt, 'strftime'):
+                        _cin_display = _ci_dt.strftime('%d.%m.%Y\n%H:%M')
+                    else:
+                        _txt_ci = str(_ci_raw or b.get('check_in',''))
+                        _cin_display = (_txt_ci[:10] + '\n' + _txt_ci[11:16]) if len(_txt_ci) >= 16 and ' ' in _txt_ci else str(b.get('check_in',''))[:10]
+                except Exception:
+                    _cin_display = str(b.get('check_in',''))[:10]
+                rows.append({
+                    'vals': (b['id'], b['room_number'], b.get('guest_name', ''),
+                             b.get('guest_phone', ''), _cin_display, b['check_out'],
                              nights, f"{price_night:.0f}₴", adv_str, dopla_str, dep_str,
-                             f"{splacheno:.0f}₴", f"{debt:.0f}₴",
-                             'debt' if debt > 0 else ''))
-            self.after(0, lambda: self._apply_checkedin_rows(rows))
+                             f"{splacheno:.0f}₴", f"{debt:.0f}₴"),
+                    'debt': debt > 0,
+                    'room_number': b['room_number'],
+                    'created_at': b.get('created_at'),
+                })
+
+            # ── Групування: свіжі заселення поточної зміни — завжди зверху,
+            # сортовані по номеру кімнати; заселення попередніх змін — нижче,
+            # під роздільником, згруповані по зміні (найновіша зверху),
+            # кожна група підписана датою і касиром цієї зміни. ──────────
+            def _room_sort_key(room_txt):
+                import re as _re_rn
+                s = str(room_txt or '')
+                sl = s.lower()
+                if 'рожев' in sl: cat = 0
+                elif 'золот' in sl: cat = 1
+                elif 'номер' in sl: cat = 2
+                else: cat = 3
+                m = _re_rn.match(r'\s*(\d+)', s)
+                return (cat, int(m.group(1)) if m else 10**9, s)
+
+            def _to_naive_dt(v):
+                """Знімає tzinfo, щоб порівняння naive/aware datetime не падало."""
+                try:
+                    if v is not None and hasattr(v, 'tzinfo') and v.tzinfo is not None:
+                        return v.replace(tzinfo=None)
+                except Exception:
+                    pass
+                return v
+
+            groups = []
+            try:
+                session_start = _to_naive_dt(get_session_start())
+                cur_rows, past_rows = [], []
+                for r in rows:
+                    ca = _to_naive_dt(r.get('created_at'))
+                    if session_start and ca and ca >= session_start:
+                        cur_rows.append(r)
+                    else:
+                        past_rows.append(r)
+
+                cur_rows.sort(key=lambda r: _room_sort_key(r['room_number']))
+                if cur_rows:
+                    groups.append((None, cur_rows))
+
+                if past_rows:
+                    try:
+                        from app.utils.db import query as _qSh2
+                        all_shifts = _qSh2("SELECT id, full_name, username, opened_at FROM shifts ORDER BY opened_at DESC") or []
+                        for _sh in all_shifts:
+                            _sh['opened_at'] = _to_naive_dt(_sh.get('opened_at'))
+                    except Exception:
+                        all_shifts = []
+
+                    def _find_shift(ca):
+                        if not ca: return None
+                        for sh in all_shifts:
+                            if sh.get('opened_at') and sh['opened_at'] <= ca:
+                                return sh
+                        return None
+
+                    buckets = {}  # shift_id_or_None -> {'shift':sh,'rows':[...]}
+                    for r in past_rows:
+                        sh = _find_shift(_to_naive_dt(r.get('created_at')))
+                        key = sh['id'] if sh else None
+                        buckets.setdefault(key, {'shift': sh, 'rows': []})
+                        buckets[key]['rows'].append(r)
+
+                    def _bucket_sort_key(item):
+                        sh = item[1]['shift']
+                        if sh and sh.get('opened_at'):
+                            return sh['opened_at']
+                        import datetime as _dt_bk
+                        return _dt_bk.datetime.min
+
+                    for key, b_ in sorted(buckets.items(), key=_bucket_sort_key, reverse=True):
+                        b_['rows'].sort(key=lambda r: _room_sort_key(r['room_number']))
+                        sh = b_['shift']
+                        if sh:
+                            _oa = sh.get('opened_at')
+                            _oa_s = _oa.strftime('%d.%m.%Y') if hasattr(_oa, 'strftime') else str(_oa)[:10]
+                            _name = sh.get('full_name') or sh.get('username') or '—'
+                            hdr_txt = (_oa_s, f"Зміна: {_name}")
+                        else:
+                            hdr_txt = ('', "Попередні зміни")
+                        groups.append((hdr_txt, b_['rows']))
+            except Exception as _e_grp:
+                log_error("CheckedinFrame grouping", _e_grp)
+                groups = []
+
+            if not groups:
+                # Аварійний резерв: якщо групування з будь-якої причини не
+                # вдалось — показуємо звичайний плаский список, відсортований
+                # по номеру кімнати, аби таблиця НІКОЛИ не лишалась порожньою.
+                _flat = sorted(rows, key=lambda r: _room_sort_key(r['room_number']))
+                groups = [(None, _flat)] if _flat else []
+
+            self.after(0, lambda: self._apply_checkedin_rows(groups))
         except Exception as e:
             log_error("CheckedinFrame._load_bg", e)
         finally:
             self._loading_in_progress = False
 
-    def _apply_checkedin_rows(self, rows):
+    def _apply_checkedin_rows(self, groups):
         self.tree.delete(*self.tree.get_children())
-        for r in rows:
-            self.tree.insert('', 'end', iid=r[0], tags=(r[-1],), values=r[:-1])
         self.tree.tag_configure('debt', foreground='#e74c3c')
+        self.tree.tag_configure('shift_header', background=C['card2'], foreground=C['yellow'])
+        _hdr_i = 0
+        for hdr_txt, grp_rows in groups:
+            if hdr_txt:
+                _hdr_i += 1
+                _date_col, _name_col = hdr_txt
+                self.tree.insert('', 'end', iid=f"__hdr_{_hdr_i}", tags=('shift_header',),
+                                  values=('', _date_col, _name_col, '', '', '', '', '', '', '', '', '', ''))
+            for r in grp_rows:
+                self.tree.insert('', 'end', iid=r['vals'][0],
+                                  tags=('debt',) if r['debt'] else (),
+                                  values=r['vals'])
         try: self.tree.after(10, lambda: self.tree.yview_moveto(0))
         except Exception: pass
 
     def _sel(self):
         s=self.tree.selection()
-        if not s: messagebox.showwarning("","Оберіть гостя"); return None
+        if not s or str(s[0]).startswith('__hdr_'):
+            messagebox.showwarning("","Оберіть гостя"); return None
         return int(s[0])
 
     def _checkout(self):
@@ -10731,6 +10919,7 @@ class CheckedinFrame(tk.Frame):
                       (dep_amt, bid), fetch=None)
 
             update_booking_status(bid,'checkedout')
+            _mark_booking_event_time(bid, 'виселення')
             query("UPDATE rooms SET status='cleaning' WHERE id=%s",(b['room_id'],),fetch=None)
             import datetime as _dt_cl
             _cl_append({'room': str(b.get('room_number', b['room_id'])), 'cleaner': '—', 'started': _dt_cl.datetime.now().strftime('%d.%m.%Y %H:%M'), 'finished': '', 'new_status': 'cleaning', 'note': 'Авто-запис при виселенні', 'logged_at': _dt_cl.datetime.now().strftime('%d.%m.%Y %H:%M:%S')})
@@ -10841,10 +11030,10 @@ class CheckedOutFrame(tk.Frame):
                                fg_color=C['accent']).pack(side='left', padx=6, pady=8)
         self.period_var.trace_add('write', lambda *_: self._load())
 
-        cols = ('id','room','guest','phone','cin','cout','n','total','adv','dep','paid','debt','checkout_time')
-        widths = [40,68,165,108,88,88,38,75,65,65,75,72,110]
-        ff, self.tree = mktree(self, cols, 16, widths)
-        for c, h in zip(cols, ['#','Кімн.','Гість','Тел.','Заїзд','Виїзд','Н','Всього','Аванс','Залог','Оплач.','Борг','Час виселення']):
+        cols = ('id','room','guest','phone','cin','cout','n','total','adv','dep','paid','debt')
+        widths = [40,68,165,108,88,100,38,75,65,65,75,72]
+        ff, self.tree = mktree(self, cols, 20, widths)
+        for c, h in zip(cols, ['#','Кімн.','Гість','Тел.','Заїзд','Виїзд / час','Н','Всього','Аванс','Залог','Оплач.','Борг']):
             self.tree.heading(c, text=h)
         ff.pack(fill='both', expand=True, padx=15, pady=5)
         self.tree.bind('<Double-1>', lambda e: self._open())
@@ -10894,9 +11083,10 @@ class CheckedOutFrame(tk.Frame):
 
             data = _qco(f"""
                 SELECT b.id, r.number AS room_number, g.name AS guest_name,
-                       g.phone AS guest_phone, b.check_in, b.check_out,
+                       g.phone AS guest_phone, b.check_in, b.check_out, b.notes,
                        COALESCE(b.total_amount, 0) AS total_amount,
                        COALESCE(
+                           NULLIF(substring(b.notes from 'Фактичне виселення: ([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2})'), ''),
                            (SELECT MAX(p.created_at) FROM payments p WHERE p.booking_id = b.id),
                            b.check_out::timestamp
                        ) AS updated_at
@@ -10964,14 +11154,25 @@ class CheckedOutFrame(tk.Frame):
                 paid, dep, adv = paid_map.get(bid, (0.0, 0.0, 0.0))
                 paid_ttl = paid + dep + adv
                 debt = max(total - paid_ttl, 0)
-                checkout_time = str(b.get('updated_at',''))[:16]
+                import re as _re_co_display
+                _notes_co = b.get('notes', '') or ''
+                _m_co = _re_co_display.search(r'Фактичне виселення:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})', _notes_co)
+                _co_raw = _m_co.group(1) if _m_co else b.get('updated_at','')
+                try:
+                    if hasattr(_co_raw, 'strftime'):
+                        checkout_time = _co_raw.strftime('%d.%m.%Y\n%H:%M')
+                    else:
+                        _txt_co = str(_co_raw or b.get('check_out',''))
+                        checkout_time = (_txt_co[:10] + '\n' + _txt_co[11:16]) if len(_txt_co) >= 16 and ' ' in _txt_co else _txt_co[:10]
+                except Exception:
+                    checkout_time = str(b.get('check_out',''))[:10]
                 adv_str = f"{adv:.0f}₴" if adv > 0 else "—"
                 dep_str = f"{dep:.0f}₴" if dep > 0 else "—"
                 rows.append((
                     b['id'], b['room_number'], b.get('guest_name',''),
-                    b.get('guest_phone',''), b['check_in'], b['check_out'],
+                    b.get('guest_phone',''), b['check_in'], checkout_time,
                     n, f"{total:.0f}₴", adv_str, dep_str,
-                    f"{paid_ttl:.0f}₴", f"{debt:.0f}₴", checkout_time,
+                    f"{paid_ttl:.0f}₴", f"{debt:.0f}₴",
                     'debt' if debt > 0 else ''
                 ))
 
@@ -11359,6 +11560,7 @@ class BookingsFrame(tk.Frame):
 
             # Заселити + статус кімнати
             update_booking_status(bid, 'checkedin')
+            _mark_booking_event_time(bid, 'заселення')
             query("UPDATE rooms SET status='occupied' WHERE id=%s",(b['room_id'],),fetch=None)
 
             # Чек
@@ -16795,6 +16997,7 @@ def _open_sauna_checkin_dlg(parent, room, on_save=None, booking=None):
                       WHERE id=%s""",
                   (gid, ci_date, co_date, price_per_hour, note_text, total, _existing_bid), fetch=None)
             bid = _existing_bid
+            _mark_booking_event_time(bid, 'заселення')
         else:
             b_new = query("""INSERT INTO bookings
                       (guest_id, room_id, check_in, check_out, price_per_day,
@@ -16808,6 +17011,8 @@ def _open_sauna_checkin_dlg(parent, room, on_save=None, booking=None):
                 b_row = query("SELECT id FROM bookings WHERE room_id=%s ORDER BY id DESC LIMIT 1",
                               (room['id'],), fetch='one')
                 bid = b_row['id'] if b_row else None
+            if bid:
+                _mark_booking_event_time(bid, 'заселення')
 
         # Рахуємо вже сплачений аванс — він записаний на СТАРЕ бронювання (booking['id'])
         # bid тут — нове бронювання (щойно створене), аванс треба шукати по оригінальному bid
@@ -17679,15 +17884,17 @@ class ReportsFrame(tk.Frame):
                 cols = ['room_number','guest_name','phone','check_in','check_out','nights','total','paid']
                 headers = ['Номер','Гість','Телефон','Заїзд','Виїзд','Ночей','Сума','Сплачено']
             else:
-                if rt == 'Зміни':
+                if rt in ('Зміни', 'X-звіт', 'Z-звіт'):
                     if getattr(self, '_current_shift_detail_export_fn', None):
                         self._current_shift_detail_export_fn()
-                    else:
+                    elif rt == 'Зміни':
                         _sel = [s for var, s in getattr(self, '_shifts_vars', {}).values() if var.get()]
                         if not _sel:
                             messagebox.showinfo("", "Оберіть галочкою потрібні зміни, або відкрийте конкретну зміну кнопкою 'Переглянути'")
                         else:
                             self._export_shifts_summary_excel(_sel)
+                    else:
+                        messagebox.showinfo("", "Спочатку сформуйте звіт")
                     return
                 messagebox.showinfo("", f"Excel-вигрузка для '{rt}' доступна через кнопку 'Вигрузити Excel' у самому звіті.")
                 return
@@ -17822,7 +18029,7 @@ class ReportsFrame(tk.Frame):
 
         if rt in ('X-звіт','Z-звіт'):
             try:
-                self._show_xz_report(df, rt, get_session_start(), get_current_shift_id())
+                self._show_xz_report(df, rt, get_session_start(), get_current_shift_id(), table_mode=True)
             except Exception as _xz_err:
                 log_error("_show_xz_report", _xz_err)
                 import traceback as _tb
@@ -17938,8 +18145,9 @@ class ReportsFrame(tk.Frame):
             # Залоги показуємо окремо (не входять у дохід)
             for i,(lt,val,color) in enumerate(_rev_cards):
                 top.columnconfigure(i,weight=1)
-                c=ctk.CTkFrame(top,fg_color=color,corner_radius=8)
-                c.grid(row=0,column=i,padx=3,pady=3,sticky='ew',ipady=3)
+                c=ctk.CTkFrame(top,fg_color=color,corner_radius=8,height=54)
+                c.grid(row=0,column=i,padx=3,pady=3,sticky='ew')
+                c.grid_propagate(False)
                 lbl(c,val,16,True,'white').pack(pady=(3,1))
                 lbl(c,lt,8,color='white').pack(pady=(0,3))
 
@@ -18369,10 +18577,11 @@ class ReportsFrame(tk.Frame):
                 ("🏠 Зараз у прибиранні", str(len(rows)),             C['red']),
             ]):
                 st_f.columnconfigure(i,weight=1)
-                cf=ctk.CTkFrame(st_f,fg_color=clr,corner_radius=10)
-                cf.grid(row=0,column=i,padx=5,pady=5,sticky='ew',ipady=8)
-                lbl(cf,val,22,True,'white').pack(pady=(8,2))
-                lbl(cf,lbl_t,10,color='white').pack(pady=(0,8))
+                cf=ctk.CTkFrame(st_f,fg_color=clr,corner_radius=10,height=64)
+                cf.grid(row=0,column=i,padx=5,pady=5,sticky='ew')
+                cf.grid_propagate(False)
+                lbl(cf,val,20,True,'white').pack(pady=(10,2))
+                lbl(cf,lbl_t,10,color='white').pack(pady=(0,6))
             # Rooms currently cleaning
             if rows:
                 now_f=card(self.result); now_f.pack(fill='x',padx=10,pady=4)
@@ -18414,8 +18623,16 @@ class ReportsFrame(tk.Frame):
             lbl(self.result,"Немає даних за вказаний період",13,color=C['text2']).pack(pady=30)
             return
 
-        # Таблиця — розміщуємо у звичайному tk.Frame з прокруткою
-        frm=tk.Frame(self.result,bg=C['bg']); frm.pack(fill='both',expand=True,padx=15,pady=5)
+        # Таблиця — формат 1С: панель пошуку/керування + компактна сітка.
+        table_box = card(self.result); table_box.pack(fill='both', expand=True, padx=15, pady=5)
+        table_toolbar = tk.Frame(table_box, bg=C['card']); table_toolbar.pack(fill='x', padx=10, pady=(8,5))
+        lbl(table_toolbar, '🔎 Пошук:', 10, color=C['text2']).pack(side='left', padx=(2,6))
+        _report_search = ctk.CTkEntry(table_toolbar, height=32, width=260,
+                                      placeholder_text='Номер, гість, статус, сума…')
+        _report_search.pack(side='left', padx=(0,8))
+        _report_count = lbl(table_toolbar, f'Рядків: {len(rows)}', 10, color=C['text2'])
+        _report_count.pack(side='left', padx=4)
+        frm=tk.Frame(table_box,bg=C['bg']); frm.pack(fill='both',expand=True,padx=8,pady=(0,8))
         ff,tree=mktree(frm,cols,22,widths)
         for c,h in zip(cols,headers): tree.heading(c,text=h)
         # Кольорові теги для статусів завантаженості
@@ -18447,6 +18664,62 @@ class ReportsFrame(tk.Frame):
             tree.insert('','end',values=vals,tags=(_row_tag,))
         ff.pack(fill='both',expand=True)
 
+        # Клік по шапці сортує колонку; поле пошуку працює по всіх видимих полях.
+        try:
+            _apply_report_filter = make_sortable_filterable(
+                tree, {c: h for c, h in zip(cols, headers)})
+            if hasattr(tree, '_remember_all_rows'):
+                tree._remember_all_rows()
+            def _on_report_search(_event=None):
+                _apply_report_filter(_report_search.get())
+                try:
+                    visible = len(tree.get_children(''))
+                    _report_count.configure(text=f'Рядків: {visible} / {len(rows)}')
+                except Exception:
+                    pass
+            _report_search.bind('<KeyRelease>', _on_report_search)
+        except Exception as _sort_ex:
+            log_error('generic report table controls', _sort_ex)
+
+        # ── Друк цього звіту (та сама таблиця, вирівняним текстом) ──
+        def _print_this_generic():
+            plain_rows = []
+            for r in rows:
+                cells = []
+                for c in cols:
+                    v = r.get(c,'') if isinstance(r, dict) else ''
+                    if c in ('revenue','total','debt','paid') and v not in (None,''):
+                        try: v = f"{float(v):.0f}₴"
+                        except Exception: pass
+                    cells.append('' if v is None else v)
+                plain_rows.append(cells)
+            self._print_table_generic(
+                f"{rt}", f"{df.strftime('%d.%m.%Y')} — {dt.strftime('%d.%m.%Y')}  |  Записів: {len(rows)}",
+                headers, plain_rows)
+        self._do_print_report_fn = _print_this_generic
+
+    def _print_table_generic(self, title, subtitle, headers, rows_as_lists, totals_row=None):
+        """Універсальний друк табличного звіту (моноширинним текстом,
+        колонки вирівняні) — як паперова відомість."""
+        widths = [max(len(str(h)), *(len(str(r[i])) for r in rows_as_lists)) if rows_as_lists else len(str(h))
+                   for i, h in enumerate(headers)]
+        widths = [min(w, 34) + 2 for w in widths]
+        def _fmt_row(cells):
+            return "".join(str(c)[:w-2].ljust(w) for c, w in zip(cells, widths))
+        lines = [f"  {title}"]
+        if subtitle:
+            lines.append(f"  {subtitle}")
+        total_w = sum(widths)
+        lines.append("─" * total_w)
+        lines.append(_fmt_row(headers))
+        lines.append("─" * total_w)
+        for r in rows_as_lists:
+            lines.append(_fmt_row(r))
+        if totals_row:
+            lines.append("─" * total_w)
+            lines.append(_fmt_row(totals_row))
+        print_text(title, lines)
+
     def _rebind_report_scroll(self):
         """Прив'язати скрол до прямих дітей result після рендеру."""
         try:
@@ -18456,8 +18729,8 @@ class ReportsFrame(tk.Frame):
 
     def _show_shifts_list(self, df, dt):
         """Список змін (усіх користувачів) за обраний період — для адміна.
-        По кожній зміні можна відкрити повний звіт: каса, номери, бані,
-        бесідки/альтанки, ресторан, послуги, прибирання."""
+        Таблиця (як у 1С): колонки, багато-вибір рядків, друк/Excel по
+        обраних. Подвійний клік або кнопка 'Переглянути' — повний звіт."""
         from app.utils.db import query as _qsh
         try:
             shifts_rows = _qsh("""
@@ -18475,59 +18748,82 @@ class ReportsFrame(tk.Frame):
         hdr = card(self.result); hdr.pack(fill='x', padx=15, pady=(5,3))
         lbl(hdr, f"🕓 Зміни  |  {df.strftime('%d.%m.%Y')} — {dt.strftime('%d.%m.%Y')}",
             13, True, C['accent']).pack(anchor='w', padx=12, pady=8)
-        lbl(hdr, f"Записів: {len(shifts_rows)}", 11, color=C['text2']).pack(anchor='w', padx=12, pady=(0,8))
+        lbl(hdr, f"Записів: {len(shifts_rows)}  (виділіть рядки — Ctrl/Shift+клік — для друку/Excel по кількох)",
+            11, color=C['text2']).pack(anchor='w', padx=12, pady=(0,8))
+
+        self._current_shift_detail_export_fn = None
 
         if not shifts_rows:
             lbl(self.result, "Немає змін за вказаний період", 13, color=C['text2']).pack(pady=30)
             return
 
-        self._current_shift_detail_export_fn = None
-        self._shifts_vars = {}  # shift_id -> (tk.BooleanVar, shift_dict)
-
         actions_bar = tk.Frame(self.result, bg=C['bg']); actions_bar.pack(fill='x', padx=15, pady=(0,6))
-        _all_var = tk.BooleanVar(value=False)
-        def _toggle_all():
-            v = _all_var.get()
-            for var, _s in self._shifts_vars.values():
-                var.set(v)
-        ctk.CTkCheckBox(actions_bar, text="Обрати всі", variable=_all_var, command=_toggle_all,
-                        font=('Segoe UI',11)).pack(side='left', padx=(0,14))
+
+        tbl_wrap = card(self.result); tbl_wrap.pack(fill='both', expand=True, padx=15, pady=(0,10))
+        cols = ('cashier','opened','closed','status','cash','card','transfer','total','restaurant','deposits')
+        headers = ('Касир','Відкрита','Закрита','Статус','Готівка','Картка','Переказ','Разом','Ресторан','Залоги прийн.')
+        widths = [150, 125, 125, 90, 90, 90, 90, 100, 100, 100]
+        ff_sh, tree_sh = mktree(tbl_wrap, cols, 18, widths)
+        for c, h in zip(cols, headers):
+            tree_sh.heading(c, text=h)
+            tree_sh.column(c, anchor='center' if c != 'cashier' else 'w')
+        tree_sh.configure(selectmode='extended')
+        tree_sh.tag_configure('open_row', foreground=C['green'])
+
+        def _fmt_dt(v):
+            if not v: return '—'
+            return str(v)[:16].replace('T', ' ')
+
+        self._shifts_row_map = {}
+        gt_cash=gt_card=gt_transfer=gt_total=gt_rest=0.0
+        for sh in shifts_rows:
+            t = self._shift_cash_totals(sh.get('id'))
+            gt_cash+=t['cash']; gt_card+=t['card']; gt_transfer+=t['transfer']
+            gt_total+=t['total']; gt_rest+=t['restaurant']
+            name = sh.get('full_name') or sh.get('username') or '—'
+            st_ua = "🔓 Відкрита" if sh.get('status')=='open' else "🔒 Закрита"
+            iid = str(sh.get('id'))
+            self._shifts_row_map[iid] = sh
+            tree_sh.insert('', 'end', iid=iid,
+                values=(name, _fmt_dt(sh.get('opened_at')), _fmt_dt(sh.get('closed_at')) if sh.get('closed_at') else 'ще відкрита',
+                        st_ua, f"{t['cash']:.0f}₴", f"{t['card']:.0f}₴", f"{t['transfer']:.0f}₴",
+                        f"{t['total']:.0f}₴", f"{t['restaurant']:.0f}₴", f"{t['dep_taken']:.0f}₴"),
+                tags=('open_row',) if sh.get('status')=='open' else ())
+        tree_sh.insert('', 'end', values=(
+            "РАЗОМ", '', '', '', f"{gt_cash:.0f}₴", f"{gt_card:.0f}₴", f"{gt_transfer:.0f}₴",
+            f"{gt_total:.0f}₴", f"{gt_rest:.0f}₴", ''), tags=('total_row',))
+        tree_sh.tag_configure('total_row', background=C['card2'], foreground=C['green'])
+        ff_sh.pack(fill='both', expand=True, padx=8, pady=8)
 
         def _selected_shifts():
-            return [s for var, s in self._shifts_vars.values() if var.get()]
+            return [self._shifts_row_map[iid] for iid in tree_sh.selection() if iid in self._shifts_row_map]
 
         def _print_selected():
             sel = _selected_shifts()
             if not sel:
-                messagebox.showinfo("", "Оберіть хоча б одну зміну галочкою"); return
+                messagebox.showinfo("", "Виділіть хоча б один рядок (клік, або Ctrl/Shift+клік для кількох)"); return
             self._print_shifts_summary(sel)
 
         def _export_selected():
             sel = _selected_shifts()
             if not sel:
-                messagebox.showinfo("", "Оберіть хоча б одну зміну галочкою"); return
+                messagebox.showinfo("", "Виділіть хоча б один рядок (клік, або Ctrl/Shift+клік для кількох)"); return
             self._export_shifts_summary_excel(sel)
 
-        btn(actions_bar, "🖨 Друкувати обрані", _print_selected, C['card2'], 190).pack(side='left', padx=4)
-        btn(actions_bar, "📊 Excel обрані", _export_selected, '#27ae60', 160).pack(side='left', padx=4)
+        def _view_selected():
+            sel = _selected_shifts()
+            if not sel:
+                messagebox.showinfo("", "Виділіть рядок зміни"); return
+            self._show_shift_detail(sel[0])
 
-        def _fmt_dt(v):
-            if not v: return '—'
-            s = str(v)
-            return s[:16].replace('T', ' ')
+        def _on_dbl(_e):
+            sel = _selected_shifts()
+            if sel: self._show_shift_detail(sel[0])
+        tree_sh.bind('<Double-1>', _on_dbl)
 
-        for sh in shifts_rows:
-            rf = tk.Frame(self.result, bg=C['card2']); rf.pack(fill='x', padx=15, pady=3)
-            var = tk.BooleanVar(value=False)
-            self._shifts_vars[sh.get('id')] = (var, sh)
-            ctk.CTkCheckBox(rf, text="", variable=var, width=24).pack(side='left', padx=(10,4), pady=8)
-            name = sh.get('full_name') or sh.get('username') or '—'
-            lbl(rf, f"👤 {name}", 12, True, C['text']).pack(side='left', padx=(2,10), pady=8)
-            lbl(rf, f"🟢 {_fmt_dt(sh.get('opened_at'))}  →  🔴 {_fmt_dt(sh.get('closed_at')) if sh.get('closed_at') else 'ще відкрита'}",
-                11, color=C['text2']).pack(side='left', padx=6)
-            _st_ua = "🔓 Відкрита" if sh.get('status') == 'open' else "🔒 Закрита"
-            lbl(rf, _st_ua, 11, color=C['green'] if sh.get('status')=='open' else C['text2']).pack(side='left', padx=10)
-            btn(rf, "👁 Переглянути", lambda s=sh: self._show_shift_detail(s), C['accent'], 150).pack(side='right', padx=10, pady=6)
+        btn(actions_bar, "👁 Переглянути обрану", _view_selected, C['accent'], 190).pack(side='left', padx=4)
+        btn(actions_bar, "🖨 Друкувати обрані", _print_selected, C['card2'], 180).pack(side='left', padx=4)
+        btn(actions_bar, "📊 Excel обрані", _export_selected, '#27ae60', 150).pack(side='left', padx=4)
 
         self._do_print_report_fn = lambda: self._print_shifts_summary(_selected_shifts() or shifts_rows)
 
@@ -19270,7 +19566,8 @@ class ReportsFrame(tk.Frame):
             11, color=C['text2']).pack(anchor='w', padx=15, pady=(0,10))
 
         if table_mode:
-            # ── Один консолідований звіт-таблиця: усе видно одразу ──────
+            # ── Відомість по зміні (як у 1С): групи з підсумками, однакові
+            # колонки "К-сть" / "Сума" по всій таблиці — легко читати і друкувати ──
             ci_rooms  = int(checkin_stats.get('rooms_ci') or 0)
             ci_bani   = int(checkin_stats.get('bani_ci') or 0)
             ci_besid  = int(checkin_stats.get('besidky_ci') or 0)
@@ -19280,35 +19577,33 @@ class ReportsFrame(tk.Frame):
             _cat_total = _rooms_r + _bani_r + _besid_r + svc_rev + rest_total
 
             tbl_card = card(self.result); tbl_card.pack(fill='both', expand=True, padx=5, pady=5)
-            lbl(tbl_card, "📋  Повний звіт по зміні", 14, True).pack(anchor='w', padx=12, pady=(10,6))
-            ff_sh, tv_sh = mktree(tbl_card, ('metric','value'), 24, [420, 220])
-            tv_sh.heading('metric', text='Показник')
-            tv_sh.heading('value', text='Значення')
-            tv_sh.column('metric', anchor='w')
-            tv_sh.column('value', anchor='e')
-            tv_sh.tag_configure('section', background=C['card'], foreground=C['accent'])
-            tv_sh.tag_configure('total',   background='#1c2b1c', foreground=C['green'])
+            lbl(tbl_card, "📋  Відомість по зміні", 14, True).pack(anchor='w', padx=12, pady=(10,6))
+            ff_sh, tv_sh = mktree(tbl_card, ('label','qty','amount'), 22, [420, 130, 150])
+            tv_sh.heading('label', text='Позиція')
+            tv_sh.heading('qty', text='К-сть')
+            tv_sh.heading('amount', text='Сума')
+            tv_sh.column('label', anchor='w')
+            tv_sh.column('qty', anchor='center')
+            tv_sh.column('amount', anchor='e')
+            tv_sh.tag_configure('group', background='#252b3d', foreground='#8fb4ff', font=('Segoe UI', 10, 'bold'))
+            tv_sh.tag_configure('subtotal', background='#18301f', foreground='#69d58a', font=('Segoe UI', 10, 'bold'))
+            tv_sh.tag_configure('grandtotal', background='#19364a', foreground='#8fc1ff', font=('Segoe UI', 10, 'bold'))
             tv_sh.tag_configure('odd',  background=C['card'])
             tv_sh.tag_configure('even', background=C['card2'])
 
-            def _sec(title_):
-                tv_sh.insert('', 'end', values=(title_, ''), tags=('section',))
-                _flat_rows.append(('section', title_, ''))
-
+            _flat_rows = []  # (kind, label, qty, amount) — для друку/Excel
             _rows_i = 0
-            _flat_rows = []  # (kind, label, value) — для друку/Excel цього звіту
-            def _row(label, value, total=False, parent=''):
-                nonlocal _rows_i
-                tag = 'total' if total else ('odd' if _rows_i % 2 == 0 else 'even')
-                iid = tv_sh.insert(parent, 'end', values=(label, value), tags=(tag,))
-                _rows_i += 1
-                _flat_rows.append(('total' if total else 'row', label, value))
-                return iid
 
-            def _child(parent_iid, label, value=''):
-                tv_sh.insert(parent_iid, 'end', values=(f"    {label}", value), tags=('child',))
-                _flat_rows.append(('child', label, value))
-            tv_sh.tag_configure('child', foreground=C['text2'])
+            def _grp(title_):
+                tv_sh.insert('', 'end', values=(title_, '', ''), tags=('group',))
+                _flat_rows.append(('group', title_, '', ''))
+
+            def _ln(label, qty='', amount='', total=False, grand=False):
+                nonlocal _rows_i
+                tag = 'grandtotal' if grand else ('subtotal' if total else ('odd' if _rows_i % 2 == 0 else 'even'))
+                tv_sh.insert('', 'end', values=(label, qty, amount), tags=(tag,))
+                _rows_i += 1
+                _flat_rows.append(('grandtotal' if grand else ('subtotal' if total else 'row'), label, qty, amount))
 
             from app.utils.db import query as _qtbl
 
@@ -19333,10 +19628,16 @@ class ReportsFrame(tk.Frame):
                         OR CAST(COALESCE({alias_r}.number,'') AS text) ILIKE '%%бесід%%'
                         OR CAST(COALESCE({alias_r}.number,'') AS text) ILIKE '%%альтанк%%')"""
 
-            def _add_checkedin_children(parent_iid, ctype):
-                """Список номерів, які ЗАРАЗ заселені (той самий підрахунок,
-                що й у цифрі 'Заселено ...' — без прив'язки до конкретної
-                зміни, бо саме так тут завжди рахувалось)."""
+            def _nights(ci_, co_):
+                try:
+                    return max((co_ - ci_).days, 1)
+                except Exception:
+                    return '—'
+
+            def _room_group(title, ctype, revenue, ci_cnt, bk_cnt):
+                if revenue <= 0 and ci_cnt == 0 and bk_cnt == 0:
+                    return
+                _grp(title)
                 try:
                     rows_ci = _qtbl(f"""
                         SELECT r.number AS num, g.name AS guest, b.check_in, b.check_out
@@ -19348,14 +19649,10 @@ class ReportsFrame(tk.Frame):
                         ORDER BY r.number
                     """) or []
                     for rr in rows_ci:
-                        _co = rr.get('check_out')
-                        _co_s = _co.strftime('%d.%m') if hasattr(_co, 'strftime') else str(_co or '')[:10]
-                        _child(parent_iid, f"№{rr.get('num','')} — {rr.get('guest') or '—'} (до {_co_s})")
+                        n = _nights(rr.get('check_in'), rr.get('check_out'))
+                        _ln(f"№{rr.get('num','')} — {rr.get('guest') or '—'} (заселено)", f"{n} ніч", "—")
                 except Exception:
                     pass
-
-            def _add_booked_children(parent_iid, ctype):
-                """Список нових бронювань, створених за цю зміну."""
                 try:
                     rows_bk = _qtbl(f"""
                         SELECT r.number AS num, g.name AS guest, b.check_in, b.check_out
@@ -19369,124 +19666,127 @@ class ReportsFrame(tk.Frame):
                         ORDER BY r.number
                     """, (shift_id, shift_id)) or []
                     for rr in rows_bk:
-                        _ci = rr.get('check_in')
-                        _ci_s = _ci.strftime('%d.%m') if hasattr(_ci, 'strftime') else str(_ci or '')[:10]
-                        _child(parent_iid, f"№{rr.get('num','')} — {rr.get('guest') or '—'} (заїзд {_ci_s})")
+                        n = _nights(rr.get('check_in'), rr.get('check_out'))
+                        _ln(f"№{rr.get('num','')} — {rr.get('guest') or '—'} (бронь)", f"{n} ніч", "—")
                 except Exception:
                     pass
+                _ln(f"ПІДСУМОК: {title}", f"{ci_cnt} засел. / {bk_cnt} брон.", f"{revenue:.2f}₴", total=True)
 
-            _sec("💰  КАСА")
-            _row("💵 Готівка в касі", f"{cash_total:.2f}₴")
-            _row("💳 Картка", f"{card_total:.2f}₴")
-            _row("🏦 Переказ", f"{transfer_total:.2f}₴")
-            _row("✅ Всього отримано (без залогів)", f"{grand_total:.2f}₴", total=True)
-            _row("🧾 Кількість транзакцій", str(tx_count))
+            # ── 💰 КАСА ──
+            _grp("💰 КАСА")
+            method_names_ua = {'cash':'💵 Готівка','card':'💳 Картка','transfer':'🏦 Переказ','online':'🌐 Онлайн'}
+            for r in pay_rows:
+                _ln(method_names_ua.get(r['method'], r['method']), f"{int(r['cnt'])} транз.", f"{float(r['total'] or 0):.2f}₴")
+            _ln("ПІДСУМОК КАСА", f"{tx_count} транз.", f"{grand_total:.2f}₴", total=True)
 
-            _sec("🔒  ЗАЛОГИ")
+            # ── 🔒 ЗАЛОГИ ──
+            _grp("🔒 ЗАЛОГИ")
             if _opening_dep_sr > 0:
-                _row("🔒 Передано з попередньої зміни", f"{_opening_dep_sr:.2f}₴")
-            _row("🔒 Прийнято цієї зміни", f"{xz_dep:.2f}₴")
-            _row("↩️ Повернено залогів", f"{xz_ret:.2f}₴")
-            _row("💸 Залишок залогів (всього)", f"{xz_dep_balance:.2f}₴", total=True)
+                _ln("Залишок на початок зміни", "—", f"{_opening_dep_sr:.2f}₴")
+            _ln("Прийнято цієї зміни", "—", f"{xz_dep:.2f}₴")
+            _ln("Повернено", "—", f"-{xz_ret:.2f}₴")
+            _ln("ПІДСУМОК (залишок на кінець зміни)", "—", f"{xz_dep_balance:.2f}₴", total=True)
 
-            _sec("🏨  ДОХІД ЗА КАТЕГОРІЯМИ")
-            _iid_rooms = _row("🛏 Номери (готель)", f"{_rooms_r:.2f}₴")
-            _add_checkedin_children(_iid_rooms, 'rooms')
-            _iid_bani = _row("🛁 Бані", f"{_bani_r:.2f}₴")
-            _add_checkedin_children(_iid_bani, 'bani')
-            _iid_besid = _row("⛺ Бесідки/Альтанки", f"{_besid_r:.2f}₴")
-            _add_checkedin_children(_iid_besid, 'besidky')
-            _row("🍽 Послуги готелю", f"{svc_rev:.2f}₴")
-            _iid_rest = _row("🍴 Ресторан", f"{rest_total:.2f}₴")
-            _row("📊 РАЗОМ дохід", f"{_cat_total:.2f}₴", total=True)
-            _row("🍴 Закритих замовлень ресторану", str(rest_cnt))
+            # ── 🛏 НОМЕРИ / 🛁 БАНІ / ⛺ БЕСІДКИ ──
+            _room_group("🛏 НОМЕРИ (готель)", 'rooms', _rooms_r, ci_rooms, bk_rooms)
+            _room_group("🛁 БАНІ", 'bani', _bani_r, ci_bani, bk_bani)
+            _room_group("⛺ БЕСІДКИ/АЛЬТАНКИ", 'besidky', _besid_r, ci_besid, bk_besid)
 
-            # ── Склад ресторанних замовлень (що і скільки купили) ──
-            try:
-                import re as _re_tbl
-                pay_rest = _qtbl("""
-                    SELECT created_at, amount, method, note FROM payments
-                    WHERE shift_id=%s AND amount>0 AND note LIKE 'Ресторан %%'
-                    ORDER BY created_at
-                """, (shift_id,)) or []
-                if pay_rest:
-                    from app.utils.db import get_conn as _gc_tb
-                    with _gc_tb() as _c_tb:
-                        with _c_tb.cursor() as _cur_tb:
-                            _cur_tb.execute("SELECT column_name FROM information_schema.columns "
-                                "WHERE table_name='restaurant_order_items'")
-                            _cols_tb = {r[0] for r in _cur_tb.fetchall()}
-                    _qc_tb = 'quantity' if 'quantity' in _cols_tb else ('qty' if 'qty' in _cols_tb else 'quantity')
-                    _nc_tb = next((c for c in ('name','item_name','title','service_name','note') if c in _cols_tb), None)
-                    _name_sql_tb = f"COALESCE(s2.name, roi.{_nc_tb}, '—')" if _nc_tb else "COALESCE(s2.name, '—')"
-                    _oids_tb = []
-                    _oid_of_tb = {}
-                    for _pr in pay_rest:
-                        _m = _re_tbl.search(r'#(\d+)', str(_pr.get('note') or ''))
-                        _oid = int(_m.group(1)) if _m else None
-                        _oid_of_tb[id(_pr)] = _oid
-                        if _oid: _oids_tb.append(_oid)
-                    _items_map_tb = {}
-                    if _oids_tb:
-                        _ph_tb = ','.join(['%s'] * len(_oids_tb))
-                        _rows_it_tb = _qtbl(
-                            f"SELECT roi.order_id, {_name_sql_tb} AS nm, roi.{_qc_tb} AS q "
-                            f"FROM restaurant_order_items roi "
-                            f"LEFT JOIN services s2 ON s2.id = roi.service_id "
-                            f"WHERE roi.order_id IN ({_ph_tb}) ORDER BY roi.id",
-                            tuple(_oids_tb)) or []
-                        for _ri in _rows_it_tb:
-                            _items_map_tb.setdefault(_ri['order_id'], []).append(f"{_ri.get('nm','?')} ×{_ri.get('q','?')}")
-                    for _pr in pay_rest:
-                        _t = _pr.get('created_at')
-                        _ts = _t.strftime('%H:%M') if hasattr(_t, 'strftime') else str(_t)[:16]
-                        _oid = _oid_of_tb.get(id(_pr))
-                        _its = ', '.join(_items_map_tb.get(_oid, [])) or '(склад не знайдено в БД)'
-                        _child(_iid_rest, f"{_ts}  {_pr.get('note','')} — {_its}", f"{float(_pr.get('amount') or 0):.0f}₴")
-            except Exception as _e_rt:
-                _child(_iid_rest, f"⚠️ Не вдалося завантажити склад: {_e_rt}")
+            # ── 🍽 ПОСЛУГИ ГОТЕЛЮ ──
+            if svc_rev > 0:
+                _grp("🍽 ПОСЛУГИ ГОТЕЛЮ")
+                _ln("ПІДСУМОК ПОСЛУГ", "—", f"{svc_rev:.2f}₴", total=True)
 
+            # ── 🍴 РЕСТОРАН (з розкладкою по замовленнях і складом) ──
+            if rest_total > 0 or rest_cnt > 0:
+                _grp("🍴 РЕСТОРАН")
+                try:
+                    import re as _re_tbl
+                    pay_rest = _qtbl("""
+                        SELECT created_at, amount, method, note FROM payments
+                        WHERE shift_id=%s AND amount>0 AND note LIKE 'Ресторан %%'
+                        ORDER BY created_at
+                    """, (shift_id,)) or []
+                    if pay_rest:
+                        from app.utils.db import get_conn as _gc_tb
+                        with _gc_tb() as _c_tb:
+                            with _c_tb.cursor() as _cur_tb:
+                                _cur_tb.execute("SELECT column_name FROM information_schema.columns "
+                                    "WHERE table_name='restaurant_order_items'")
+                                _cols_tb = {r[0] for r in _cur_tb.fetchall()}
+                        _qc_tb = 'quantity' if 'quantity' in _cols_tb else ('qty' if 'qty' in _cols_tb else 'quantity')
+                        _nc_tb = next((c for c in ('name','item_name','title','service_name','note') if c in _cols_tb), None)
+                        _name_sql_tb = f"COALESCE(s2.name, roi.{_nc_tb}, '—')" if _nc_tb else "COALESCE(s2.name, '—')"
+                        _oids_tb = []
+                        _oid_of_tb = {}
+                        for _pr in pay_rest:
+                            _m = _re_tbl.search(r'#(\d+)', str(_pr.get('note') or ''))
+                            _oid = int(_m.group(1)) if _m else None
+                            _oid_of_tb[id(_pr)] = _oid
+                            if _oid: _oids_tb.append(_oid)
+                        _items_map_tb = {}
+                        _qty_map_tb = {}
+                        if _oids_tb:
+                            _ph_tb = ','.join(['%s'] * len(_oids_tb))
+                            _rows_it_tb = _qtbl(
+                                f"SELECT roi.order_id, {_name_sql_tb} AS nm, roi.{_qc_tb} AS q "
+                                f"FROM restaurant_order_items roi "
+                                f"LEFT JOIN services s2 ON s2.id = roi.service_id "
+                                f"WHERE roi.order_id IN ({_ph_tb}) ORDER BY roi.id",
+                                tuple(_oids_tb)) or []
+                            for _ri in _rows_it_tb:
+                                _items_map_tb.setdefault(_ri['order_id'], []).append(f"{_ri.get('nm','?')} ×{_ri.get('q','?')}")
+                                try: _qty_map_tb[_ri['order_id']] = _qty_map_tb.get(_ri['order_id'], 0) + float(_ri.get('q') or 0)
+                                except Exception: pass
+                        for _pr in pay_rest:
+                            _t = _pr.get('created_at')
+                            _ts = _t.strftime('%H:%M') if hasattr(_t, 'strftime') else str(_t)[:16]
+                            _oid = _oid_of_tb.get(id(_pr))
+                            _its = ', '.join(_items_map_tb.get(_oid, [])) or '(склад не знайдено в БД)'
+                            _q_total = _qty_map_tb.get(_oid, 0)
+                            _q_txt = f"{_q_total:.0f} шт" if _q_total else "—"
+                            _ln(f"{_ts}  {_pr.get('note','')} — {_its}", _q_txt, f"{float(_pr.get('amount') or 0):.2f}₴")
+                except Exception as _e_rt:
+                    _ln(f"⚠️ Не вдалося завантажити склад: {_e_rt}", "—", "—")
+                _ln("ПІДСУМОК РЕСТОРАНУ", f"{rest_cnt} замовл.", f"{rest_total:.2f}₴", total=True)
+
+            # ── 💸 ПЕРЕМІЩЕННЯ КОШТІВ ──
             if transfers_rows:
-                _sec("💸  ПЕРЕМІЩЕННЯ КОШТІВ")
+                _grp("💸 ПЕРЕМІЩЕННЯ КОШТІВ")
                 for r in transfers_rows:
                     t = r['created_at']
                     ts = t.strftime('%H:%M') if hasattr(t, 'strftime') else str(t)[:5]
-                    _row(f"{ts}  {r['reason']}", f"{float(r['amount']):.2f}₴")
-                _row("Разом переміщено", f"{transfers_total:.2f}₴", total=True)
+                    _ln(f"{ts}  {r['reason']}", "—", f"{float(r['amount']):.2f}₴")
+                _ln("ПІДСУМОК ПЕРЕМІЩЕНЬ", "—", f"{transfers_total:.2f}₴", total=True)
 
-            _sec("📋  ОПЕРАЦІЙНА СТАТИСТИКА")
-            _iid_ci_r = _row("🔑 Заселено номерів", str(ci_rooms)); _add_checkedin_children(_iid_ci_r, 'rooms')
-            _iid_ci_b = _row("🔑 Заселено бань", str(ci_bani)); _add_checkedin_children(_iid_ci_b, 'bani')
-            _iid_ci_g = _row("🔑 Заселено бесідок/альтанок", str(ci_besid)); _add_checkedin_children(_iid_ci_g, 'besidky')
-            _iid_bk_r = _row("📝 Заброньовано номерів", str(bk_rooms)); _add_booked_children(_iid_bk_r, 'rooms')
-            _iid_bk_b = _row("📝 Заброньовано бань", str(bk_bani)); _add_booked_children(_iid_bk_b, 'bani')
-            _iid_bk_g = _row("📝 Заброньовано бесідок/альтанок", str(bk_besid)); _add_booked_children(_iid_bk_g, 'besidky')
-            _row("👥 Унікальних відвідувачів", str(_visitors_total))
+            # ── 🏠 СТАТУС НОМЕРІВ (ЗАРАЗ) ──
+            _grp("🏠 СТАТУС НОМЕРІВ (ЗАРАЗ)")
+            _ln("Вільних", str(_chess_free), "—")
+            _ln("Зайнятих", str(_chess_occ), "—")
+            _ln("Прибирання", str(_chess_clean), "—")
+            _ln("Заброньовано", str(_chess_booked), "—")
+            _ln("Ремонт", str(_chess_repair), "—")
+            _ln("ПІДСУМОК: Всього номерів", str(_chess_total), "—", total=True)
 
-            _sec("🏠  СТАТУС НОМЕРІВ (ЗАРАЗ)")
-            _row("✅ Вільних", str(_chess_free))
-            _row("🔴 Зайнятих", str(_chess_occ))
-            _row("🧹 Прибирання", str(_chess_clean))
-            _row("📋 Заброньовано", str(_chess_booked))
-            _row("🔧 Ремонт", str(_chess_repair))
-            _row("🛏 Всього номерів", str(_chess_total), total=True)
+            # ── 👥 ВІДВІДУВАЧІ ──
+            _grp("👥 ВІДВІДУВАЧІ")
+            _ln("Унікальних відвідувачів", str(_visitors_total), "—", total=True)
 
-            for _iid_open in (_iid_rooms, _iid_bani, _iid_besid, _iid_rest,
-                               _iid_ci_r, _iid_ci_b, _iid_ci_g, _iid_bk_r, _iid_bk_b, _iid_bk_g):
-                try: tv_sh.item(_iid_open, open=True)
-                except Exception: pass
+            # ── 📊 ЗАГАЛЬНИЙ ПІДСУМОК ──
+            _grp("📊 ЗАГАЛЬНИЙ ПІДСУМОК")
+            _ln("Загальний дохід за категоріями", "—", f"{_cat_total:.2f}₴", grand=True)
+            _ln("Отримано в касу (без залогів)", "—", f"{grand_total:.2f}₴", grand=True)
 
-            # ── Друк і Excel-вигрузка саме ЦІЄЇ зміни (на основі вже
-            # зібраних _flat_rows — без дублювання всієї логіки картко-звіту) ──
+            # ── Друк і Excel-вигрузка саме ЦІЄЇ зміни ──
             def _do_print_shift_table():
-                lines = [f"  ПОВНИЙ ЗВІТ ПО ЗМІНІ", f"  {shift_info}", f"{'─'*60}"]
-                for kind, label, value in _flat_rows:
-                    lbl_clean = label.replace('    ', '  ↳ ') if kind == 'child' else label
-                    if kind == 'section':
-                        lines.append(f"{'─'*60}"); lines.append(f"  {lbl_clean}")
+                lines = [f"  ВІДОМІСТЬ ПО ЗМІНІ", f"  {shift_info}", f"{'─'*78}",
+                         f"  {'Позиція':<46}{'К-сть':>14}{'Сума':>16}", f"{'─'*78}"]
+                for kind, label, qty, amount in _flat_rows:
+                    if kind == 'group':
+                        lines.append(f"{'─'*78}"); lines.append(f"  {label}")
                     else:
-                        lines.append(f"  {lbl_clean:<46} {str(value):>12}")
-                print_text("Звіт по зміні", lines)
+                        lines.append(f"  {label:<46}{str(qty):>14}{str(amount):>16}")
+                print_text("Відомість по зміні", lines)
 
             def _do_export_shift_table_excel():
                 import os, datetime as _dte
@@ -19494,27 +19794,30 @@ class ReportsFrame(tk.Frame):
                     messagebox.showerror("Помилка", "Бібліотека openpyxl не знайдена.\nВстановіть: pip install openpyxl")
                     return
                 wb = openpyxl.Workbook()
-                ws = wb.active; ws.title = "Звіт по зміні"
-                ws.column_dimensions['A'].width = 50
+                ws = wb.active; ws.title = "Відомість по зміні"
+                ws.column_dimensions['A'].width = 55
                 ws.column_dimensions['B'].width = 18
-                ws.append([f"ПОВНИЙ ЗВІТ ПО ЗМІНІ"]); ws.cell(1,1).font = Font(bold=True, size=14)
+                ws.column_dimensions['C'].width = 18
+                ws.append(["ВІДОМІСТЬ ПО ЗМІНІ"]); ws.cell(1,1).font = Font(bold=True, size=14)
                 ws.append([shift_info]); ws.cell(2,1).font = Font(color='666666')
                 ws.append([])
-                for kind, label, value in _flat_rows:
-                    lbl_clean = label.replace('    ', '    ↳ ') if kind == 'child' else label
+                ws.append(["Позиція", "К-сть", "Сума"])
+                for c in range(1,4):
+                    ws.cell(4,c).font = Font(bold=True, color='FFFFFF')
+                    ws.cell(4,c).fill = PatternFill('solid', fgColor='2C3E50')
+                for kind, label, qty, amount in _flat_rows:
                     r = ws.max_row + 1
-                    ws.cell(r, 1, lbl_clean)
-                    ws.cell(r, 2, value)
-                    if kind == 'section':
-                        ws.cell(r,1).font = Font(bold=True, color='FFFFFF')
-                        ws.cell(r,1).fill = PatternFill('solid', fgColor='2C3E50')
-                        ws.cell(r,2).fill = PatternFill('solid', fgColor='2C3E50')
-                    elif kind == 'total':
-                        ws.cell(r,1).font = Font(bold=True, color='117A65')
-                        ws.cell(r,2).font = Font(bold=True, color='117A65')
-                    elif kind == 'child':
-                        ws.cell(r,1).font = Font(color='888888', italic=True)
-                    ws.cell(r,2).alignment = Alignment(horizontal='right')
+                    ws.cell(r, 1, label); ws.cell(r, 2, qty); ws.cell(r, 3, amount)
+                    if kind == 'group':
+                        for c in range(1,4):
+                            ws.cell(r,c).font = Font(bold=True, color='FFFFFF')
+                            ws.cell(r,c).fill = PatternFill('solid', fgColor='34495E')
+                    elif kind in ('subtotal','grandtotal'):
+                        _clr = '1E8449' if kind=='subtotal' else '1A5276'
+                        for c in range(1,4):
+                            ws.cell(r,c).font = Font(bold=True, color=_clr)
+                    ws.cell(r,2).alignment = Alignment(horizontal='center')
+                    ws.cell(r,3).alignment = Alignment(horizontal='right')
                 try:
                     out_dir = os.path.join(os.path.expanduser('~'), 'Desktop')
                     if not os.path.isdir(out_dir): out_dir = os.path.expanduser('~')
@@ -19566,10 +19869,11 @@ class ReportsFrame(tk.Frame):
             ("💸 Залишок залогів",     f"{xz_dep_balance:.2f}₴",                        '#c0392b'),
         ]):
             st.columnconfigure(i, weight=1)
-            c = ctk.CTkFrame(st, fg_color=color, corner_radius=12)
-            c.grid(row=0, column=i, padx=6, pady=6, sticky='ew', ipady=12)
-            lbl(c, val, 22, True, 'white').pack(pady=(10,2))
-            lbl(c, lt, 10, color='white').pack(pady=(0,10))
+            c = ctk.CTkFrame(st, fg_color=color, corner_radius=12, height=76)
+            c.grid(row=0, column=i, padx=6, pady=6, sticky='ew')
+            c.grid_propagate(False)
+            lbl(c, val, 20, True, 'white').pack(pady=(14,2))
+            lbl(c, lt, 10, color='white').pack(pady=(0,8))
 
         # Деталі по методах оплати — картки замість таблиці
         pm = card(self.result); pm.pack(fill='x', padx=5, pady=5)
