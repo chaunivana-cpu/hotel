@@ -120,6 +120,18 @@ import traceback as _tb_mod
 APP_VERSION = "1.0.9"  # Версія — змінюйте при кожному оновленні
 SYNC_INTERVAL = 60    # секунд між автосинхронізаціями
 
+# За рішенням: при збої зв'язку з сервером програма повинна показувати
+# ПОМИЛКУ, а не тихо підставляти застарілі дані з локального SQLite-кешу
+# (це спричиняло показ даних одного готелю в сесії іншого — локальний
+# кеш-файл спільний і не прив'язаний до конкретної БД/готелю).
+# Якщо колись знадобиться повернути офлайн-режим — досить виставити True.
+OFFLINE_FALLBACK_ENABLED = False
+
+class OfflineFallbackDisabled(Exception):
+    """Кидається замість тихого переходу на локальний SQLite-кеш, коли
+    OFFLINE_FALLBACK_ENABLED=False і живий запит до сервера не вдався."""
+    pass
+
 
 class OfflineSyncManager:
     """
@@ -3303,6 +3315,11 @@ class SetupWindow(ctk.CTk):
 
     def _on_setup_close(self):
         self._save_setup_geom()
+        # Скидаємо процесний кеш кімнат — інакше після входу в ІНШИЙ готель
+        # (інша БД) до ~15с могла показуватись кімнати попереднього готелю,
+        # бо цей кеш в RAM і не знає, з якою БД зараз працює програма.
+        try: _invalidate_rooms_cache()
+        except Exception: pass
         self.destroy()
 
     def _build(self):
@@ -4046,7 +4063,12 @@ class HotelApp(ctk.CTk):
             # if _install_db_cache is not None:
             #     _step("1. _install_db_cache", _install_db_cache)
             # 1b. Патч logic.get_rooms — при офлайні повертає дані з SQLite кешу
+            # (вимкнено — OFFLINE_FALLBACK_ENABLED=False: патч більше НЕ
+            # підміняє результат на SQLite, щоб не показувати дані одного
+            # готелю в сесії іншого)
             def _patch_get_rooms():
+                if not OFFLINE_FALLBACK_ENABLED:
+                    return
                 import app.modules.logic as _logic_mod
                 _orig_get_rooms = _logic_mod.get_rooms
                 def _get_rooms_with_sqlite_fallback():
@@ -5147,9 +5169,14 @@ _ROOMS_CACHE_TS  = 0.0   # час останнього оновлення
 _ROOMS_CACHE_TTL = 15.0  # секунди до примусового оновлення
 
 def _invalidate_rooms_cache():
-    """Примусово інвалідує кеш кімнат (викликати після зміни статусу)."""
-    global _ROOMS_CACHE_TS
+    """Примусово інвалідує кеш кімнат (викликати після зміни статусу АБО
+    після перемикання готелю/профілю — інакше може недовго показуватись
+    список кімнат попереднього готелю, бо цей кеш процесний (в RAM),
+    не прив'язаний до конкретної БД, і живе до 15с незалежно від того,
+    з яким готелем зараз працює програма)."""
+    global _ROOMS_CACHE_TS, _ROOMS_CACHE
     _ROOMS_CACHE_TS = 0.0
+    _ROOMS_CACHE = []
 
 def _get_sqlite_db_path():
     """Знаходить шлях до hotel_local_cache.db — перевіряє кілька можливих місць."""
@@ -5326,9 +5353,12 @@ def _get_rooms_cached(force=False):
             return list(rooms)
         raise Exception("empty result")
     except Exception:
-        # PG недоступний — in-memory кеш або SQLite
+        # PG недоступний — in-memory кеш (в межах поточної сесії/готелю)
         if _ROOMS_CACHE:
             return list(_ROOMS_CACHE)
+        # Офлайн-fallback на SQLite (вимкнено — OFFLINE_FALLBACK_ENABLED=False)
+        if not OFFLINE_FALLBACK_ENABLED:
+            return []
         sqlite_rooms = _sort_rooms_by_type(_get_rooms_from_sqlite() or [])
         if sqlite_rooms:
             _ROOMS_CACHE    = sqlite_rooms
@@ -5834,7 +5864,9 @@ class DashboardFrame(tk.Frame):
                             _dcur.execute(
                                 "SELECT DISTINCT room_id FROM bookings WHERE status='checkedin'")
                             checkedin_room_ids = {row[0] for row in _dcur.fetchall()}
-                except Exception:
+                except Exception as _e_dst:
+                    if not OFFLINE_FALLBACK_ENABLED:
+                        raise
                     # PG недоступний — читаємо з локального SQLite кешу
                     _sq_rooms = _sqlite_select("SELECT id, status FROM rooms")
                     db_statuses = {int(r['id']): r['status'] for r in _sq_rooms}
@@ -5987,22 +6019,23 @@ class DashboardFrame(tk.Frame):
                         log_info(f"Dashboard overdue: знайдено {len(overdue_bookings)} записів для today={today}")
             except Exception as _ov_err:
                 log_error("Dashboard: помилка запиту прострочених виїздів", _ov_err)
-                # Fallback → SQLite кеш
-                try:
-                    _fb = _sqlite_select(
-                        """SELECT b.id, r.number as room_number,
-                           COALESCE(g.name,'') as guest_name, b.check_in, b.check_out
-                           FROM bookings b JOIN rooms r ON r.id=b.room_id
-                           LEFT JOIN guests g ON g.id=b.guest_id
-                           WHERE b.status='checkedin' AND b.check_out <= ?
-                           ORDER BY b.check_out ASC""", (str(today),))
-                    overdue_bookings = _calc_days_late(_fb)
-                    log_info(f"Dashboard overdue SQLite fallback: {len(overdue_bookings)} записів")
-                except Exception as _fb_err:
-                    log_error("Dashboard: SQLite fallback overdue теж не вдався", _fb_err)
+                # Fallback → SQLite кеш (вимкнено — OFFLINE_FALLBACK_ENABLED=False)
+                if OFFLINE_FALLBACK_ENABLED:
+                    try:
+                        _fb = _sqlite_select(
+                            """SELECT b.id, r.number as room_number,
+                               COALESCE(g.name,'') as guest_name, b.check_in, b.check_out
+                               FROM bookings b JOIN rooms r ON r.id=b.room_id
+                               LEFT JOIN guests g ON g.id=b.guest_id
+                               WHERE b.status='checkedin' AND b.check_out <= ?
+                               ORDER BY b.check_out ASC""", (str(today),))
+                        overdue_bookings = _calc_days_late(_fb)
+                        log_info(f"Dashboard overdue SQLite fallback: {len(overdue_bookings)} записів")
+                    except Exception as _fb_err:
+                        log_error("Dashboard: SQLite fallback overdue теж не вдався", _fb_err)
 
-            # ── Заїзди і виїзди сьогодні (з SQLite якщо PG недоступний) ──
-            if not arr:
+            # ── Заїзди і виїзди сьогодні (офлайн-fallback вимкнено — OFFLINE_FALLBACK_ENABLED=False) ──
+            if not arr and OFFLINE_FALLBACK_ENABLED:
                 try:
                     arr = _sqlite_select(
                         """SELECT b.id, r.number as room_number,
@@ -6012,7 +6045,7 @@ class DashboardFrame(tk.Frame):
                            WHERE b.status='confirmed' AND b.check_in=?""", (str(today),))
                 except Exception:
                     arr = []
-            if not dep:
+            if not dep and OFFLINE_FALLBACK_ENABLED:
                 try:
                     dep = _sqlite_select(
                         """SELECT b.id, r.number as room_number,
@@ -6044,7 +6077,18 @@ class DashboardFrame(tk.Frame):
         threading.Thread(target=self._fetch_from_cache, args=(msg,), daemon=True).start()
 
     def _fetch_from_cache(self, err_msg):
-        """Завантажує дані з SQLite кешу і рендерить дашборд в офлайн-режимі."""
+        """Раніше: завантажувала дані з SQLite кешу і рендерила дашборд в
+        офлайн-режимі. Тепер офлайн-фолбек вимкнено (OFFLINE_FALLBACK_ENABLED
+        = False) — замість підстановки застарілих/чужих даних одразу
+        показуємо явну помилку з'єднання."""
+        if not OFFLINE_FALLBACK_ENABLED:
+            try:
+                if self.winfo_exists():
+                    self.after(0, lambda: self._loading_lbl.configure(
+                        text=f"❌ Немає з'єднання з сервером БД.\n{err_msg}", text_color=C['red']))
+            except Exception: pass
+            self._loading = False
+            return
         try:
             from datetime import date as _date_c
             today = _date_c.today()
@@ -9917,12 +9961,26 @@ class ChessFrame(tk.Frame):
             rooms = _get_rooms_cached() or []
             # Бронювання — з таймаутом
             chess = []
+            _conn_failed = False
             try:
                 from app.modules.logic import get_chess
                 chess = get_chess(start_snap, end) or []
-            except Exception:
-                try: chess = _sqlite_bookings(status=['confirmed','checkedin'], limit=1000)
-                except Exception: chess = []
+            except Exception as _e_chess:
+                if not OFFLINE_FALLBACK_ENABLED:
+                    _conn_failed = True
+                    try: log_error("ChessFrame: немає з'єднання з сервером", _e_chess)
+                    except Exception: pass
+                else:
+                    try: chess = _sqlite_bookings(status=['confirmed','checkedin'], limit=1000)
+                    except Exception: chess = []
+            if _conn_failed:
+                try:
+                    if self.winfo_exists():
+                        self.after(0, lambda: _spin.configure(
+                            text="❌ Немає з'єднання з сервером БД. Натисніть 'Оновити' щоб спробувати знову.",
+                            text_color=C['red']))
+                except Exception: pass
+                return
             # Статуси — з таймаутом
             try:
                 from app.utils.db import get_conn as _gc2
@@ -9934,13 +9992,17 @@ class ChessFrame(tk.Frame):
                     _rid = int(r.get('id',0))
                     if _rid in _live: r['status'] = _live[_rid]
             except Exception:
-                try:
-                    _sq = _sqlite_rooms_with_status()
-                    _lsq = {int(r['id']): r.get('status','free') for r in _sq}
-                    for r in rooms:
-                        _rid = int(r.get('id',0))
-                        if _rid in _lsq: r['status'] = _lsq[_rid]
-                except Exception: pass
+                if OFFLINE_FALLBACK_ENABLED:
+                    try:
+                        _sq = _sqlite_rooms_with_status()
+                        _lsq = {int(r['id']): r.get('status','free') for r in _sq}
+                        for r in rooms:
+                            _rid = int(r.get('id',0))
+                            if _rid in _lsq: r['status'] = _lsq[_rid]
+                    except Exception: pass
+                # OFFLINE_FALLBACK_ENABLED=False: показуємо кімнати без
+                # оновлення статусів наживо, а не підмінюємо застарілими
+                # даними іншого можливого готелю з локального кешу.
 
             try:
                 if self.winfo_exists():
@@ -10071,25 +10133,28 @@ class ChessFrame(tk.Frame):
                             _overdue_chess = _rows_c
                 except Exception as _ce:
                     log_error("Chess: overdue query", _ce)
-                    # Офлайн-fallback
-                    try:
-                        _overdue_chess = _sqlite_select(
-                            """SELECT b.id, r.number as room_number,
-                               COALESCE(g.name,'') as guest_name, b.check_out
-                               FROM bookings b JOIN rooms r ON r.id=b.room_id
-                               LEFT JOIN guests g ON g.id=b.guest_id
-                               WHERE b.status='checkedin' AND b.check_out <= ?
-                               ORDER BY b.check_out ASC""", (str(today_chess),))
-                        for _rc in _overdue_chess:
-                            try:
-                                _co_c = _rc['check_out']
-                                if isinstance(_co_c, str):
-                                    import datetime as _dtp3
-                                    _co_c = _dtp3.date.fromisoformat(_co_c[:10])
-                                _rc['days_late'] = (today_chess - _co_c).days
-                            except Exception:
-                                _rc['days_late'] = 0
-                    except Exception:
+                    # Офлайн-fallback (вимкнено — OFFLINE_FALLBACK_ENABLED=False)
+                    if OFFLINE_FALLBACK_ENABLED:
+                        try:
+                            _overdue_chess = _sqlite_select(
+                                """SELECT b.id, r.number as room_number,
+                                   COALESCE(g.name,'') as guest_name, b.check_out
+                                   FROM bookings b JOIN rooms r ON r.id=b.room_id
+                                   LEFT JOIN guests g ON g.id=b.guest_id
+                                   WHERE b.status='checkedin' AND b.check_out <= ?
+                                   ORDER BY b.check_out ASC""", (str(today_chess),))
+                            for _rc in _overdue_chess:
+                                try:
+                                    _co_c = _rc['check_out']
+                                    if isinstance(_co_c, str):
+                                        import datetime as _dtp3
+                                        _co_c = _dtp3.date.fromisoformat(_co_c[:10])
+                                    _rc['days_late'] = (today_chess - _co_c).days
+                                except Exception:
+                                    _rc['days_late'] = 0
+                        except Exception:
+                            _overdue_chess = []
+                    else:
                         _overdue_chess = []
 
                 if not _overdue_chess: return
@@ -10618,10 +10683,14 @@ class CheckedinFrame(tk.Frame):
         ff,self.tree=mktree(self,cols,20,widths)
         for c,h in zip(cols,['#','Кімн.','Гість','Тел.','Заїзд / час','Виїзд','Діб','Ціна/ніч','Аванс','Доплата','Залог','Сплачено','Борг']):
             self.tree.heading(c,text=h)
-        ff.pack(fill='both',expand=True,padx=15,pady=5)
         self.tree.bind('<Double-1>',lambda e:self._open())
 
-        bot=ctk.CTkFrame(self,fg_color=C['card']); bot.pack(fill='x',padx=15,pady=(0,10))
+        # Рядок кнопок пакуємо ПЕРШИМ з side='bottom' — так він завжди
+        # отримує пріоритет на місце внизу вікна, незалежно від розміру
+        # екрана. Таблицю пакуємо ПІСЛЯ, з fill='both', expand=True —
+        # вона займає весь простір, що лишився, і стискається першою
+        # (у неї вже є власний скролбар).
+        bot=ctk.CTkFrame(self,fg_color=C['card']); bot.pack(side='bottom',fill='x',padx=15,pady=(0,10))
         _btns = [
             ("🚪 Виселити",    self._checkout,  C['yellow']),
             ("📅 Продовжити",  self._extend,    C['green']),
@@ -10629,9 +10698,11 @@ class CheckedinFrame(tk.Frame):
             ("📋 Деталі",      self._open,       C['card2']),
         ]
         if self.user.get('role') in ('admin', 'manager'):
-            _btns.append(("✏️ Редагувати", self._open, '#9b59b6'))
+            _btns.append(("✏️ Редагувати заселення", self._edit_checkin, '#9b59b6'))
         for txt,cmd,color in _btns:
             btn(bot,txt,cmd,color,120).pack(side='left',padx=4,pady=8)
+
+        ff.pack(fill='both',expand=True,padx=15,pady=5)
         self._load()
 
     def _load(self):
@@ -10646,8 +10717,9 @@ class CheckedinFrame(tk.Frame):
             from app.modules.logic import get_bookings
             srch = self.e_srch.get().strip() if hasattr(self, 'e_srch') else None
             data = get_bookings(status='checkedin', search=srch or None) or []
-            # Офлайн-fallback
-            if not data:
+            # Офлайн-fallback (вимкнено — OFFLINE_FALLBACK_ENABLED=False,
+            # щоб не підставляти застарілі/чужі дані з локального кешу)
+            if not data and OFFLINE_FALLBACK_ENABLED:
                 data = _sqlite_bookings(status='checkedin', search=srch or None)
             paid_map = {}
             dep_map  = {}
@@ -10699,8 +10771,11 @@ class CheckedinFrame(tk.Frame):
                 # Сплачено = ціна×діб - аванс - доплата + залог
                 # Сплачено = аванс + доплата + залог (всі реально отримані гроші від гостя)
                 splacheno  = adv + paid_dopla + dep
-                # Борг = те що ще не оплачено за проживання
-                total_live = price_night * nights
+                # Борг = те що ще не оплачено за проживання.
+                # Використовуємо total_amount (він враховує знижку та
+                # продовження проживання), а не "ціна×діб" напряму —
+                # інакше борг показувався б без урахування знижки.
+                total_live = total
                 paid_live  = adv + paid_dopla
                 debt       = max(total_live - paid_live, 0)
                 adv_str    = f"{adv:.0f}₴"       if adv > 0       else "—"
@@ -10994,6 +11069,25 @@ class CheckedinFrame(tk.Frame):
         bid=self._sel()
         if bid: BookingDetailDlg(self,bid,on_close=self._load)
 
+    def _edit_checkin(self):
+        """Відкрити картку заселення одразу у режимі редагування (адмін/менеджер):
+        дата/час фактичного заселення, гість, дати, ціна, залог тощо."""
+        bid = self._sel()
+        if not bid: return
+        dlg = BookingDetailDlg(self, bid, on_close=self._load)
+        self._wait_and_open_edit(dlg)
+
+    def _wait_and_open_edit(self, dlg, _tries=0):
+        try:
+            if not dlg.winfo_exists():
+                return
+            if getattr(dlg, '_b', None):
+                dlg._edit_booking_dlg(dlg._b)
+            elif _tries < 50:
+                dlg.after(100, lambda: self._wait_and_open_edit(dlg, _tries + 1))
+        except Exception:
+            pass
+
 
 
 class CheckedOutFrame(tk.Frame):
@@ -11100,20 +11194,21 @@ class CheckedOutFrame(tk.Frame):
                 LIMIT 500
             """, params, fetch='all') or []
 
-            # Офлайн-fallback
+            # Офлайн-fallback (вимкнено — OFFLINE_FALLBACK_ENABLED=False)
             if not data:
-                sq_data = _sqlite_bookings(status='checkedout', search=srch or None, limit=500)
-                if sq_data:
-                    # Фільтр по даті
-                    from datetime import timedelta as _tdd
-                    if period == 'today':
-                        sq_data = [b for b in sq_data if str(b.get('check_out',''))[:10] == str(today)]
-                    elif period == 'week':
-                        week_start = str(today - _tdd(days=7))
-                        sq_data = [b for b in sq_data if str(b.get('check_out',''))[:10] >= week_start]
-                    for b in sq_data:
-                        b['updated_at'] = b.get('check_out', '')
-                    data = sq_data
+                if OFFLINE_FALLBACK_ENABLED:
+                    sq_data = _sqlite_bookings(status='checkedout', search=srch or None, limit=500)
+                    if sq_data:
+                        # Фільтр по даті
+                        from datetime import timedelta as _tdd
+                        if period == 'today':
+                            sq_data = [b for b in sq_data if str(b.get('check_out',''))[:10] == str(today)]
+                        elif period == 'week':
+                            week_start = str(today - _tdd(days=7))
+                            sq_data = [b for b in sq_data if str(b.get('check_out',''))[:10] >= week_start]
+                        for b in sq_data:
+                            b['updated_at'] = b.get('check_out', '')
+                        data = sq_data
                 self.after(0, lambda: self._apply_rows([]))
                 return
 
@@ -11262,8 +11357,8 @@ class BookingsFrame(tk.Frame):
             from app.utils.db import query
             srch = self.e_srch.get().strip() if hasattr(self, 'e_srch') else None
             data = get_bookings(status='confirmed', search=srch or None) or []
-            # Офлайн-fallback
-            if not data:
+            # Офлайн-fallback (вимкнено — OFFLINE_FALLBACK_ENABLED=False)
+            if not data and OFFLINE_FALLBACK_ENABLED:
                 data = _sqlite_bookings(status='confirmed', search=srch or None)
             paid_map = {}
             if data:
@@ -12192,6 +12287,46 @@ class BookingDetailDlg(ctk.CTkToplevel):
             deposits = query("SELECT * FROM service_orders WHERE booking_id=%s AND note LIKE 'deposit%%' ORDER BY created_at", (self.bid,)) or []
             fines    = query("SELECT * FROM service_orders WHERE booking_id=%s AND note LIKE 'fine%%' ORDER BY created_at", (self.bid,)) or []
             services = get_services()
+
+            # ── Перерахунок Всього/Оплачено/Борг напряму з bookings+payments ──
+            # get_balance() іноді дає неточні цифри:
+            #  1) "Всього" = total_amount з БД без фолбеку на ціна×діб, якщо
+            #     total_amount ще не проставлено — тоді Всього=0, хоча за
+            #     кімнату реально треба платити;
+            #  2) "Борг" = Всього - Оплачено, де Оплачено включає ЗАЛОГ —
+            #     а залог це застава на повернення, і він не має закривати
+            #     борг за проживання (номер, що не продовжений, і далі в боргу).
+            # Тому рахуємо ці три цифри тут самостійно — так само, як у
+            # списку "Заселені" (CheckedinFrame._load_bg).
+            try:
+                _n_nights = max((b['check_out'] - b['check_in']).days, 1)
+                _price_night = float(b.get('price_per_day') or 0)
+                _total_stored = float(b.get('total_amount') or 0)
+                _total_calc = _total_stored if _total_stored > 0 else _price_night * _n_nights
+
+                _paid_dopla = 0.0; _dep_paid = 0.0; _adv_paid = 0.0
+                for _p in pay:
+                    _amt = float(_p.get('amount') or 0)
+                    if _amt <= 0:
+                        continue
+                    _note = _p.get('note','') or ''
+                    if any(_tag in _note for _tag in ('Залог', 'deposit', 'Повернення залогу')):
+                        _dep_paid += _amt
+                    elif 'Аванс' in _note:
+                        _adv_paid += _amt
+                    else:
+                        _paid_dopla += _amt
+
+                # "Оплачено" — все реально отримане від гостя (разом із залогом)
+                _paid_display = _adv_paid + _paid_dopla + _dep_paid
+                # "Борг" — тільки за проживання, БЕЗ залогу (він застава, не оплата)
+                _debt_calc = max(_total_calc - (_adv_paid + _paid_dopla), 0)
+
+                bal['total'] = _total_calc
+                bal['paid']  = _paid_display
+                bal['debt']  = _debt_calc
+            except Exception as _e_bal:
+                log_error("BookingDetailDlg: перерахунок балансу", _e_bal)
         except Exception as _e:
             log_error("BookingDetailDlg._load_and_build", _e)
             def _show_err():
@@ -12259,6 +12394,7 @@ class BookingDetailDlg(ctk.CTkToplevel):
 
     def _render_impl(self, b, bal, svc, pay, deposits, fines, services):
 
+        self._b = b  # зберігаємо для зовнішнього виклику (напр. авто-відкриття редагування)
         dep_total    = sum(float(d['total'] or 0) for d in deposits)
         dep_returned = sum(float(d['total'] or 0) for d in deposits if d.get('note','').startswith('deposit_returned'))
         dep_active   = sum(float(d['total'] or 0) for d in deposits if d.get('note','').startswith('deposit:'))
@@ -12349,8 +12485,17 @@ class BookingDetailDlg(ctk.CTkToplevel):
         for p in pay:
             try: _amt = float(p['amount'] or 0)
             except (ValueError, TypeError): _amt = 0.0
-            pt.insert('','end', values=(f"{_amt:.0f}₴", {'cash':'готівка','card':'картка','transfer':'переказ','online':'онлайн'}.get(p['method'],p['method']), p.get('note',''), str(p['created_at'])[:16]))
+            try: _iid = str(p['id'])
+            except Exception: _iid = None
+            _kw = {'iid': _iid} if _iid else {}
+            pt.insert('','end', values=(f"{_amt:.0f}₴", {'cash':'готівка','card':'картка','transfer':'переказ','online':'онлайн'}.get(p['method'],p['method']), p.get('note',''), str(p['created_at'])[:16]), **_kw)
         pf2.pack(fill='x', padx=8, pady=(0,5))
+        self._pt_pay_map = {str(p['id']): p for p in pay if p.get('id') is not None}
+        if self._is_admin_user():
+            pbf = ctk.CTkFrame(pf, fg_color='transparent'); pbf.pack(fill='x', padx=8, pady=(0,10))
+            btn(pbf, "✏️ Ред. платіж",     lambda: self._edit_payment_dlg(pt), C['card2'], 140).pack(side='left', padx=3)
+            btn(pbf, "🗑 Видалити платіж", lambda: self._delete_payment(pt),   C['red'],   150).pack(side='left', padx=3)
+            pt.bind('<Double-1>', lambda e: self._edit_payment_dlg(pt))
 
         # ── Кнопки дій ────────────────────────────────
         af2 = ctk.CTkFrame(scroll, fg_color='transparent'); af2.pack(fill='x', pady=5)
@@ -12361,6 +12506,113 @@ class BookingDetailDlg(ctk.CTkToplevel):
         btn(af2, "🖨 Чек",       lambda: self._print_receipt(b, bal, svc, pay, deposits, fines), C['card2'], 100).pack(side='left', padx=3)
         if self._is_admin_user():
             btn(af2, "✏️ Ред.", lambda: self._edit_booking_dlg(b), C['card2'], 100).pack(side='left', padx=3)
+
+    def _edit_payment_dlg(self, pt):
+        """Редагування вже внесеного платежу (тип/сума/метод) —
+        для виправлення помилок, напр. коли залог помилково записали як аванс."""
+        sel = pt.selection()
+        if not sel:
+            messagebox.showinfo("", "Оберіть платіж у списку")
+            return
+        pid = sel[0]
+        p = getattr(self, '_pt_pay_map', {}).get(pid)
+        if not p:
+            messagebox.showerror("", "Не вдалося знайти цей платіж")
+            return
+
+        win = dlg_win(self, "✏️ Редагувати платіж", "420x420")
+        scroll = ctk.CTkScrollableFrame(win, fg_color=C['bg'])
+        scroll.pack(fill='both', expand=True, padx=10, pady=10)
+
+        hdr = card(scroll); hdr.pack(fill='x', pady=5)
+        lbl(hdr, "✏️  Редагування платежу", 14, True).pack(anchor='w', padx=12, pady=(10,3))
+        lbl(hdr, f"Бронювання #{self.bid}", 11, color=C['text2']).pack(anchor='w', padx=12, pady=(0,10))
+
+        # ── Тип платежу (визначає, як він враховується у борг/залог) ──
+        f0 = card(scroll); f0.pack(fill='x', pady=4)
+        lbl(f0, "📂 Тип платежу:", 12, True).pack(anchor='w', padx=12, pady=(8,3))
+        _types = {
+            "Аванс при бронюванні":     "Аванс при бронюванні",
+            "Залог при заселенні":      "Залог при заселенні",
+            "Оплата за проживання":     "Оплата за проживання",
+            "Інше (вказати вручну)":    None,
+        }
+        _cur_note = str(p.get('note','') or '')
+        _match = next((k for k, v in _types.items() if v and _cur_note.startswith(v)), "Інше (вказати вручну)")
+        type_var = ctk.StringVar(value=_match)
+        ctk.CTkOptionMenu(f0, values=list(_types.keys()), variable=type_var,
+                          width=380, fg_color=C['card2'], button_color=C['accent']).pack(padx=12, pady=(0,8))
+        lbl(f0, "⚠️ Залог не зменшує борг за проживання (повертається гостю),\n"
+                "Аванс і Оплата — зменшують борг.", 10, color=C['text2']).pack(anchor='w', padx=12, pady=(0,8))
+
+        f1 = card(scroll); f1.pack(fill='x', pady=4)
+        lbl(f1, "📝 Нотатка (повний текст):", 12, True).pack(anchor='w', padx=12, pady=(8,3))
+        e_note = ent(f1, "Нотатка", w=380); e_note.pack(padx=12, pady=(0,8))
+        e_note.insert(0, _cur_note)
+
+        def _sync_note(*_):
+            base = _types.get(type_var.get())
+            if base:
+                e_note.delete(0, 'end')
+                e_note.insert(0, base)
+        type_var.trace_add('write', _sync_note)
+
+        f2 = card(scroll); f2.pack(fill='x', pady=4)
+        lbl(f2, "💰 Сума:", 12, True).pack(anchor='w', padx=12, pady=(8,3))
+        e_amt = ent(f2, "0.00", w=380); e_amt.pack(padx=12, pady=(0,8))
+        try: e_amt.insert(0, f"{float(p.get('amount') or 0):.0f}")
+        except Exception: e_amt.insert(0, "0")
+
+        f3 = card(scroll); f3.pack(fill='x', pady=4)
+        lbl(f3, "💳 Метод оплати:", 12, True).pack(anchor='w', padx=12, pady=(8,3))
+        _meth_map = {'готівка':'cash','картка':'card','переказ':'transfer','онлайн':'online'}
+        _meth_rev = {v:k for k,v in _meth_map.items()}
+        meth_var = ctk.StringVar(value=_meth_rev.get(p.get('method',''), 'готівка'))
+        ctk.CTkOptionMenu(f3, values=list(_meth_map.keys()), variable=meth_var,
+                          width=380, fg_color=C['card2'], button_color=C['accent']).pack(padx=12, pady=(0,8))
+
+        _st = lbl(scroll, "", 10); _st.pack(anchor='w', padx=4, pady=(4,0))
+
+        def _save():
+            from app.utils.db import query as _qp
+            try:
+                amt = float((e_amt.get() or '0').strip().replace(',', '.'))
+            except ValueError:
+                _st.configure(text="❌ Невірна сума", text_color=C['red']); return
+            if amt <= 0:
+                _st.configure(text="❌ Сума має бути більше 0", text_color=C['red']); return
+            note = e_note.get().strip()
+            method = _meth_map.get(meth_var.get(), 'cash')
+            try:
+                _qp("UPDATE payments SET amount=%s, method=%s, note=%s WHERE id=%s",
+                    (amt, method, note, int(pid)), fetch=None)
+            except Exception as _ex:
+                _st.configure(text=f"❌ {_ex}", text_color=C['red']); return
+            win.destroy(); self._rebuild()
+
+        bf = ctk.CTkFrame(scroll, fg_color='transparent'); bf.pack(fill='x', pady=10)
+        btn(bf, "💾 Зберегти", _save, C['accent'], 150, height=38).pack(side='left', padx=5)
+        btn(bf, "✖ Скасувати", win.destroy, C['card2'], 130, height=38).pack(side='left', padx=5)
+
+    def _delete_payment(self, pt):
+        """Видалення платежу (напр. внесеного помилково)."""
+        sel = pt.selection()
+        if not sel:
+            messagebox.showinfo("", "Оберіть платіж у списку")
+            return
+        pid = sel[0]
+        p = getattr(self, '_pt_pay_map', {}).get(pid)
+        amt_txt = f"{float(p.get('amount') or 0):.0f}₴" if p else ""
+        note_txt = (p.get('note') or "") if p else ""
+        if not messagebox.askyesno("Видалити платіж",
+                f"Видалити платіж {amt_txt} ({note_txt})?\nЦю дію не можна відмінити."):
+            return
+        from app.utils.db import query as _qd
+        try:
+            _qd("DELETE FROM payments WHERE id=%s", (int(pid),), fetch=None)
+        except Exception as _ex:
+            messagebox.showerror("Помилка", str(_ex)); return
+        self._rebuild()
 
     def _add_svc(self,tree):
         from app.modules.logic import get_booking,add_service
@@ -12393,50 +12645,142 @@ class BookingDetailDlg(ctk.CTkToplevel):
         """Редагування бронювання/заселення (тільки для адміністратора):
         дати, гість, телефон, кількість дорослих, ціна за добу, нотатки."""
         from app.utils.db import query as _qe
-        win = dlg_win(self, f"✏️ Редагувати бронювання #{self.bid}", "440x580")
-        scroll = ctk.CTkScrollableFrame(win, fg_color=C['bg'])
-        scroll.pack(fill='both', expand=True, padx=10, pady=10)
 
-        def _row(label_text):
-            r = row_frm(scroll); r.pack(fill='x', padx=4, pady=4)
-            ctk.CTkLabel(r, text=label_text, font=('Segoe UI',11), text_color=C['text2'],
-                         width=110, anchor='w').pack(side='left')
-            return r
+        # ── Пере-завантажуємо "сирі" дані напряму з таблиць bookings/guests ──
+        # get_booking() (з app.modules.logic) в деяких версіях повертає інші
+        # назви полів (guest_name/phone можуть загубитись), через що це вікно
+        # відкривалось повністю порожнім. SELECT * гарантовано дає реальні
+        # назви колонок з БД, тому підставляємо саме їх, з фолбеком на b.
+        _raw = {}
+        try:
+            _raw = _qe("SELECT * FROM bookings WHERE id=%s", (self.bid,), fetch='one') or {}
+        except Exception as _e:
+            log_error(f"_edit_booking_dlg: не вдалось завантажити bookings#{self.bid}", _e)
 
-        r1 = _row("Гість:")
-        e_name = ent(r1, w=230); e_name.insert(0, str(b.get('guest_name','')))
+        _guest = {}
+        _gid = _raw.get('guest_id') or (b or {}).get('guest_id')
+        if _gid:
+            try:
+                _guest = _qe("SELECT * FROM guests WHERE id=%s", (_gid,), fetch='one') or {}
+            except Exception as _e:
+                log_error(f"_edit_booking_dlg: не вдалось завантажити guests#{_gid}", _e)
 
-        r2 = _row("Телефон:")
-        e_phone = ent(r2, w=230); e_phone.insert(0, str(b.get('phone','')))
+        log_info(f"_edit_booking_dlg #{self.bid}: b_keys={list((b or {}).keys())} "
+                 f"raw_keys={list(_raw.keys())} guest_keys={list(_guest.keys())}")
 
-        r3 = _row("Заїзд (РРРР-ММ-ДД):")
-        e_ci = ent(r3, w=230); e_ci.insert(0, str(b.get('check_in','')))
+        merged = dict(b or {})
+        merged.update(_raw)  # дані з bookings мають пріоритет — це справжні назви колонок
 
-        r4 = _row("Виїзд (РРРР-ММ-ДД):")
-        e_co = ent(r4, w=230); e_co.insert(0, str(b.get('check_out','')))
+        _name  = (_guest.get('name') or merged.get('guest_name') or merged.get('name')
+                  or (b or {}).get('guest_name') or '')
+        _phone = (_guest.get('phone') or merged.get('phone') or merged.get('guest_phone')
+                  or (b or {}).get('phone') or '')
+        b = merged
 
-        r5 = _row("Дорослих:")
-        e_ad = ent(r5, w=230); e_ad.insert(0, str(b.get('adults','') or ''))
+        # ── Вікно у тому ж стилі, що й «Заселення»: прокручуваний Canvas
+        # + картки-секції (card()) з grid-розкладкою лейбл→поле. ──────────
+        win = dlg_win(self, f"✏️ Редагувати бронювання #{self.bid}", "500x680")
+        main = tk.Frame(win, bg=C['bg']); main.pack(fill='both', expand=True)
+        canvas_ = tk.Canvas(main, bg=C['bg'], highlightthickness=0)
+        vsb = tk.Scrollbar(main, orient='vertical', command=canvas_.yview)
+        canvas_.configure(yscrollcommand=vsb.set)
+        vsb.pack(side='right', fill='y')
+        canvas_.pack(side='left', fill='both', expand=True)
+        sc = tk.Frame(canvas_, bg=C['bg'])
+        cw_ = canvas_.create_window((0,0), window=sc, anchor='nw')
+        canvas_.bind('<Configure>', lambda e: canvas_.itemconfig(cw_, width=e.width))
+        sc.bind('<Configure>', lambda e: canvas_.configure(scrollregion=canvas_.bbox('all')))
+        def _dlg_scroll(e):
+            canvas_.yview_scroll(int(-1*(e.delta/120)), 'units')
+            return 'break'
+        canvas_.bind('<MouseWheel>', _dlg_scroll)
+        sc.bind('<MouseWheel>', _dlg_scroll)
+        def _bind_dlg_scroll(w):
+            try: w.bind('<MouseWheel>', _dlg_scroll)
+            except Exception: pass
+            for ch in w.winfo_children():
+                _bind_dlg_scroll(ch)
+        win.after(400, lambda: _bind_dlg_scroll(sc))
 
-        r6 = _row("Ціна/добу:")
-        e_price = ent(r6, w=230); e_price.insert(0, str(b.get('price_per_day','') or ''))
+        # Заголовок
+        hdr = card(sc); hdr.pack(fill='x', padx=12, pady=(10,5))
+        lbl(hdr, f"✏️  Редагування бронювання #{self.bid}", 15, True, C['accent']).pack(
+            anchor='w', padx=12, pady=(10,3))
+        _room_no = b.get('room_number') or b.get('room') or ''
+        lbl(hdr, f"🚪 Номер №{_room_no}" if _room_no else "", 11, color=C['text2']).pack(
+            anchor='w', padx=12, pady=(0,10))
 
-        r7 = _row("Сума всього:")
-        e_total = ent(r7, w=230); e_total.insert(0, str(b.get('total_amount','') or ''))
+        if not _raw:
+            lbl(sc, "⚠️ Не вдалось завантажити дані з БД — поля можуть бути "
+                    "неповними. Перевірте data/hotel_errors.log.", 10, color=C['red']).pack(
+                anchor='w', padx=16, pady=(0,8))
 
-        r8 = _row("🏷 Знижка:")
-        disc_wrap = tk.Frame(r8, bg=C['card2']); disc_wrap.pack(side='left')
-        e_disc = ent(disc_wrap, "0", w=90); e_disc.pack(side='left')
-        ctk.CTkLabel(disc_wrap, text="₴  Коментар:", font=('Segoe UI',10), text_color=C['text2']).pack(side='left', padx=(6,4))
-        e_disc_comment = ent(disc_wrap, "причина", w=110); e_disc_comment.pack(side='left')
+        # ── Фактична дата/час заселення (коли реально заселили гостя) ──
+        import re as _re_ci_edit
+        _notes_raw0 = str(b.get('notes','') or '')
+        _m_ci_edit = _re_ci_edit.search(r'Фактичне заселення:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})', _notes_raw0)
+        _ci_actual_default = _m_ci_edit.group(1) if _m_ci_edit else ''
 
-        lbl(scroll, "Нотатки:", 11, color=C['text2']).pack(anchor='w', padx=4, pady=(8,2))
-        e_notes = ctk.CTkTextbox(scroll, height=70, fg_color=C['card2'])
-        e_notes.pack(fill='x', padx=4)
+        ci_card = card(sc); ci_card.pack(fill='x', padx=12, pady=5)
+        lbl(ci_card, "🕒  Фактичне заселення", 13, True).pack(anchor='w', padx=12, pady=(10,5))
+        cif = tk.Frame(ci_card, bg=C['card']); cif.pack(fill='x', padx=12, pady=(0,10))
+        lbl(cif,"Дата/час заселення:",11,color=C['text2']).grid(row=0,column=0,sticky='w',pady=3)
+        e_ci_actual = ent(cif, "РРРР-ММ-ДД ГГ:ХХ", w=230)
+        e_ci_actual.grid(row=0,column=1,padx=8,pady=3,sticky='w')
+        if _ci_actual_default:
+            e_ci_actual.insert(0, _ci_actual_default)
+
+        # Гість
+        g_card = card(sc); g_card.pack(fill='x', padx=12, pady=5)
+        lbl(g_card, "👤  Гість", 13, True).pack(anchor='w', padx=12, pady=(10,5))
+        gf = tk.Frame(g_card, bg=C['card']); gf.pack(fill='x', padx=12, pady=(0,10))
+        lbl(gf,"Ім'я та прізвище:",11,color=C['text2']).grid(row=0,column=0,sticky='w',pady=3)
+        e_name = ent(gf, w=230); e_name.grid(row=0,column=1,padx=8,pady=3,sticky='w')
+        e_name.insert(0, str(_name))
+        lbl(gf,"Телефон:",11,color=C['text2']).grid(row=1,column=0,sticky='w',pady=3)
+        e_phone = ent(gf, w=230); e_phone.grid(row=1,column=1,padx=8,pady=3,sticky='w')
+        e_phone.insert(0, str(_phone))
+
+        # Дати проживання
+        d_card = card(sc); d_card.pack(fill='x', padx=12, pady=5)
+        lbl(d_card, "📅  Дати проживання", 13, True).pack(anchor='w', padx=12, pady=(10,5))
+        df = tk.Frame(d_card, bg=C['card']); df.pack(fill='x', padx=12, pady=(0,10))
+        lbl(df,"Заїзд (РРРР-ММ-ДД):",11,color=C['text2']).grid(row=0,column=0,sticky='w',pady=3)
+        e_ci = ent(df, w=150); e_ci.grid(row=0,column=1,padx=8,pady=3,sticky='w')
+        e_ci.insert(0, str(b.get('check_in','')))
+        lbl(df,"Виїзд (РРРР-ММ-ДД):",11,color=C['text2']).grid(row=1,column=0,sticky='w',pady=3)
+        e_co = ent(df, w=150); e_co.grid(row=1,column=1,padx=8,pady=3,sticky='w')
+        e_co.insert(0, str(b.get('check_out','')))
+        lbl(df,"Дорослих:",11,color=C['text2']).grid(row=2,column=0,sticky='w',pady=3)
+        e_ad = ent(df, w=80); e_ad.grid(row=2,column=1,padx=8,pady=3,sticky='w')
+        e_ad.insert(0, str(b.get('adults','') or ''))
+
+        # Розрахунок
+        p_card = card(sc); p_card.pack(fill='x', padx=12, pady=5)
+        lbl(p_card, "💰  Розрахунок", 13, True).pack(anchor='w', padx=12, pady=(10,5))
+        pf = tk.Frame(p_card, bg=C['card']); pf.pack(fill='x', padx=12, pady=(0,10))
+        lbl(pf,"Ціна/добу:",11,color=C['text2']).grid(row=0,column=0,sticky='w',pady=3)
+        e_price = ent(pf, w=150); e_price.grid(row=0,column=1,padx=8,pady=3,sticky='w')
+        e_price.insert(0, str(b.get('price_per_day','') or ''))
+        lbl(pf,"Сума всього:",11,color=C['text2']).grid(row=1,column=0,sticky='w',pady=3)
+        e_total = ent(pf, w=150); e_total.grid(row=1,column=1,padx=8,pady=3,sticky='w')
+        e_total.insert(0, str(b.get('total_amount','') or ''))
+        lbl(pf,"🏷 Знижка:",11,color=C['text2']).grid(row=2,column=0,sticky='w',pady=3)
+        disc_row = tk.Frame(pf, bg=C['card']); disc_row.grid(row=2,column=1,padx=8,pady=3,sticky='w')
+        e_disc = ent(disc_row, "0", w=90); e_disc.pack(side='left')
+        ctk.CTkLabel(disc_row, text="₴", font=('Segoe UI',11), text_color=C['text2']).pack(side='left', padx=(4,10))
+        ctk.CTkLabel(disc_row, text="Коментар:", font=('Segoe UI',11), text_color=C['text2']).pack(side='left', padx=(0,6))
+        e_disc_comment = ent(disc_row, "причина", w=140); e_disc_comment.pack(side='left')
+
+        # Нотатки
+        n_card = card(sc); n_card.pack(fill='x', padx=12, pady=5)
+        lbl(n_card, "📝  Нотатки", 13, True).pack(anchor='w', padx=12, pady=(10,5))
+        e_notes = ctk.CTkTextbox(n_card, height=70, fg_color=C['card2'])
+        e_notes.pack(fill='x', padx=12, pady=(0,10))
         e_notes.insert('1.0', str(b.get('notes','') or ''))
 
-        _st = lbl(scroll, "", 10)
-        _st.pack(anchor='w', padx=4, pady=(8,0))
+        _st = lbl(sc, "", 10)
+        _st.pack(anchor='w', padx=16, pady=(4,0))
 
         def _save():
             import datetime as _dted
@@ -12460,6 +12804,18 @@ class BookingDetailDlg(ctk.CTkToplevel):
             name  = e_name.get().strip()
             phone = e_phone.get().strip()
             notes = e_notes.get('1.0','end').strip()
+
+            # ── Оновити фактичну дату/час заселення в нотатках ──
+            _ci_actual_val = e_ci_actual.get().strip()
+            if _ci_actual_val:
+                try:
+                    _dted.datetime.strptime(_ci_actual_val, '%Y-%m-%d %H:%M')
+                except ValueError:
+                    _st.configure(text="❌ Невірний формат дати/часу заселення (РРРР-ММ-ДД ГГ:ХХ)",
+                                  text_color=C['red']); return
+                notes = _re_ci_edit.sub(r'Фактичне заселення: \[?[^\]\n]+\]?', '', notes).strip()
+                notes = (notes + ('  ' if notes else '') + f'Фактичне заселення: {_ci_actual_val}').strip()
+
             if discount > 0:
                 total = max(total - discount, 0)
                 notes = f"Знижка: {discount:.0f}₴ ({discount_comment})  " + notes
@@ -12474,7 +12830,7 @@ class BookingDetailDlg(ctk.CTkToplevel):
                 _st.configure(text=f"❌ {_ex}", text_color=C['red']); return
             win.destroy(); self._rebuild()
 
-        bf = ctk.CTkFrame(scroll, fg_color='transparent'); bf.pack(fill='x', pady=12)
+        bf = tk.Frame(sc, bg=C['bg']); bf.pack(fill='x', padx=12, pady=12)
         btn(bf, "💾 Зберегти", _save, C['accent'], 150, height=38).pack(side='left', padx=5)
         btn(bf, "✖ Скасувати", win.destroy, C['card2'], 130, height=38).pack(side='left', padx=5)
 
@@ -14549,27 +14905,31 @@ class RestaurantFrame(tk.Frame):
                     cols = [d[0] for d in _cur.description]
                     rows = _cur.fetchall()
                     self._svcs_cache = [dict(zip(cols, row)) for row in rows]
-        except Exception:
-            # Офлайн-fallback: читаємо services з локального SQLite кешу
-            try:
-                excl = set(self._RESTAURANT_EXCL_CATS)
-                sq_svcs = _sqlite_select(
-                    "SELECT * FROM services WHERE active=1 OR active='true' OR active='t' ORDER BY category, name")
-                if not sq_svcs:
-                    # Спробуємо без фільтру active (старі схеми)
-                    sq_svcs = _sqlite_select("SELECT * FROM services ORDER BY category, name")
-                self._svcs_cache = [
-                    s for s in sq_svcs
-                    if s.get('category', '') not in excl
-                    and s.get('active', 1) not in (0, '0', 'false', 'f', False)
-                ]
-                for s in self._svcs_cache:
-                    s['price']   = float(s.get('price') or 0)
-                    s['quantity']= float(s.get('quantity') or 0)
-                    s['stock']   = float(s.get('stock') or s.get('quantity') or 0)
-                    s['barcode'] = str(s.get('barcode') or '').strip()
-            except Exception:
+        except Exception as _e_svc:
+            # Офлайн-fallback (вимкнено — OFFLINE_FALLBACK_ENABLED=False)
+            if OFFLINE_FALLBACK_ENABLED:
+                try:
+                    excl = set(self._RESTAURANT_EXCL_CATS)
+                    sq_svcs = _sqlite_select(
+                        "SELECT * FROM services WHERE active=1 OR active='true' OR active='t' ORDER BY category, name")
+                    if not sq_svcs:
+                        # Спробуємо без фільтру active (старі схеми)
+                        sq_svcs = _sqlite_select("SELECT * FROM services ORDER BY category, name")
+                    self._svcs_cache = [
+                        s for s in sq_svcs
+                        if s.get('category', '') not in excl
+                        and s.get('active', 1) not in (0, '0', 'false', 'f', False)
+                    ]
+                    for s in self._svcs_cache:
+                        s['price']   = float(s.get('price') or 0)
+                        s['quantity']= float(s.get('quantity') or 0)
+                        s['stock']   = float(s.get('stock') or s.get('quantity') or 0)
+                        s['barcode'] = str(s.get('barcode') or '').strip()
+                except Exception:
+                    self._svcs_cache = []
+            else:
                 self._svcs_cache = []
+                log_error("RestaurantFrame: немає з'єднання з сервером БД (меню)", _e_svc)
         # Конвертуємо Decimal → float у всіх позиціях
         for s in self._svcs_cache:
             for _k in ('price', 'quantity', 'stock'):
@@ -15113,7 +15473,10 @@ class RestaurantFrame(tk.Frame):
             # Скинути кеш колонок — можливо структура БД змінилась
             RestaurantFrame._roi_columns_cache = None
             # Офлайн-fallback: зберігаємо позицію локально
-            if not _sync_mgr.is_online():
+            # (вимкнено — OFFLINE_FALLBACK_ENABLED=False: показуємо помилку
+            # замість тихого локального збереження, яке потім спливло б
+            # непередбачувано при наступній синхронізації)
+            if OFFLINE_FALLBACK_ENABLED and not _sync_mgr.is_online():
                 try:
                     import sqlite3 as _sq3loc
                     _db = _get_sqlite_db_path()
@@ -16110,8 +16473,8 @@ class _BookableObjectFrame(tk.Frame):
         from app.modules.logic import get_rooms
         from datetime import date as _date
         rooms = get_rooms() or []
-        # Офлайн-fallback: якщо PG недоступний — беремо з SQLite кешу
-        if not rooms:
+        # Офлайн-fallback (вимкнено — OFFLINE_FALLBACK_ENABLED=False)
+        if not rooms and OFFLINE_FALLBACK_ENABLED:
             rooms = _get_rooms_from_sqlite() or []
         kws = self.CAT_KEYWORDS
         # Шукаємо по cat_name, category, і також по number (для відлагодження)
@@ -16151,31 +16514,34 @@ class _BookableObjectFrame(tk.Frame):
                     r['status'] = db_statuses[rid]
                 else:
                     r['status'] = 'free'
-        except Exception:
-            try:
-                today = _date.today()
-                if objects:
-                    ids_str = ','.join(str(int(r.get('id',0))) for r in objects)
-                    _sq_st = _sqlite_select(f"SELECT id, status FROM rooms WHERE id IN ({ids_str})")
-                    db_statuses = {int(r['id']): r['status'] for r in _sq_st}
-                    _sq_ci = _sqlite_select("SELECT DISTINCT room_id FROM bookings WHERE status='checkedin'")
-                    checkedin_ids = {int(r['room_id']) for r in _sq_ci}
-                    _sq_cf = _sqlite_select(
-                        "SELECT DISTINCT room_id FROM bookings WHERE status='confirmed' AND check_out >= ?",
-                        (str(today),))
-                    confirmed_ids = {int(r['room_id']) for r in _sq_cf}
-                    for r in objects:
-                        rid = int(r.get('id', 0))
-                        if rid in checkedin_ids:
-                            r['status'] = 'checkedin'
-                        elif rid in confirmed_ids:
-                            r['status'] = 'confirmed'
-                        elif db_statuses.get(rid) not in (None, 'free'):
-                            r['status'] = db_statuses[rid]
-                        else:
-                            r['status'] = 'free'
-            except Exception:
-                pass
+        except Exception as _e_bof:
+            if OFFLINE_FALLBACK_ENABLED:
+                try:
+                    today = _date.today()
+                    if objects:
+                        ids_str = ','.join(str(int(r.get('id',0))) for r in objects)
+                        _sq_st = _sqlite_select(f"SELECT id, status FROM rooms WHERE id IN ({ids_str})")
+                        db_statuses = {int(r['id']): r['status'] for r in _sq_st}
+                        _sq_ci = _sqlite_select("SELECT DISTINCT room_id FROM bookings WHERE status='checkedin'")
+                        checkedin_ids = {int(r['room_id']) for r in _sq_ci}
+                        _sq_cf = _sqlite_select(
+                            "SELECT DISTINCT room_id FROM bookings WHERE status='confirmed' AND check_out >= ?",
+                            (str(today),))
+                        confirmed_ids = {int(r['room_id']) for r in _sq_cf}
+                        for r in objects:
+                            rid = int(r.get('id', 0))
+                            if rid in checkedin_ids:
+                                r['status'] = 'checkedin'
+                            elif rid in confirmed_ids:
+                                r['status'] = 'confirmed'
+                            elif db_statuses.get(rid) not in (None, 'free'):
+                                r['status'] = db_statuses[rid]
+                            else:
+                                r['status'] = 'free'
+                except Exception:
+                    pass
+            else:
+                log_error("_BookableObjectFrame: немає з'єднання з сервером БД (статуси)", _e_bof)
         return objects
 
     def _build(self):
@@ -18078,33 +18444,36 @@ class ReportsFrame(tk.Frame):
                         _pay_rows = [dict(zip(_rcols, r)) for r in _cur_rev.fetchall()]
             except Exception as _erev:
                 log_error("Дохід report", _erev)
-                # Офлайн-fallback: читаємо payments з SQLite
-                try:
-                    _pay_rows = _sqlite_select(
-                        """SELECT
-                            p.created_at AS dt,
-                            COALESCE(r.number, '—') AS room,
-                            COALESCE(g.name, '—') AS guest,
-                            COALESCE(rc.name, '—') AS category,
-                            p.amount, p.method, p.note
-                           FROM payments p
-                           LEFT JOIN bookings b ON p.booking_id = b.id
-                           LEFT JOIN guests g ON b.guest_id = g.id
-                           LEFT JOIN rooms r ON b.room_id = r.id
-                           LEFT JOIN room_categories rc ON r.category_id = rc.id
-                           WHERE DATE(p.created_at) BETWEEN ? AND ?
-                             AND p.amount > 0
-                             AND COALESCE(p.note,'') NOT LIKE 'Повернення залогу%'
-                             AND COALESCE(p.note,'') NOT LIKE 'deposit_returned%'
-                             AND COALESCE(p.note,'') NOT LIKE 'Залог при заселенн%'
-                             AND COALESCE(p.note,'') NOT LIKE 'Залог при бронюванн%'
-                             AND COALESCE(p.note,'') NOT LIKE 'deposit%'
-                           ORDER BY p.created_at DESC""",
-                        (str(df), str(dt)))
-                    for _r in _pay_rows:
-                        _r['amount'] = float(_r.get('amount') or 0)
-                except Exception as _erev2:
-                    log_error("Дохід SQLite fallback", _erev2)
+                # Офлайн-fallback (вимкнено — OFFLINE_FALLBACK_ENABLED=False)
+                if OFFLINE_FALLBACK_ENABLED:
+                    try:
+                        _pay_rows = _sqlite_select(
+                            """SELECT
+                                p.created_at AS dt,
+                                COALESCE(r.number, '—') AS room,
+                                COALESCE(g.name, '—') AS guest,
+                                COALESCE(rc.name, '—') AS category,
+                                p.amount, p.method, p.note
+                               FROM payments p
+                               LEFT JOIN bookings b ON p.booking_id = b.id
+                               LEFT JOIN guests g ON b.guest_id = g.id
+                               LEFT JOIN rooms r ON b.room_id = r.id
+                               LEFT JOIN room_categories rc ON r.category_id = rc.id
+                               WHERE DATE(p.created_at) BETWEEN ? AND ?
+                                 AND p.amount > 0
+                                 AND COALESCE(p.note,'') NOT LIKE 'Повернення залогу%'
+                                 AND COALESCE(p.note,'') NOT LIKE 'deposit_returned%'
+                                 AND COALESCE(p.note,'') NOT LIKE 'Залог при заселенн%'
+                                 AND COALESCE(p.note,'') NOT LIKE 'Залог при бронюванн%'
+                                 AND COALESCE(p.note,'') NOT LIKE 'deposit%'
+                               ORDER BY p.created_at DESC""",
+                            (str(df), str(dt)))
+                        for _r in _pay_rows:
+                            _r['amount'] = float(_r.get('amount') or 0)
+                    except Exception as _erev2:
+                        log_error("Дохід SQLite fallback", _erev2)
+                        _pay_rows = []
+                else:
                     _pay_rows = []
 
             # ── Зведені картки ──
@@ -19002,10 +19371,10 @@ class ReportsFrame(tk.Frame):
                 GROUP BY method ORDER BY method
             """, (shift_id,)) or []
             xz_ret_row = query(
-                "SELECT COALESCE(ABS(SUM(amount)),0) as ret FROM payments WHERE shift_id=%s AND note LIKE 'Повернення залогу%%'",
+                "SELECT COALESCE(ABS(SUM(amount)),0) as ret, COUNT(*) as cnt FROM payments WHERE shift_id=%s AND note LIKE 'Повернення залогу%%'",
                 (shift_id,), fetch='one') or {}
             xz_dep_row = query(
-                "SELECT COALESCE(SUM(amount),0) as dep FROM payments WHERE shift_id=%s AND amount > 0 AND (note LIKE 'Залог%%' OR note LIKE 'deposit%%')",
+                "SELECT COALESCE(SUM(amount),0) as dep, COUNT(*) as cnt FROM payments WHERE shift_id=%s AND amount > 0 AND (note LIKE 'Залог%%' OR note LIKE 'deposit%%')",
                 (shift_id,), fetch='one') or {}
             svc_row = query("""
                 SELECT COALESCE(SUM(so.total),0) as svcs FROM service_orders so
@@ -19232,10 +19601,10 @@ class ReportsFrame(tk.Frame):
                 GROUP BY method ORDER BY method
             """, (shift_start,)) or []
             xz_ret_row = query(
-                "SELECT COALESCE(ABS(SUM(amount)),0) as ret FROM payments WHERE created_at > %s AND note LIKE 'Повернення залогу%%'",
+                "SELECT COALESCE(ABS(SUM(amount)),0) as ret, COUNT(*) as cnt FROM payments WHERE created_at > %s AND note LIKE 'Повернення залогу%%'",
                 (shift_start,), fetch='one') or {}
             xz_dep_row = query(
-                "SELECT COALESCE(SUM(amount),0) as dep FROM payments WHERE created_at > %s AND amount > 0 AND (note LIKE 'Залог%%' OR note LIKE 'deposit%%')",
+                "SELECT COALESCE(SUM(amount),0) as dep, COUNT(*) as cnt FROM payments WHERE created_at > %s AND amount > 0 AND (note LIKE 'Залог%%' OR note LIKE 'deposit%%')",
                 (shift_start,), fetch='one') or {}
             svc_row = query("""
                 SELECT COALESCE(SUM(total),0) as svcs FROM service_orders
@@ -19337,10 +19706,10 @@ class ReportsFrame(tk.Frame):
                 GROUP BY method ORDER BY method
             """, (today,)) or []
             xz_ret_row = query(
-                "SELECT COALESCE(ABS(SUM(amount)),0) as ret FROM payments WHERE DATE(created_at)=%s AND note LIKE 'Повернення залогу%%'",
+                "SELECT COALESCE(ABS(SUM(amount)),0) as ret, COUNT(*) as cnt FROM payments WHERE DATE(created_at)=%s AND note LIKE 'Повернення залогу%%'",
                 (today,), fetch='one') or {}
             xz_dep_row = query(
-                "SELECT COALESCE(SUM(amount),0) as dep FROM payments WHERE DATE(created_at)=%s AND amount > 0 AND (note LIKE 'Залог%%' OR note LIKE 'deposit%%')",
+                "SELECT COALESCE(SUM(amount),0) as dep, COUNT(*) as cnt FROM payments WHERE DATE(created_at)=%s AND amount > 0 AND (note LIKE 'Залог%%' OR note LIKE 'deposit%%')",
                 (today,), fetch='one') or {}
             svc_row = query("""
                 SELECT COALESCE(SUM(so.total),0) as svcs FROM service_orders so
@@ -19497,6 +19866,8 @@ class ReportsFrame(tk.Frame):
         transfer_total = sum(float(r['total'] or 0) for r in pay_rows if r['method'] in ('transfer','online'))
         xz_ret      = float(xz_ret_row.get('ret') or 0)
         xz_dep      = float(xz_dep_row.get('dep') or 0)
+        xz_ret_cnt  = int(xz_ret_row.get('cnt') or 0)
+        xz_dep_cnt  = int(xz_dep_row.get('cnt') or 0)
         # Фізична готівка в касі = відкриття + оплати готівкою (БЕЗ залогів) - переміщення.
         # _sr_ret_cash НЕ віднімаємо: cash_in вже виключає залоги і їх повернення.
         # Якщо є повернення доходу (не залогів) — вони вже мають від'ємний знак у payments
@@ -19629,8 +20000,28 @@ class ReportsFrame(tk.Frame):
                         OR CAST(COALESCE({alias_r}.number,'') AS text) ILIKE '%%альтанк%%')"""
 
             def _nights(ci_, co_):
+                """Кількість діб. check_in/check_out тут приходять напряму
+                з SQL (не через get_bookings(), де типи вже нормалізовані),
+                тож один може бути date, інший datetime, або взагалі рядок —
+                пряме віднімання (co_-ci_) на такій суміші падає з винятком
+                і мовчки давало '—'. Приводимо обидва до date перед відніманням."""
+                import datetime as _dtn
+                def _to_date(v):
+                    if v is None:
+                        return None
+                    if isinstance(v, _dtn.datetime):
+                        return v.date()
+                    if isinstance(v, _dtn.date):
+                        return v
+                    try:
+                        return _dtn.date.fromisoformat(str(v)[:10])
+                    except Exception:
+                        return None
+                ci_d, co_d = _to_date(ci_), _to_date(co_)
+                if ci_d is None or co_d is None:
+                    return '—'
                 try:
-                    return max((co_ - ci_).days, 1)
+                    return max((co_d - ci_d).days, 1)
                 except Exception:
                     return '—'
 
@@ -19638,9 +20029,25 @@ class ReportsFrame(tk.Frame):
                 if revenue <= 0 and ci_cnt == 0 and bk_cnt == 0:
                     return
                 _grp(title)
+
+                def _booking_amount(rr, n):
+                    """Сума за бронювання: total_amount, а якщо він ще не
+                    проставлений — ціна/добу × кількість діб (та сама логіка,
+                    що й у списку «Заселені» та картці бронювання)."""
+                    total_stored = float(rr.get('total_amount') or 0)
+                    if total_stored > 0:
+                        return total_stored
+                    price = float(rr.get('price_per_day') or 0)
+                    try:
+                        nights = int(n)
+                    except Exception:
+                        nights = 1
+                    return price * nights
+
                 try:
                     rows_ci = _qtbl(f"""
-                        SELECT r.number AS num, g.name AS guest, b.check_in, b.check_out
+                        SELECT r.number AS num, g.name AS guest, b.check_in, b.check_out,
+                               b.total_amount, b.price_per_day
                         FROM bookings b
                         JOIN rooms r ON b.room_id=r.id
                         LEFT JOIN room_categories rc ON r.category_id=rc.id
@@ -19650,12 +20057,16 @@ class ReportsFrame(tk.Frame):
                     """) or []
                     for rr in rows_ci:
                         n = _nights(rr.get('check_in'), rr.get('check_out'))
-                        _ln(f"№{rr.get('num','')} — {rr.get('guest') or '—'} (заселено)", f"{n} ніч", "—")
+                        amt = _booking_amount(rr, n)
+                        n_str = f"{n} ніч" if isinstance(n, int) else "—"
+                        _ln(f"№{rr.get('num','')} — {rr.get('guest') or '—'} (заселено)",
+                            n_str, f"{amt:.0f}₴" if amt > 0 else "—")
                 except Exception:
                     pass
                 try:
                     rows_bk = _qtbl(f"""
-                        SELECT r.number AS num, g.name AS guest, b.check_in, b.check_out
+                        SELECT r.number AS num, g.name AS guest, b.check_in, b.check_out,
+                               b.total_amount, b.price_per_day
                         FROM bookings b
                         JOIN rooms r ON b.room_id=r.id
                         LEFT JOIN room_categories rc ON r.category_id=rc.id
@@ -19667,7 +20078,10 @@ class ReportsFrame(tk.Frame):
                     """, (shift_id, shift_id)) or []
                     for rr in rows_bk:
                         n = _nights(rr.get('check_in'), rr.get('check_out'))
-                        _ln(f"№{rr.get('num','')} — {rr.get('guest') or '—'} (бронь)", f"{n} ніч", "—")
+                        amt = _booking_amount(rr, n)
+                        n_str = f"{n} ніч" if isinstance(n, int) else "—"
+                        _ln(f"№{rr.get('num','')} — {rr.get('guest') or '—'} (бронь)",
+                            n_str, f"{amt:.0f}₴" if amt > 0 else "—")
                 except Exception:
                     pass
                 _ln(f"ПІДСУМОК: {title}", f"{ci_cnt} засел. / {bk_cnt} брон.", f"{revenue:.2f}₴", total=True)
@@ -19683,8 +20097,14 @@ class ReportsFrame(tk.Frame):
             _grp("🔒 ЗАЛОГИ")
             if _opening_dep_sr > 0:
                 _ln("Залишок на початок зміни", "—", f"{_opening_dep_sr:.2f}₴")
-            _ln("Прийнято цієї зміни", "—", f"{xz_dep:.2f}₴")
-            _ln("Повернено", "—", f"-{xz_ret:.2f}₴")
+            # Кількість транзакцій рахуємо з того ж запиту, що й суму, але якщо
+            # лічильник все ж повернувся як 0 при ненульовій сумі (розбіжність
+            # даних/драйвера) — показуємо хоча б "1 транз.", а не прочерк,
+            # адже сума > 0 означає, що рух грошей точно був.
+            _dep_cnt_disp = f"{xz_dep_cnt} транз." if xz_dep_cnt > 0 else ("1 транз." if xz_dep > 0 else "—")
+            _ret_cnt_disp = f"{xz_ret_cnt} транз." if xz_ret_cnt > 0 else ("1 транз." if xz_ret > 0 else "—")
+            _ln("Прийнято цієї зміни", _dep_cnt_disp, f"{xz_dep:.2f}₴")
+            _ln("Повернено", _ret_cnt_disp, f"-{xz_ret:.2f}₴")
             _ln("ПІДСУМОК (залишок на кінець зміни)", "—", f"{xz_dep_balance:.2f}₴", total=True)
 
             # ── 🛏 НОМЕРИ / 🛁 БАНІ / ⛺ БЕСІДКИ ──
