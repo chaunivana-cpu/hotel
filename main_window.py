@@ -6045,28 +6045,28 @@ class DashboardFrame(tk.Frame):
         """Запускає завантаження даних у фоновому потоці."""
         import threading, time as _time_ld
         if self._loading:
-            # Якщо попереднє завантаження досі "висить" довше 12с (наприклад,
+            # Якщо попереднє завантаження досі "висить" довше 20с (наприклад,
             # БД не відповідає і запит завис без таймауту) — не даємо дашборду
             # застрягнути назавжди: скидаємо прапорець і пробуємо знову.
             _started = getattr(self, '_loading_started', 0.0)
-            if _started and (_time_ld.monotonic() - _started) > 12:
+            if _started and (_time_ld.monotonic() - _started) > 20:
                 self._loading = False
             else:
                 return
         self._loading = True
         self._loading_started = _time_ld.monotonic()
         threading.Thread(target=self._fetch_and_render, daemon=True).start()
-        # Watchdog: якщо через 12с потік ще не завершився (get_conn() завис
+        # Watchdog: якщо через 20с потік ще не завершився (get_conn() завис
         # без таймауту через недоступну БД) — примусово рендеримо з кешу,
         # щоб дашборд не залишався "0 0 0..." назавжди.
-        self.after(12000, self._loading_watchdog)
+        self.after(20000, self._loading_watchdog)
 
     def _loading_watchdog(self):
         try:
             if not self.winfo_exists(): return
             if self._loading:
                 self._loading = False
-                self._render_error("Тайм-аут з'єднання з БД (>12с) — показано дані з кешу")
+                self._render_error("Тайм-аут з'єднання з БД (>20с) — показано дані з кешу")
         except Exception:
             pass
 
@@ -6079,12 +6079,26 @@ class DashboardFrame(tk.Frame):
             arr   = []
             dep   = []
 
+            # Одне спільне з'єднання для трьох блоків запитів нижче (статуси
+            # номерів, каса зміни, прострочені виїзди) — раніше кожен блок
+            # відкривав власне з'єднання (3 окремих TCP+auth рукостискання
+            # до віддаленої БД за одне оновлення дашборду), що на нестабільній
+            # мережі додавало зайві секунди й провокувало хибний тайм-аут.
+            _shared_conn = None
+            try:
+                from app.utils.db import get_conn as _gc_shared
+                _shared_conn_cm = _gc_shared()
+                _shared_conn = _shared_conn_cm.__enter__()
+            except Exception:
+                _shared_conn = None
+                _shared_conn_cm = None
+
             try:
                 # Статуси номерів — завжди з БД напряму (не кеш) для актуальності
                 try:
-                    from app.utils.db import get_conn as _get_conn2
-                    with _get_conn2() as _dc:
-                        with _dc.cursor() as _dcur:
+                    if _shared_conn is None:
+                        raise RuntimeError("Немає з'єднання з БД")
+                    with _shared_conn.cursor() as _dcur:
                             _dcur.execute("SELECT id, status FROM rooms")
                             _cols = [d[0] for d in _dcur.description]
                             db_statuses = {row[0]: row[1] for row in _dcur.fetchall()}
@@ -6144,7 +6158,8 @@ class DashboardFrame(tk.Frame):
             shift_paid = 0.0
             shift_dep  = 0.0
             try:
-                from app.utils.db import get_conn as _gc_dash
+                if _shared_conn is None:
+                    raise RuntimeError("Немає з'єднання з БД")
                 # Завжди беремо найновіший відкритий shift_id напряму з БД
                 _sid = None
                 try:
@@ -6154,8 +6169,8 @@ class DashboardFrame(tk.Frame):
                 except Exception:
                     _sid = get_current_shift_id()
                 if _sid:
-                    with _gc_dash() as _dc2:
-                        with _dc2.cursor() as _cur2:
+                    if True:
+                        with _shared_conn.cursor() as _cur2:
                             _cur2.execute(
                                 "SELECT COALESCE(opening_cash,0), COALESCE(opening_deposits,0) FROM shifts WHERE id=%s",
                                 (_sid,))
@@ -6231,9 +6246,10 @@ class DashboardFrame(tk.Frame):
                         _row['days_late'] = 0
                 return rows
             try:
-                from app.utils.db import get_conn as _gc_ov
-                with _gc_ov() as _ovc:
-                    with _ovc.cursor() as _ovcur:
+                if _shared_conn is None:
+                    raise RuntimeError("Немає з'єднання з БД")
+                if True:
+                    with _shared_conn.cursor() as _ovcur:
                         _ovcur.execute("""
                             SELECT b.id, r.number as room_number,
                                    COALESCE(g.name, '') as guest_name, b.check_in, b.check_out
@@ -6264,6 +6280,14 @@ class DashboardFrame(tk.Frame):
                         log_info(f"Dashboard overdue SQLite fallback: {len(overdue_bookings)} записів")
                     except Exception as _fb_err:
                         log_error("Dashboard: SQLite fallback overdue теж не вдався", _fb_err)
+
+            # Спільне з'єднання більше не потрібне — закриваємо одразу,
+            # а не тримаємо відкритим до кінця функції.
+            if _shared_conn_cm is not None:
+                try:
+                    _shared_conn_cm.__exit__(None, None, None)
+                except Exception:
+                    pass
 
             # ── Заїзди і виїзди сьогодні (офлайн-fallback вимкнено — OFFLINE_FALLBACK_ENABLED=False) ──
             if not arr and OFFLINE_FALLBACK_ENABLED:
@@ -12991,6 +13015,11 @@ class BookingDetailDlg(ctk.CTkToplevel):
         _notes_raw0 = str(b.get('notes','') or '')
         _m_ci_edit = _re_ci_edit.search(r'Фактичне заселення:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})', _notes_raw0)
         _ci_actual_default = _m_ci_edit.group(1) if _m_ci_edit else ''
+        # Якщо знижку вже застосовували раніше — знаходимо її тут (заздалегідь),
+        # щоб коректно порахувати "Сума всього" нижче (без подвійного
+        # віднімання знижки при повторному редагуванні).
+        _m_disc_edit = _re_ci_edit.search(r'Знижка:\s*([\d.,]+)\s*₴\s*\(([^)]*)\)', _notes_raw0)
+        _prior_discount = float(_m_disc_edit.group(1).replace(',', '.')) if _m_disc_edit else 0.0
 
         ci_card = card(sc); ci_card.pack(fill='x', padx=12, pady=5)
         lbl(ci_card, "🕒  Фактичне заселення", 13, True).pack(anchor='w', padx=12, pady=(10,5))
@@ -13035,13 +13064,58 @@ class BookingDetailDlg(ctk.CTkToplevel):
         e_price.insert(0, str(b.get('price_per_day','') or ''))
         lbl(pf,"Сума всього:",11,color=C['text2']).grid(row=1,column=0,sticky='w',pady=3)
         e_total = ent(pf, w=150); e_total.grid(row=1,column=1,padx=8,pady=3,sticky='w')
-        e_total.insert(0, str(b.get('total_amount','') or ''))
+        # Якщо в bookings.total_amount 0/порожньо (буває у старих записах,
+        # де ця колонка ніколи не заповнювалась) — підставляємо РЕАЛЬНІ дані:
+        # 1) фактично сплачену суму при заселенні (payments), 2) інакше
+        # ціна/добу × кількість діб, а не голий нуль.
+        try:
+            _total_val = float(b.get('total_amount') or 0)
+        except Exception:
+            _total_val = 0.0
+        if (not _total_val or _prior_discount > 0):
+            _total_val = 0.0
+            # 1) Спробувати реальну суму оплати за це бронювання (без залогу)
+            try:
+                _pay_row = _qe(
+                    """SELECT COALESCE(SUM(amount),0) AS s FROM payments
+                       WHERE booking_id=%s AND amount>0
+                         AND (note IS NULL OR (note NOT LIKE 'Залог%%'
+                              AND note NOT LIKE 'Повернення залогу%%'))""",
+                    (self.bid,), fetch='one') or {}
+                _total_val = float(_pay_row.get('s') or 0)
+            except Exception as _e_pay:
+                log_error(f"_edit_booking_dlg: не вдалось порахувати оплати #{self.bid}", _e_pay)
+            # 2) Якщо оплат теж нема (чи вже була знижка) — ціна × ночі
+            if not _total_val or _prior_discount > 0:
+                try:
+                    _ci_calc = b.get('check_in'); _co_calc = b.get('check_out')
+                    if isinstance(_ci_calc, str):
+                        import datetime as _dtci
+                        _ci_calc = _dtci.date.fromisoformat(_ci_calc[:10])
+                    if isinstance(_co_calc, str):
+                        import datetime as _dtco
+                        _co_calc = _dtco.date.fromisoformat(_co_calc[:10])
+                    _nights_calc = max((_co_calc - _ci_calc).days, 1) if _ci_calc and _co_calc else 1
+                    _price_calc = float(b.get('price_per_day') or 0)
+                    _calc_total = _price_calc * _nights_calc
+                    if _calc_total > _total_val:
+                        _total_val = _calc_total
+                except Exception as _e_calc:
+                    log_error(f"_edit_booking_dlg: не вдалось порахувати ціна×ночі #{self.bid}", _e_calc)
+                    if not _total_val:
+                        _total_val = float(b.get('price_per_day') or 0)
+        e_total.insert(0, f"{_total_val:.2f}")
         lbl(pf,"🏷 Знижка:",11,color=C['text2']).grid(row=2,column=0,sticky='w',pady=3)
         disc_row = tk.Frame(pf, bg=C['card']); disc_row.grid(row=2,column=1,padx=8,pady=3,sticky='w')
         e_disc = ent(disc_row, "0", w=90); e_disc.pack(side='left')
         ctk.CTkLabel(disc_row, text="₴", font=('Segoe UI',11), text_color=C['text2']).pack(side='left', padx=(4,10))
         ctk.CTkLabel(disc_row, text="Коментар:", font=('Segoe UI',11), text_color=C['text2']).pack(side='left', padx=(0,6))
         e_disc_comment = ent(disc_row, "причина", w=140); e_disc_comment.pack(side='left')
+        # Якщо знижку вже застосовували раніше — підтягуємо її, щоб повторне
+        # збереження не плодило дублікати рядка "Знижка: ..." у нотатках.
+        if _m_disc_edit:
+            e_disc.delete(0,'end'); e_disc.insert(0, _m_disc_edit.group(1).replace(',', '.'))
+            e_disc_comment.delete(0,'end'); e_disc_comment.insert(0, _m_disc_edit.group(2))
 
         # Нотатки
         n_card = card(sc); n_card.pack(fill='x', padx=12, pady=5)
@@ -13089,7 +13163,10 @@ class BookingDetailDlg(ctk.CTkToplevel):
 
             if discount > 0:
                 total = max(total - discount, 0)
+                notes = _re_ci_edit.sub(r'Знижка:\s*[\d.,]+\s*₴\s*\([^)]*\)\s*', '', notes).strip()
                 notes = f"Знижка: {discount:.0f}₴ ({discount_comment})  " + notes
+            else:
+                notes = _re_ci_edit.sub(r'Знижка:\s*[\d.,]+\s*₴\s*\([^)]*\)\s*', '', notes).strip()
             try:
                 if b.get('guest_id'):
                     _qe("UPDATE guests SET name=%s, phone=%s WHERE id=%s",
@@ -26791,6 +26868,85 @@ class SettingsFrame(tk.Frame):
         e_port = ent(pf,w=200); e_port.insert(0,_POS_SETTINGS.get('port','COM1'))
         e_port.grid(row=1,column=1,padx=10,sticky='w')
 
+        def _get_type():
+            t = type_var.get()
+            return t.split(' ')[0]  # беремо лише 'tcp_server', 'serial', 'usb_raw' тощо
+
+        def do_search_printer():
+            """Знаходить принтери, встановлені у Windows, і дає вибрати
+            потрібний — щоб не вводити ім'я принтера вручну.
+            Спочатку пробує win32print (якщо є pywin32), інакше — той самий
+            PowerShell, яким вже й так друкує режим 'direct' (без потреби
+            встановлювати pywin32 чи пересобирати exe)."""
+            names = []
+            _err_pw32 = None
+            try:
+                import win32print
+                _raw = win32print.EnumPrinters(
+                    win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS)
+                names = sorted({p[2] for p in _raw})
+            except Exception as ex:
+                _err_pw32 = ex
+
+            if not names:
+                # Фолбек без pywin32: той самий powershell.exe, що вже
+                # використовується для друку в режимі 'direct'.
+                try:
+                    import subprocess
+                    r = subprocess.run(
+                        ['powershell', '-WindowStyle', 'Hidden', '-NoProfile', '-Command',
+                         'Get-Printer | Select-Object -ExpandProperty Name'],
+                        timeout=10, capture_output=True
+                    )
+                    if r.returncode == 0:
+                        names = sorted({
+                            ln.strip() for ln in r.stdout.decode('cp1251', errors='replace').splitlines()
+                            if ln.strip()
+                        })
+                except Exception as ex:
+                    if _err_pw32 is None:
+                        _err_pw32 = ex
+
+            if not names:
+                messagebox.showerror(
+                    "❌ Помилка",
+                    "Не вдалося отримати список принтерів ані через pywin32, ані через "
+                    "PowerShell.\nВведіть ім'я принтера вручну (Параметри → Пристрої → "
+                    f"Принтери).\n\nДеталі: {_err_pw32}"
+                )
+                return
+
+            sel_win = dlg_win(f.winfo_toplevel(), "🔍 Виберіть принтер", "420x340")
+            lbl(sel_win, "Знайдені принтери:", 12, True).pack(anchor='w', padx=15, pady=(15,6))
+            lb = tk.Listbox(sel_win, font=('Segoe UI', 11), height=10,
+                             bg=C['card2'], fg=C['text'], selectbackground=C['accent'])
+            lb.pack(fill='both', expand=True, padx=15, pady=(0,10))
+            for n in names:
+                lb.insert('end', n)
+            lb.selection_set(0)
+
+            def _pick():
+                sel = lb.curselection()
+                if sel:
+                    e_port.delete(0, 'end')
+                    e_port.insert(0, names[sel[0]])
+                sel_win.destroy()
+
+            lb.bind('<Double-Button-1>', lambda _e: _pick())
+            btn(sel_win, "✅ Вибрати", _pick, C['green'], 140, height=36).pack(pady=(0,15))
+
+        search_btn = btn(pf, "🔍 Пошук принтера", do_search_printer, C['card2'], 160, height=30)
+
+        def _update_search_btn_visibility(*_a):
+            # Кнопка пошуку має сенс лише для usb_raw — там у полі "Порт"
+            # вводиться ім'я встановленого в Windows принтера.
+            if _get_type() == 'usb_raw':
+                search_btn.grid(row=1, column=2, padx=(0,10), sticky='w')
+            else:
+                search_btn.grid_remove()
+
+        type_var.trace_add('write', _update_search_btn_visibility)
+
         lbl(pf,"Швидкість / TCP-порт:",11,color=C['text2']).grid(row=2,column=0,sticky='w',pady=5)
         e_baud = ent(pf,w=120); e_baud.insert(0,str(_POS_SETTINGS.get('baudrate',9600)))
         e_baud.grid(row=2,column=1,padx=10,sticky='w')
@@ -26798,6 +26954,8 @@ class SettingsFrame(tk.Frame):
         lbl(pf,"Авто-друк при заселенні:",11,color=C['text2']).grid(row=3,column=0,sticky='w',pady=5)
         en_var = ctk.BooleanVar(value=_POS_SETTINGS.get('enabled',False))
         ctk.CTkSwitch(pf, variable=en_var, text="Увімкнено").grid(row=3,column=1,padx=10,sticky='w')
+
+        _update_search_btn_visibility()
 
         # Підказки
         hints = card(f); hints.pack(fill='x', pady=5)
@@ -26812,9 +26970,6 @@ class SettingsFrame(tk.Frame):
         )
         lbl(hints, tip_text, 10, color=C['text2']).pack(anchor='w', padx=12, pady=(0,10))
 
-        def _get_type():
-            t = type_var.get()
-            return t.split(' ')[0]  # беремо лише 'tcp_server', 'serial', 'usb_raw' тощо
 
         def do_test():
             _POS_SETTINGS.update({'type':_get_type(),'port':e_port.get().strip(),
