@@ -2654,12 +2654,42 @@ def _print_pos(text):
                 win32print.ClosePrinter(h)
             return True
         except ImportError:
-            # без win32print — через copy команду
-            tmp = tempfile.mktemp(suffix='.bin')
-            with open(tmp,'wb') as f: f.write(INIT + lines + b'\n\n\n' + CUT)
-            subprocess.run(f'copy /b "{tmp}" "{port}"', shell=True)
-            os.unlink(tmp)
-            return True
+            # У EXE часто немає pywin32. Старий fallback `copy /b ... "Ім'я принтера"`
+            # НЕ друкує у чергу Windows, бо ім'я принтера не є LPT/USB-портом.
+            # Використовуємо штатний Windows Spooler через PowerShell Out-Printer.
+            # Тут передаємо саме текст, без ESC/POS RAW-команд, щоб драйвер Epson
+            # сам сформував сторінку/чек.
+            tmp = tempfile.mktemp(suffix='.txt')
+            try:
+                with open(tmp, 'w', encoding='utf-8', newline='') as f:
+                    f.write(text)
+
+                _ps_path = tmp.replace("'", "''")
+                _ps_name = str(port).replace("'", "''")
+                ps = (
+                    f"$ErrorActionPreference='Stop'; "
+                    f"Get-Content -Encoding UTF8 -Path '{_ps_path}' | "
+                    f"Out-Printer -Name '{_ps_name}'"
+                )
+
+                r = subprocess.run(
+                    ['powershell', '-WindowStyle', 'Hidden', '-NoProfile',
+                     '-Command', ps],
+                    timeout=20, capture_output=True
+                )
+
+                if r.returncode != 0:
+                    err = r.stderr.decode('utf-8', errors='replace').strip()
+                    raise RuntimeError(
+                        f"Windows не зміг надрукувати на «{port}»"
+                        + (f": {err[:300]}" if err else "")
+                    )
+                return True
+            finally:
+                try:
+                    os.unlink(tmp)
+                except Exception:
+                    pass
 
     elif typ == 'serial':
         import serial as _serial
