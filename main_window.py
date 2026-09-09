@@ -1681,6 +1681,237 @@ if not hasattr(ttk.Treeview, '_patched_for_auto_scroll'):
     ttk.Treeview.insert = _patched_insert
     ttk.Treeview._patched_for_auto_scroll = True
 
+def _get_table_layout_data(table_id):
+    s = _load_app_settings()
+    return (s.get('table_layouts') or {}).get(table_id, {})
+
+def _save_table_layout_data(table_id, data):
+    s = _load_app_settings()
+    layouts = s.get('table_layouts') or {}
+    layouts[table_id] = data
+    _save_app_settings({'table_layouts': layouts})
+
+def get_table_columns_for_display(table_id, all_fields):
+    """all_fields: [(key, label, default_width), ...] у природному порядку.
+    Повертає (ordered_cols, row_height), де ordered_cols — список
+    (key, label, width) видимих полів у збереженому порядку (або дефолт —
+    усі поля, як задано)."""
+    data = _get_table_layout_data(table_id)
+    active = data.get('active')
+    presets = data.get('presets', {})
+    field_map = {k: (k, l, w) for k, l, w in all_fields}
+    if active and active in presets:
+        p = presets[active]
+        ordered = []
+        for c in p.get('columns', []):
+            k = c.get('key')
+            if k in field_map:
+                _, label, defw = field_map[k]
+                ordered.append((k, label, c.get('width', defw)))
+        row_h = int(p.get('row_height', 28))
+        if ordered:
+            return ordered, row_h
+    return [(k, l, w) for k, l, w in all_fields], 28
+
+def apply_table_layout(tree, table_id, all_fields, style_name=None):
+    """Застосовує збережений (або дефолтний) вигляд таблиці: які колонки
+    показувати, в якому порядку, якої ширини, і висоту рядка."""
+    cols, row_h = get_table_columns_for_display(table_id, all_fields)
+    keys = [c[0] for c in cols]
+    try:
+        tree.configure(displaycolumns=keys)
+    except Exception:
+        pass
+    for k, label, w in cols:
+        try:
+            tree.heading(k, text=label)
+            tree.column(k, width=w)
+        except Exception:
+            pass
+    if style_name:
+        try:
+            ttk.Style().configure(style_name, rowheight=row_h)
+        except Exception:
+            pass
+
+
+class TableLayoutDlg(ctk.CTkToplevel):
+    """Конструктор вигляду таблиці (тільки для admin/manager): які колонки
+    показувати і в якому порядку, ширина колонок, висота рядка, збереження
+    кількох іменованих шаблонів вигляду для однієї таблиці. all_fields може
+    містити БІЛЬШЕ полів, ніж зараз показано — це і є список "нових колонок,
+    які є у програмі", доступних для додавання."""
+    def __init__(self, parent, table_id, all_fields, on_apply):
+        super().__init__(parent)
+        self.table_id = table_id
+        self.all_fields = all_fields  # [(key,label,default_width),...]
+        self.on_apply = on_apply
+        self.title(f"⚙️ Налаштування таблиці")
+        self.geometry("580x580")
+        self.grab_set()
+        self.configure(fg_color=C['bg'])
+
+        data = _get_table_layout_data(table_id)
+        self.presets = data.get('presets', {})
+        self.active_name = data.get('active')
+
+        top = tk.Frame(self, bg=C['bg']); top.pack(fill='x', padx=14, pady=(14,6))
+        lbl(top, "Шаблон:", 11, color=C['text2']).pack(side='left', padx=(0,6))
+        self.preset_var = ctk.StringVar(value=self.active_name or "(за замовчуванням)")
+        self.preset_menu = ctk.CTkOptionMenu(top, values=self._preset_names(), variable=self.preset_var,
+                                              command=self._on_preset_selected, width=200,
+                                              fg_color=C['card2'], button_color=C['accent'])
+        self.preset_menu.pack(side='left', padx=4)
+        btn(top, "🗑 Видалити шаблон", self._delete_preset, C['red'], 160, height=30).pack(side='left', padx=6)
+
+        rh = tk.Frame(self, bg=C['bg']); rh.pack(fill='x', padx=14, pady=(0,8))
+        lbl(rh, "Висота рядка (px):", 11, color=C['text2']).pack(side='left', padx=(0,6))
+        ent_rh = ent(rh, "28", w=70); ent_rh.pack(side='left')
+        ent_rh.delete(0,'end'); ent_rh.insert(0, "28")
+        self.e_row_h = ent_rh
+
+        lbl(self, "Позначте поля, які показувати (в т.ч. нові колонки). ▲/▼ — порядок. Подвійний клік по ширині — змінити.",
+            10, color=C['text2']).pack(anchor='w', padx=14, pady=(0,4))
+
+        tree_f = tk.Frame(self, bg=C['bg']); tree_f.pack(fill='both', expand=True, padx=14)
+        cols2 = ('vis','field','width')
+        ff2, self.cfg_tree = mktree(tree_f, cols2, 14, [50, 300, 90])
+        for c,h in zip(cols2, ['Показ.','Поле','Ширина']):
+            self.cfg_tree.heading(c, text=h)
+        ff2.pack(fill='both', expand=True)
+        self.cfg_tree.bind('<Button-1>', self._on_tree_click)
+        self.cfg_tree.bind('<Double-1>', self._on_tree_dblclick)
+
+        mv = tk.Frame(self, bg=C['bg']); mv.pack(fill='x', padx=14, pady=6)
+        btn(mv, "▲ Вгору", self._move_up, C['card2'], 100, height=30).pack(side='left', padx=3)
+        btn(mv, "▼ Вниз", self._move_down, C['card2'], 100, height=30).pack(side='left', padx=3)
+
+        savef = tk.Frame(self, bg=C['bg']); savef.pack(fill='x', padx=14, pady=(4,4))
+        lbl(savef, "Нова назва шаблону:", 11, color=C['text2']).pack(side='left', padx=(0,6))
+        self.e_new_name = ent(savef, "напр. Коротка версія", w=200); self.e_new_name.pack(side='left')
+        btn(savef, "💾 Зберегти як...", self._save_as, C['green'], 160, height=30).pack(side='left', padx=6)
+
+        bf = tk.Frame(self, bg=C['bg']); bf.pack(fill='x', padx=14, pady=(6,14))
+        btn(bf, "✅ Застосувати", self._apply_and_close, C['accent'], 150, height=36).pack(side='left', padx=4)
+        btn(bf, "✖ Закрити", self.destroy, C['card2'], 120, height=36).pack(side='left', padx=4)
+
+        self._load_state_into_tree(self.active_name)
+
+    def _preset_names(self):
+        return ["(за замовчуванням)"] + list(self.presets.keys())
+
+    def _load_state_into_tree(self, preset_name):
+        self.cfg_tree.delete(*self.cfg_tree.get_children())
+        field_map = {k: (l, w) for k, l, w in self.all_fields}
+        if preset_name and preset_name in self.presets:
+            p = self.presets[preset_name]
+            ordered_keys = [c['key'] for c in p.get('columns', []) if c['key'] in field_map]
+            widths = {c['key']: c.get('width') for c in p.get('columns', [])}
+            row_h = p.get('row_height', 28)
+        else:
+            ordered_keys = [k for k,_,_ in self.all_fields]
+            widths = {}
+            row_h = 28
+        remaining = [k for k,_,_ in self.all_fields if k not in ordered_keys]
+        for k in ordered_keys + remaining:
+            label, defw = field_map[k]
+            w = widths.get(k, defw)
+            vis = '☑' if k in ordered_keys else '☐'
+            self.cfg_tree.insert('', 'end', iid=k, values=(vis, label, w))
+        self.e_row_h.delete(0,'end'); self.e_row_h.insert(0, str(row_h))
+
+    def _on_preset_selected(self, val):
+        self._load_state_into_tree(None if val == "(за замовчуванням)" else val)
+
+    def _on_tree_click(self, ev):
+        region = self.cfg_tree.identify('region', ev.x, ev.y)
+        col = self.cfg_tree.identify_column(ev.x)
+        iid = self.cfg_tree.identify_row(ev.y)
+        if region == 'cell' and col == '#1' and iid:
+            cur = self.cfg_tree.set(iid, 'vis')
+            self.cfg_tree.set(iid, 'vis', '☐' if cur == '☑' else '☑')
+
+    def _on_tree_dblclick(self, ev):
+        col = self.cfg_tree.identify_column(ev.x)
+        iid = self.cfg_tree.identify_row(ev.y)
+        if col == '#3' and iid:
+            from tkinter import simpledialog
+            cur = self.cfg_tree.set(iid, 'width')
+            new_val = simpledialog.askinteger("Ширина колонки", "Нова ширина (px):",
+                                               initialvalue=int(cur) if str(cur).isdigit() else 80,
+                                               parent=self, minvalue=20, maxvalue=600)
+            if new_val:
+                self.cfg_tree.set(iid, 'width', new_val)
+
+    def _move_up(self):
+        sel = self.cfg_tree.selection()
+        if not sel: return
+        iid = sel[0]
+        idx = self.cfg_tree.index(iid)
+        if idx > 0:
+            self.cfg_tree.move(iid, '', idx-1)
+
+    def _move_down(self):
+        sel = self.cfg_tree.selection()
+        if not sel: return
+        iid = sel[0]
+        idx = self.cfg_tree.index(iid)
+        self.cfg_tree.move(iid, '', idx+1)
+
+    def _collect_config(self):
+        columns = []
+        for iid in self.cfg_tree.get_children():
+            vis, label, width = self.cfg_tree.item(iid, 'values')
+            if vis == '☑':
+                try: w = int(width)
+                except Exception: w = 80
+                columns.append({'key': iid, 'width': w})
+        try: row_h = int(self.e_row_h.get().strip() or 28)
+        except Exception: row_h = 28
+        return {'columns': columns, 'row_height': row_h}
+
+    def _save_as(self):
+        name = self.e_new_name.get().strip()
+        if not name:
+            messagebox.showwarning("", "Введіть назву шаблону"); return
+        cfg = self._collect_config()
+        self.presets[name] = cfg
+        self.active_name = name
+        _save_table_layout_data(self.table_id, {'active': name, 'presets': self.presets})
+        self.preset_menu.configure(values=self._preset_names())
+        self.preset_var.set(name)
+        messagebox.showinfo("", f"Шаблон «{name}» збережено")
+
+    def _delete_preset(self):
+        name = self.preset_var.get()
+        if name == "(за замовчуванням)" or name not in self.presets:
+            messagebox.showwarning("", "Оберіть збережений шаблон для видалення"); return
+        if not messagebox.askyesno("Підтвердження", f"Видалити шаблон «{name}»?"):
+            return
+        del self.presets[name]
+        if self.active_name == name:
+            self.active_name = None
+        _save_table_layout_data(self.table_id, {'active': self.active_name, 'presets': self.presets})
+        self.preset_menu.configure(values=self._preset_names())
+        self.preset_var.set("(за замовчуванням)")
+        self._load_state_into_tree(None)
+
+    def _apply_and_close(self):
+        cfg = self._collect_config()
+        chosen = self.preset_var.get()
+        if chosen != "(за замовчуванням)" and chosen in self.presets:
+            self.presets[chosen] = cfg
+            self.active_name = chosen
+        else:
+            self.active_name = None
+        _save_table_layout_data(self.table_id, {'active': self.active_name, 'presets': self.presets})
+        self.destroy()
+        try:
+            self.on_apply()
+        except Exception as e:
+            log_error("TableLayoutDlg on_apply", e)
+
+
 def mktree(parent, cols, h=8, widths=None):
     # Універсальна таблиця для розділів звітів. Зовнішня рамка + шапка +
     # zebra-рядки дають відчуття повноцінної облікової таблиці у стилі 1С.
@@ -10671,6 +10902,8 @@ class CheckedinFrame(tk.Frame):
         tb=ctk.CTkFrame(self,fg_color=C['card']); tb.pack(fill='x',padx=15,pady=(15,5))
         lbl(tb,"🏨  Заселені гості",18,True).pack(side='left',padx=15,pady=12)
         refresh_btn(tb, self._load, side='left', padx=4, pady=10)
+        if self.user.get('role') in ('admin', 'manager'):
+            btn(tb, "⚙️ Налаштувати таблицю", self._open_layout_dlg, C['card2'], 200, height=30).pack(side='right', padx=10)
 
         flt=ctk.CTkFrame(self,fg_color=C['card']); flt.pack(fill='x',padx=15,pady=3)
         lbl(flt,"Пошук:",11,color=C['text2']).pack(side='left',padx=(10,4),pady=8)
@@ -10678,11 +10911,16 @@ class CheckedinFrame(tk.Frame):
         self.e_srch.pack(side='left',pady=8)
         self.e_srch.bind('<Return>',lambda e:self._load())
 
-        cols=('id','room','guest','phone','cin','cout','n','price','adv','dopla','dep','sплачено','debt')
-        widths=[40,90,175,108,88,88,42,85,70,80,70,85,72]
+        cols=('id','room','guest','phone','cin','cout','n','price','adv','dopla','dep','sплачено','debt',
+              'category','notes','email','booked_at')
+        widths=[40,90,175,108,88,88,42,85,70,80,70,85,72,120,220,160,130]
         ff,self.tree=mktree(self,cols,20,widths)
-        for c,h in zip(cols,['#','Кімн.','Гість','Тел.','Заїзд / час','Виїзд','Діб','Ціна/ніч','Аванс','Доплата','Залог','Сплачено','Борг']):
+        _labels=['#','Кімн.','Гість','Тел.','Заїзд / час','Виїзд','Діб','Ціна/ніч','Аванс','Доплата','Залог','Сплачено','Борг',
+                 'Категорія','Нотатка','Email','Заброньовано']
+        self._all_fields = list(zip(cols, _labels, widths))
+        for c,h in zip(cols,_labels):
             self.tree.heading(c,text=h)
+        apply_table_layout(self.tree, 'checkedin', self._all_fields)
         self.tree.bind('<Double-1>',lambda e:self._open())
 
         # Рядок кнопок пакуємо ПЕРШИМ з side='bottom' — так він завжди
@@ -10704,6 +10942,12 @@ class CheckedinFrame(tk.Frame):
 
         ff.pack(fill='both',expand=True,padx=15,pady=5)
         self._load()
+
+    def _open_layout_dlg(self):
+        TableLayoutDlg(self, 'checkedin', self._all_fields, self._on_layout_applied)
+
+    def _on_layout_applied(self):
+        apply_table_layout(self.tree, 'checkedin', self._all_fields)
 
     def _load(self):
         import threading
@@ -10799,7 +11043,11 @@ class CheckedinFrame(tk.Frame):
                     'vals': (b['id'], b['room_number'], b.get('guest_name', ''),
                              b.get('guest_phone', ''), _cin_display, b['check_out'],
                              nights, f"{price_night:.0f}₴", adv_str, dopla_str, dep_str,
-                             f"{splacheno:.0f}₴", f"{debt:.0f}₴"),
+                             f"{splacheno:.0f}₴", f"{debt:.0f}₴",
+                             (b.get('cat_name') or b.get('room_category') or ''),
+                             (b.get('notes') or '')[:200],
+                             (b.get('guest_email') or b.get('email') or ''),
+                             str(b.get('created_at') or '')[:16]),
                     'debt': debt > 0,
                     'room_number': b['room_number'],
                     'created_at': b.get('created_at'),
@@ -10912,7 +11160,7 @@ class CheckedinFrame(tk.Frame):
                 _hdr_i += 1
                 _date_col, _name_col = hdr_txt
                 self.tree.insert('', 'end', iid=f"__hdr_{_hdr_i}", tags=('shift_header',),
-                                  values=('', _date_col, _name_col, '', '', '', '', '', '', '', '', '', ''))
+                                  values=('', _date_col, _name_col) + ('',) * (len(self._all_fields) - 3))
             for r in grp_rows:
                 self.tree.insert('', 'end', iid=r['vals'][0],
                                   tags=('debt',) if r['debt'] else (),
@@ -11129,11 +11377,12 @@ class CheckedOutFrame(tk.Frame):
         ff, self.tree = mktree(self, cols, 20, widths)
         for c, h in zip(cols, ['#','Кімн.','Гість','Тел.','Заїзд','Виїзд / час','Н','Всього','Аванс','Залог','Оплач.','Борг']):
             self.tree.heading(c, text=h)
-        ff.pack(fill='both', expand=True, padx=15, pady=5)
         self.tree.bind('<Double-1>', lambda e: self._open())
 
-        bot = ctk.CTkFrame(self, fg_color=C['card']); bot.pack(fill='x', padx=15, pady=(0,10))
+        bot = ctk.CTkFrame(self, fg_color=C['card']); bot.pack(side='bottom', fill='x', padx=15, pady=(0,10))
         btn(bot, "📋 Деталі", self._open, C['card2'], 120).pack(side='left', padx=4, pady=8)
+
+        ff.pack(fill='both', expand=True, padx=15, pady=5)
         self._load()
 
     def _load(self):
@@ -11317,21 +11566,31 @@ class BookingsFrame(tk.Frame):
         btn(tb,"➕ Нове",self._new,width=120).pack(side='left',padx=4,pady=10)
         refresh_btn(tb, self._load, side='left', padx=4, pady=10)
         lbl(tb,"Тут тільки підтверджені бронювання",11,color=C['text2']).pack(side='left',padx=12)
+        if self.user.get('role') in ('admin', 'manager'):
+            btn(tb, "⚙️ Налаштувати таблицю", self._open_layout_dlg, C['card2'], 200, height=30).pack(side='right', padx=10)
 
         flt=ctk.CTkFrame(self,fg_color=C['card']); flt.pack(fill='x',padx=15,pady=3)
         lbl(flt,"Пошук:",11,color=C['text2']).pack(side='left',padx=(10,4),pady=8)
         self.e_srch=ent(flt,"Гість або номер кімнати",w=280)
         self.e_srch.pack(side='left',pady=8); self.e_srch.bind('<Return>',lambda e:self._load())
 
-        cols=('id','room','guest','phone','cin','cout','n','total','paid','debt','status')
-        widths=[40,70,180,120,90,90,55,85,85,85,120]
+        cols=('id','room','guest','phone','cin','cout','n','total','paid','debt','status',
+              'category','notes','email','booked_at')
+        widths=[40,70,180,120,90,90,55,85,85,85,120,120,220,160,130]
         ff,self.tree=mktree(self,cols,16,widths)
-        for c,h in zip(cols,['#','Кімн.','Гість','Тел.','Заїзд','Виїзд','Н','Всього','Оплач.','Борг','Статус']):
+        _labels2=['#','Кімн.','Гість','Тел.','Заїзд','Виїзд','Н','Всього','Оплач.','Борг','Статус',
+                  'Категорія','Нотатка','Email','Заброньовано']
+        self._all_fields = list(zip(cols, _labels2, widths))
+        for c,h in zip(cols,_labels2):
             self.tree.heading(c,text=h)
-        ff.pack(fill='both',expand=True,padx=15,pady=5)
+        apply_table_layout(self.tree, 'bookings', self._all_fields)
         self.tree.bind('<Double-1>',lambda e:self._open())
 
-        bot=ctk.CTkFrame(self,fg_color=C['card']); bot.pack(fill='x',padx=15,pady=(0,10))
+        # Рядок кнопок пакуємо ПЕРШИМ з side='bottom' — так він завжди
+        # отримує пріоритет на місце внизу вікна, незалежно від розміру
+        # екрана. Таблицю пакуємо ПІСЛЯ, з fill='both', expand=True —
+        # вона займає весь простір, що лишився, і стискається першою.
+        bot=ctk.CTkFrame(self,fg_color=C['card']); bot.pack(side='bottom',fill='x',padx=15,pady=(0,10))
         _btns2 = [
             ("✅ Заселити",  self._checkin_dlg,           C['green']),
             ("❌ Скасувати", lambda:self._st('cancelled'), C['red']),
@@ -11342,7 +11601,15 @@ class BookingsFrame(tk.Frame):
             _btns2.append(("✏️ Редагувати", self._open, '#9b59b6'))
         for txt,cmd,color in _btns2:
             btn(bot,txt,cmd,color,130).pack(side='left',padx=5,pady=8)
+
+        ff.pack(fill='both',expand=True,padx=15,pady=5)
         self._load()
+
+    def _open_layout_dlg(self):
+        TableLayoutDlg(self, 'bookings', self._all_fields, self._on_layout_applied)
+
+    def _on_layout_applied(self):
+        apply_table_layout(self.tree, 'bookings', self._all_fields)
 
     def _load(self):
         import threading
@@ -11415,7 +11682,11 @@ class BookingsFrame(tk.Frame):
                 rows.append((b['id'], b['room_number'], b.get('guest_name', ''),
                              b.get('guest_phone', ''), b['check_in'], cout_disp,
                              n_disp, f"{total:.0f}₴", f"{paid_ttl:.0f}₴", f"{debt:.0f}₴",
-                             STATUS_UA.get(b['status'], b['status'])))
+                             STATUS_UA.get(b['status'], b['status']),
+                             (b.get('cat_name') or b.get('room_category') or ''),
+                             (b.get('notes') or '')[:200],
+                             (b.get('guest_email') or b.get('email') or ''),
+                             str(b.get('created_at') or '')[:16]))
             self.after(0, lambda: self._apply_bookings_rows(rows))
         except Exception as e:
             log_error("BookingsFrame._load_bg", e)
@@ -18395,7 +18666,7 @@ class ReportsFrame(tk.Frame):
 
         if rt in ('X-звіт','Z-звіт'):
             try:
-                self._show_xz_report(df, rt, get_session_start(), get_current_shift_id(), table_mode=True)
+                self._show_xz_report(df, rt, get_session_start(), get_current_shift_id(), table_mode=True, allow_close=True)
             except Exception as _xz_err:
                 log_error("_show_xz_report", _xz_err)
                 import traceback as _tb
@@ -19351,7 +19622,127 @@ class ReportsFrame(tk.Frame):
 
         self.after(300, self._rebind_report_scroll)
 
-    def _show_xz_report(self, report_date, report_type, shift_start=None, shift_id=None, table_mode=False):
+    def _render_close_shift_ui(self, parent, cash_total, card_total, transfer_total,
+                                 grand_total, tx_count, today, shift_id=None):
+        """Кнопка й логіка реального закриття зміни (перевірка синхронізації,
+        UPDATE shifts, запис у z_reports.json, друк, вікно підсумків).
+        Винесено в окремий метод, щоб працювати однаково і в табличному
+        (table_mode), і в старому картковому вигляді звіту — інакше при
+        переході на table_mode ця кнопка ставала недосяжною (мертвий код),
+        через що зникала можливість закрити зміну."""
+        from app.utils.db import query as db_query
+        already = db_query(
+            "SELECT id FROM payments WHERE method='z_report' AND DATE(created_at)=%s",
+            (today,), fetch='one')
+
+        if already:
+            warn = card(parent); warn.pack(fill='x', padx=5, pady=5)
+            lbl(warn, f"✅  Зміну {today.strftime('%d.%m.%Y')} вже закрито.",
+                13, color=C['green']).pack(padx=15, pady=12)
+            return
+
+        def close_shift():
+            from app.utils.db import query as db_q, get_conn
+            if not messagebox.askyesno("Z-звіт",
+                f"Закрити зміну {today.strftime('%d.%m.%Y')}?\n\n"
+                f"Готівка: {cash_total:.2f}₴\n"
+                f"Картка: {card_total:.2f}₴\n"
+                f"Переказ: {transfer_total:.2f}₴\n"
+                f"Разом: {grand_total:.2f}₴\n\n"
+                "Після закриття каса обнуляється."):
+                return
+
+            # ── ОБОВ'ЯЗКОВА СИНХРОНІЗАЦІЯ перед закриттям зміни ──────
+            pending = _sync_mgr.pending_count()
+            if pending > 0 or not _sync_mgr.is_online():
+                sync_ok = _sync_mgr.on_shift_close(parent_widget=self)
+                if not sync_ok and _sync_mgr.pending_count() > 0:
+                    if not messagebox.askyesno(
+                        "⚠️  Синхронізація не завершена",
+                        f"Не всі дані вивантажено на сервер.\n"
+                        f"Залишилось операцій: {_sync_mgr.pending_count()}\n\n"
+                        "Продовжити закриття зміни?"
+                    ):
+                        return
+                return
+            # Зберегти запис Z-звіту окремо (не в payments — там NOT NULL booking_id)
+            import os, json
+            zdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'data')
+            os.makedirs(zdir, exist_ok=True)
+            zfile = os.path.join(zdir, 'z_reports.json')
+            try:
+                with open(zfile) as f_: zlog = json.load(f_)
+            except Exception:
+                zlog = []
+            import datetime as _dt
+            zlog.append({
+                'date': str(today),
+                'closed_at': _dt.datetime.now().strftime('%d.%m.%Y %H:%M:%S'),
+                'cash': cash_total,
+                'card': card_total,
+                'total': grand_total,
+                'tx': tx_count,
+            })
+            with open(zfile, 'w') as f_: json.dump(zlog, f_, ensure_ascii=False, indent=2)
+
+            # Закрити зміну в БД (статус → closed)
+            try:
+                from app.utils.db import get_conn as _gc_z
+                with _gc_z() as _conn_z:
+                    with _conn_z.cursor() as _cur_z:
+                        _cur_z.execute(
+                            "UPDATE shifts SET closed_at=NOW(), status='closed' "
+                            "WHERE status='open'"
+                        )
+                        _rows_updated = _cur_z.rowcount
+                    _conn_z.commit()
+                print(f"[Z-звіт] Зміну закрито в БД, оновлено рядків: {_rows_updated}")
+            except Exception as _e:
+                print(f"[Z-звіт] Помилка закриття зміни в БД: {_e}")
+                messagebox.showerror(
+                    "Помилка закриття зміни",
+                    f"Не вдалося закрити зміну в БД:\n{_e}\n\n"
+                    "Зверніться до адміністратора."
+                )
+                return
+
+            # Очистити shift_id в session.json — НЕ створювати нову зміну тут.
+            try:
+                import os as _os_z, json as _json_z
+                _sfile_z = _os_z.path.join(get_data_dir(), 'session.json')
+                try:
+                    with open(_sfile_z, encoding='utf-8') as _f_z:
+                        _sess_z = _json_z.load(_f_z)
+                except Exception:
+                    _sess_z = {}
+                _sess_z.pop('shift_id', None)
+                _sess_z.pop('login_dt', None)
+                with open(_sfile_z, 'w', encoding='utf-8') as _f_z:
+                    _json_z.dump(_sess_z, _f_z, ensure_ascii=False, indent=2)
+            except Exception as _se:
+                print(f"[Z-звіт] session clear error: {_se}")
+
+            try:
+                self._do_print_report_fn()
+            except Exception as _epr:
+                log_error("close_shift: друк звіту", _epr)
+
+            # Сховати головне вікно — обов'язковий релогін
+            try:
+                self.winfo_toplevel().withdraw()
+            except Exception:
+                pass
+
+            # Показати вікно підсумків зміни (блокує до релогіну)
+            ShiftClosedDlg(self, today, cash_total, card_total, transfer_total, grand_total, tx_count)
+
+        act = ctk.CTkFrame(parent, fg_color='transparent'); act.pack(fill='x', padx=5, pady=8)
+        btn(act, "🔴  Закрити зміну", close_shift, C['red'], 180).pack(side='left', padx=4)
+        warn = card(parent); warn.pack(fill='x', padx=5, pady=5)
+        lbl(warn, "⚠️  Натисніть 'Закрити зміну' — каса обнулиться за цю зміну.",
+            12, color=C['yellow']).pack(padx=15, pady=12)
+
+    def _show_xz_report(self, report_date, report_type, shift_start=None, shift_id=None, table_mode=False, allow_close=False):
         from app.utils.db import query
         is_z = report_type == 'Z-звіт'
         today = report_date
@@ -20258,6 +20649,11 @@ class ReportsFrame(tk.Frame):
             btn(btns_row, "📊 Excel цієї зміни", _do_export_shift_table_excel, '#27ae60', 170).pack(side='left', padx=4)
 
             ff_sh.pack(fill='both', expand=True, padx=10, pady=(0,10))
+
+            if allow_close and is_z:
+                self._render_close_shift_ui(self.result, cash_total, card_total, transfer_total,
+                                             grand_total, tx_count, today, shift_id)
+
             return
 
         # Початковий залишок зміни
