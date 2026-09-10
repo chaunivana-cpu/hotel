@@ -6395,6 +6395,14 @@ class DashboardFrame(tk.Frame):
             # ── Беремо дані З КАСИ по shift_id — завжди свіжий ID з БД ──
             shift_paid = 0.0
             shift_dep  = 0.0
+            # Ці три завжди визначені заздалегідь: раніше вони встановлювались
+            # лише всередині "if _sid:" (коли є відкрита зміна) або в except —
+            # якщо відкритої зміни немає І винятку не сталось, змінні взагалі
+            # не існували, і рендер дашборду падав з
+            # "cannot access free variable 'shift_card'" (саме це видно в логах).
+            shift_dep_returned = 0.0
+            shift_card = 0.0
+            shift_transfer = 0.0
             try:
                 if _shared_conn is None:
                     raise RuntimeError("Немає з'єднання з БД")
@@ -25629,45 +25637,6 @@ class SettingsFrame(tk.Frame):
         # у Налаштування.
         self._refresh_cloud_status_labels()
 
-    def _refresh_cloud_status_labels(self):
-        """Оновлює написи 'Востаннє оновлено в хмарі' та 'Зараз працює: ...'.
-        Викликається одразу при побудові вкладки і далі сама себе перезапускає
-        кожні 30с (поки вкладка відкрита), щоб автоматичний фоновий синк
-        (раз на 6 год) було видно без перезаходу в Налаштування."""
-        try:
-            if not (hasattr(self, 'cloud_info') and self.cloud_info.winfo_exists()):
-                return
-        except Exception:
-            return
-        try:
-            from app.utils.db import get_cloud_sync_status as _get_cloud_sync_status
-            _cs = _get_cloud_sync_status()
-            if _cs and _cs.get('last_sync'):
-                _cs_res = _cs.get('result') or {}
-                self.cloud_info.configure(
-                    text=f"🕒 Востаннє оновлено в хмарі: {_cs['last_sync']}  ("
-                         + ", ".join(f"{k}={v}" for k, v in _cs_res.items()) + ")",
-                    text_color=C['text2'])
-            else:
-                self.cloud_info.configure(
-                    text="🕒 Ще не було синхронізації довідників у хмару",
-                    text_color=C['yellow'])
-        except Exception:
-            pass
-        try:
-            from app.utils.db import get_backend_status as _get_backend_status
-            _bst = _get_backend_status()
-            if _bst.get('backend') == 'main':
-                self.cloud_backend_lbl.configure(text="🟢 Зараз працює: основний сервер", text_color=C['green'])
-            else:
-                self.cloud_backend_lbl.configure(text="🟠 Зараз працює: ХМАРА (основний недоступний)", text_color=C['yellow'])
-        except Exception:
-            pass
-        try:
-            self.after(30000, self._refresh_cloud_status_labels)
-        except Exception:
-            pass
-
         # ── Локальна SQLite база (кеш) ────────────────────────────────────
         lc = card(scroll); lc.pack(fill='x', padx=10, pady=(0,10))
         lbl(lc, "💾  Локальна база даних (SQLite кеш)", 14, True).pack(anchor='w', padx=12, pady=(12,6))
@@ -25842,6 +25811,45 @@ class SettingsFrame(tk.Frame):
 
         cl_bf = tk.Frame(cl, bg=C['card']); cl_bf.pack(fill='x', padx=12, pady=(4,12))
         btn(cl_bf, "🧹 Очистити тестові дані", _do_cleanup, '#8B0000', 220).pack(side='left')
+
+    def _refresh_cloud_status_labels(self):
+        """Оновлює написи 'Востаннє оновлено в хмарі' та 'Зараз працює: ...'.
+        Викликається одразу при побудові вкладки і далі сама себе перезапускає
+        кожні 30с (поки вкладка відкрита), щоб автоматичний фоновий синк
+        (раз на 6 год) було видно без перезаходу в Налаштування."""
+        try:
+            if not (hasattr(self, 'cloud_info') and self.cloud_info.winfo_exists()):
+                return
+        except Exception:
+            return
+        try:
+            from app.utils.db import get_cloud_sync_status as _get_cloud_sync_status
+            _cs = _get_cloud_sync_status()
+            if _cs and _cs.get('last_sync'):
+                _cs_res = _cs.get('result') or {}
+                self.cloud_info.configure(
+                    text=f"🕒 Востаннє оновлено в хмарі: {_cs['last_sync']}  ("
+                         + ", ".join(f"{k}={v}" for k, v in _cs_res.items()) + ")",
+                    text_color=C['text2'])
+            else:
+                self.cloud_info.configure(
+                    text="🕒 Ще не було синхронізації довідників у хмару",
+                    text_color=C['yellow'])
+        except Exception:
+            pass
+        try:
+            from app.utils.db import get_backend_status as _get_backend_status
+            _bst = _get_backend_status()
+            if _bst.get('backend') == 'main':
+                self.cloud_backend_lbl.configure(text="🟢 Зараз працює: основний сервер", text_color=C['green'])
+            else:
+                self.cloud_backend_lbl.configure(text="🟠 Зараз працює: ХМАРА (основний недоступний)", text_color=C['yellow'])
+        except Exception:
+            pass
+        try:
+            self.after(30000, self._refresh_cloud_status_labels)
+        except Exception:
+            pass
 
     def _load_cfg(self):
         try:
