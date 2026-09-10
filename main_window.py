@@ -1230,14 +1230,18 @@ def _ensure_restaurant_payments_col():
     except Exception:
         pass  # вже nullable або не підтримується
 
-def get_session_start():
+def get_session_start(shift_id=None):
     """Повертає datetime початку поточної зміни або None.
     Читає opened_at з БД щоб .exe і Python показували однаковий час зміни.
+    Якщо shift_id вже відомий викликачу (наприклад, дашборд вже отримав
+    його для інших цілей) — приймаємо його напряму й НЕ робимо ще один
+    окремий запит до get_current_shift_id() (зайве з'єднання з БД).
     """
     import os, json, datetime as _dt
     try:
         from app.utils.db import query
-        shift_id = get_current_shift_id()
+        if shift_id is None:
+            shift_id = get_current_shift_id()
         if shift_id:
             row = query("SELECT opened_at FROM shifts WHERE id=%s", (shift_id,), fetch='one')
             if row and row.get('opened_at'):
@@ -1266,14 +1270,17 @@ def get_session_start():
         pass
     return None
 
-def get_session_owner():
+def get_session_owner(shift_id=None):
     """Повертає ім'я користувача, який ВІДКРИВ поточну зміну (з таблиці shifts).
     Потрібно окремо від get_session_start(), бо людина, що зараз залогінена
     (наприклад адмін, що зайшов подивитись), і людина, чия зміна фактично
-    активна — це не завжди одна й та сама особа."""
+    активна — це не завжди одна й та сама особа.
+    Приймає опційний вже відомий shift_id, щоб не робити ще один окремий
+    запит до get_current_shift_id()."""
     try:
         from app.utils.db import query
-        shift_id = get_current_shift_id()
+        if shift_id is None:
+            shift_id = get_current_shift_id()
         if shift_id:
             row = query("SELECT username FROM shifts WHERE id=%s", (shift_id,), fetch='one')
             if row and row.get('username'):
@@ -2622,6 +2629,108 @@ def _save_pos_settings():
 _load_pos_settings()
 
 
+def _send_raw_bytes_via_powershell(printer_name, data_bytes):
+    """Відправляє сирі байти (ESC/POS) напряму на принтер через PowerShell —
+    без pywin32. Використовує ті самі Windows API winspool.drv
+    (OpenPrinter/StartDocPrinter/WritePrinter), що й win32print, але викликає
+    їх через .NET P/Invoke з PowerShell (він завжди є в Windows), тож не
+    потребує додавання pywin32 у збірку EXE і не вимагає її пересборки."""
+    import subprocess, tempfile, os
+
+    data_path = None
+    ps1_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.bin') as tf:
+            tf.write(data_bytes)
+            data_path = tf.name
+
+        cs_code = r"""
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+public class RawPrinterHelper {
+    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Ansi)]
+    public class DOCINFOA {
+        [MarshalAs(UnmanagedType.LPStr)] public string pDocName;
+        [MarshalAs(UnmanagedType.LPStr)] public string pOutputFile;
+        [MarshalAs(UnmanagedType.LPStr)] public string pDataType;
+    }
+    [DllImport("winspool.Drv", EntryPoint="OpenPrinterA", SetLastError=true, CharSet=CharSet.Ansi, ExactSpelling=true, CallingConvention=CallingConvention.StdCall)]
+    public static extern bool OpenPrinter(string szPrinter, out IntPtr hPrinter, IntPtr pd);
+    [DllImport("winspool.Drv", EntryPoint="ClosePrinter", SetLastError=true, ExactSpelling=true, CallingConvention=CallingConvention.StdCall)]
+    public static extern bool ClosePrinter(IntPtr hPrinter);
+    [DllImport("winspool.Drv", EntryPoint="StartDocPrinterA", SetLastError=true, CharSet=CharSet.Ansi, ExactSpelling=true, CallingConvention=CallingConvention.StdCall)]
+    public static extern bool StartDocPrinter(IntPtr hPrinter, int level, [In, MarshalAs(UnmanagedType.LPStruct)] DOCINFOA di);
+    [DllImport("winspool.Drv", EntryPoint="EndDocPrinter", SetLastError=true, ExactSpelling=true, CallingConvention=CallingConvention.StdCall)]
+    public static extern bool EndDocPrinter(IntPtr hPrinter);
+    [DllImport("winspool.Drv", EntryPoint="StartPagePrinter", SetLastError=true, ExactSpelling=true, CallingConvention=CallingConvention.StdCall)]
+    public static extern bool StartPagePrinter(IntPtr hPrinter);
+    [DllImport("winspool.Drv", EntryPoint="EndPagePrinter", SetLastError=true, ExactSpelling=true, CallingConvention=CallingConvention.StdCall)]
+    public static extern bool EndPagePrinter(IntPtr hPrinter);
+    [DllImport("winspool.Drv", EntryPoint="WritePrinter", SetLastError=true, ExactSpelling=true, CallingConvention=CallingConvention.StdCall)]
+    public static extern bool WritePrinter(IntPtr hPrinter, IntPtr pBytes, int dwCount, out int dwWritten);
+    public static bool SendBytesToPrinter(string szPrinterName, byte[] pBytes) {
+        IntPtr hPrinter;
+        DOCINFOA di = new DOCINFOA();
+        di.pDocName = "Hotel Receipt";
+        di.pDataType = "RAW";
+        bool ok = false;
+        if (OpenPrinter(szPrinterName, out hPrinter, IntPtr.Zero)) {
+            if (StartDocPrinter(hPrinter, 1, di)) {
+                if (StartPagePrinter(hPrinter)) {
+                    IntPtr pUnmanaged = Marshal.AllocCoTaskMem(pBytes.Length);
+                    Marshal.Copy(pBytes, 0, pUnmanaged, pBytes.Length);
+                    int written;
+                    ok = WritePrinter(hPrinter, pUnmanaged, pBytes.Length, out written);
+                    Marshal.FreeCoTaskMem(pUnmanaged);
+                    EndPagePrinter(hPrinter);
+                }
+                EndDocPrinter(hPrinter);
+            }
+            ClosePrinter(hPrinter);
+        }
+        return ok;
+    }
+    public static bool SendFileToPrinter(string szPrinterName, string szFileName) {
+        byte[] bytes = File.ReadAllBytes(szFileName);
+        return SendBytesToPrinter(szPrinterName, bytes);
+    }
+}
+"""
+        pname_esc = printer_name.replace("'", "''")
+        dpath_esc = data_path.replace("'", "''")
+
+        ps_script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            "$code = @'\n" + cs_code + "\n'@\n"
+            "Add-Type -TypeDefinition $code -Language CSharp\n"
+            f"$ok = [RawPrinterHelper]::SendFileToPrinter('{pname_esc}', '{dpath_esc}')\n"
+            "if ($ok) { Write-Output 'PRINT_OK' } else { Write-Output 'PRINT_FAIL' }\n"
+        )
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.ps1', mode='w', encoding='utf-8') as pf:
+            pf.write(ps_script)
+            ps1_path = pf.name
+
+        r = subprocess.run(
+            ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps1_path],
+            capture_output=True, timeout=20
+        )
+        out = (r.stdout or b'').decode('utf-8', errors='replace')
+        err = (r.stderr or b'').decode('cp1251', errors='replace')
+
+        if 'PRINT_OK' in out:
+            return True
+        raise RuntimeError(f"PowerShell RAW-друк не вдався (код {r.returncode}).\n{err or out}")
+    finally:
+        for _p in (data_path, ps1_path):
+            if _p:
+                try:
+                    os.remove(_p)
+                except Exception:
+                    pass
+
+
 def _print_pos(text):
     """Відправити текст на POS термо-принтер."""
     import subprocess, os, tempfile
@@ -2639,57 +2748,149 @@ def _print_pos(text):
     typ = _POS_SETTINGS.get('type','serial')
 
     if typ == 'usb_raw':
-        # Windows: пряме відправлення на USB принтер через ім'я
+        # Epson TM-T20II / ESC-POS через Windows.
+        # Друкуємо як растрове зображення шириною 576 dots (80-мм рулон),
+        # щоб Windows-драйвер не стискав текст до вузької області.
         port = _POS_SETTINGS.get('port','USB001')
-        try:
-            import win32print
-            h = win32print.OpenPrinter(port)
-            try:
-                j = win32print.StartDocPrinter(h, 1, ("Receipt", None, "RAW"))
-                win32print.StartPagePrinter(h)
-                win32print.WritePrinter(h, INIT + lines + b'\n\n\n' + CUT)
-                win32print.EndPagePrinter(h)
-                win32print.EndDocPrinter(h)
-            finally:
-                win32print.ClosePrinter(h)
-            return True
-        except ImportError:
-            # У EXE часто немає pywin32. Старий fallback `copy /b ... "Ім'я принтера"`
-            # НЕ друкує у чергу Windows, бо ім'я принтера не є LPT/USB-портом.
-            # Використовуємо штатний Windows Spooler через PowerShell Out-Printer.
-            # Тут передаємо саме текст, без ESC/POS RAW-команд, щоб драйвер Epson
-            # сам сформував сторінку/чек.
-            tmp = tempfile.mktemp(suffix='.txt')
-            try:
-                with open(tmp, 'w', encoding='utf-8', newline='') as f:
-                    f.write(text)
 
-                _ps_path = tmp.replace("'", "''")
-                _ps_name = str(port).replace("'", "''")
-                ps = (
-                    f"$ErrorActionPreference='Stop'; "
-                    f"Get-Content -Encoding UTF8 -Path '{_ps_path}' | "
-                    f"Out-Printer -Name '{_ps_name}'"
+        def _escpos_raster_print(printer_name, receipt_text):
+            try:
+                from PIL import Image, ImageDraw, ImageFont
+            except ImportError as e:
+                raise RuntimeError(
+                    "Для друку Epson потрібен Pillow (PIL). "
+                    "Додайте Pillow у збірку EXE."
+                ) from e
+
+            import os as _os_rp
+            import tempfile as _tmp_rp
+
+            WIDTH = 576       # Epson TM-T20II: 80 мм / 203 dpi
+            SIDE = 8
+            TEXT_W = WIDTH - SIDE * 2
+
+            # Windows fonts — Arial має українські символи.
+            font_candidates = [
+                r"C:\Windows\Fonts\arial.ttf",
+                r"C:\Windows\Fonts\segoeui.ttf",
+                r"C:\Windows\Fonts\tahoma.ttf",
+            ]
+            font_path = next((p for p in font_candidates if _os_rp.path.exists(p)), None)
+            if not font_path:
+                raise RuntimeError("Не знайдено системний шрифт Arial/Segoe UI/Tahoma")
+
+            # Розмір підбираємо по найдовшому рядку, щоб чек використовував
+            # майже всю ширину, але довгі рядки не обрізались.
+            raw_lines = str(receipt_text).replace('\r\n','\n').replace('\r','\n').split('\n')
+            raw_lines = raw_lines if raw_lines else ['']
+            longest = max((len(x) for x in raw_lines), default=1)
+
+            base_size = 27
+            if longest > 46:
+                base_size = 19
+            elif longest > 40:
+                base_size = 21
+            elif longest > 34:
+                base_size = 23
+            elif longest > 28:
+                base_size = 25
+
+            font = ImageFont.truetype(font_path, base_size)
+
+            # Висота рядка.
+            bbox = font.getbbox("AgЙї")
+            line_h = max(30, bbox[3] - bbox[1] + 8)
+            top = 10
+            bottom = 18
+            img_h = top + len(raw_lines) * line_h + bottom
+
+            img = Image.new("1", (WIDTH, img_h), 1)
+            draw = ImageDraw.Draw(img)
+
+            for idx, line in enumerate(raw_lines):
+                y = top + idx * line_h
+
+                # Центрування тільки для рядків, які явно були центровані
+                # старим ESC/POS форматуванням або виглядають як заголовок.
+                clean = line.strip()
+                fnt = font
+
+                # Для дуже довгих рядків автоматично зменшуємо шрифт.
+                while fnt.size > 16 and draw.textbbox((0,0), line, font=fnt)[2] > TEXT_W:
+                    fnt = ImageFont.truetype(font_path, fnt.size - 1)
+
+                tw = draw.textbbox((0,0), line, font=fnt)[2]
+                if clean and (line.startswith("  ") or len(clean) < 26):
+                    x = max(SIDE, (WIDTH - tw) // 2)
+                else:
+                    x = SIDE
+
+                draw.text((x, y), line, font=fnt, fill=0)
+
+            # ESC/POS GS v 0 raster image — розбиваємо на горизонтальні
+            # смуги (band). Якщо надіслати все зображення однією командою
+            # GS v 0, для довгого звіту (багато рядків → велика висота) це
+            # переповнює внутрішній буфер термопринтера, і замість картинки
+            # друкується "сміття" — саме це й сталось із "Відомістю по зміні",
+            # тоді як короткий тест (мала висота) вкладався в буфер і друкувався
+            # нормально. Кожна смуга висотою BAND_H шлеться окремою командою.
+            pixels = img.load()
+            width_bytes = (WIDTH + 7) // 8
+            height = img_h
+            BAND_H = 200  # безпечна висота однієї смуги в точках
+
+            ESC = b'\x1b'
+            GS = b'\x1d'
+            INIT = ESC + b'@'
+            cmd = bytearray(INIT)
+
+            for y0 in range(0, height, BAND_H):
+                band_h = min(BAND_H, height - y0)
+                band = bytearray()
+                for yy in range(y0, y0 + band_h):
+                    for xb in range(width_bytes):
+                        b = 0
+                        for bit in range(8):
+                            xx = xb * 8 + bit
+                            if xx < WIDTH and pixels[xx, yy] == 0:
+                                b |= (0x80 >> bit)
+                        band.append(b)
+                cmd += (
+                    GS + b'v' + b'0' + b'\x00' +
+                    bytes((width_bytes & 0xff, (width_bytes >> 8) & 0xff,
+                           band_h & 0xff, (band_h >> 8) & 0xff)) +
+                    bytes(band)
                 )
 
-                r = subprocess.run(
-                    ['powershell', '-WindowStyle', 'Hidden', '-NoProfile',
-                     '-Command', ps],
-                    timeout=20, capture_output=True
-                )
+            cmd += b'\n\n\n' + GS + b'V' + b'\x41\x03'
+            cmd = bytes(cmd)
 
-                if r.returncode != 0:
-                    err = r.stderr.decode('utf-8', errors='replace').strip()
-                    raise RuntimeError(
-                        f"Windows не зміг надрукувати на «{port}»"
-                        + (f": {err[:300]}" if err else "")
-                    )
-                return True
-            finally:
+            # Спочатку нормальний RAW-друк через Windows Spooler.
+            try:
+                import win32print
+                h = win32print.OpenPrinter(printer_name)
                 try:
-                    os.unlink(tmp)
-                except Exception:
-                    pass
+                    job = win32print.StartDocPrinter(
+                        h, 1, ("Hotel Receipt", None, "RAW")
+                    )
+                    try:
+                        win32print.StartPagePrinter(h)
+                        try:
+                            win32print.WritePrinter(h, cmd)
+                        finally:
+                            win32print.EndPagePrinter(h)
+                    finally:
+                        win32print.EndDocPrinter(h)
+                finally:
+                    win32print.ClosePrinter(h)
+                return True
+            except ImportError:
+                # pywin32 відсутній у збірці — RAW через звичайний Out-Printer
+                # не підходить (він змінює масштаб), тому шлемо ті самі байти
+                # через PowerShell (winspool.drv напряму), без пересборки EXE.
+                return _send_raw_bytes_via_powershell(printer_name, bytes(cmd))
+
+        return _escpos_raster_print(port, text)
 
     elif typ == 'serial':
         import serial as _serial
@@ -6168,8 +6369,15 @@ class DashboardFrame(tk.Frame):
             except Exception as _sync_err:
                 log_error("Dashboard: помилка синхронізації статусів", _sync_err)
 
-            shift_start_dt = get_session_start()
-            shift_owner = get_session_owner()
+            # shift_id рахуємо ОДИН раз тут і передаємо далі (в get_session_start,
+            # get_session_owner і в блок каси нижче) — раніше кожна з цих трьох
+            # ділянок окремо викликала get_current_shift_id(), а він сам робить
+            # запит(и) до БД. Тобто на кожне оновлення дашборду відкривалось
+            # 4-6 зайвих окремих з'єднань з БД тільки заради цього ID — саме
+            # це й накопичувало випадкову затримку та провокувало хибний тайм-аут.
+            _sid = get_current_shift_id()
+            shift_start_dt = get_session_start(_sid)
+            shift_owner = get_session_owner(_sid)
             import datetime as _dt2
             if shift_start_dt:
                 if shift_start_dt.date() == _dt2.date.today():
@@ -6190,14 +6398,7 @@ class DashboardFrame(tk.Frame):
             try:
                 if _shared_conn is None:
                     raise RuntimeError("Немає з'єднання з БД")
-                # Завжди беремо найновіший відкритий shift_id напряму з БД
-                _sid = None
-                try:
-                    from app.utils.db import query as _qd
-                    _sr = _qd("SELECT id FROM shifts WHERE status='open' ORDER BY id DESC LIMIT 1", fetch='one')
-                    _sid = _sr.get('id') if _sr else None
-                except Exception:
-                    _sid = get_current_shift_id()
+                # shift_id вже обчислено вище (один раз на все оновлення дашборду)
                 if _sid:
                     if True:
                         with _shared_conn.cursor() as _cur2:
@@ -8300,6 +8501,39 @@ class RoomsFrame(tk.Frame):
         btn(bf,"✖ Скасувати",win.destroy,C['red'],140,height=42).pack(side='left',padx=5)
 
 
+DOCUMENT_TYPES = ["Паспорт", "Військовий квиток", "Водійське посвідчення"]
+
+def _parse_doc_info(passport_text):
+    """Розбирає збережений текст документа на (тип, серія, номер).
+    Формат для паспорта (стандартний, як і раніше) — просто 'СЕРІЯ НОМЕР'.
+    Для інших типів — з префіксом 'Тип: СЕРІЯ НОМЕР', щоб не ламати старі
+    звіти/регулярки, які шукають рядок після 'Паспорт: '."""
+    t = (passport_text or '').strip()
+    doc_type = 'Паспорт'
+    for _dt in ("Військовий квиток", "Водійське посвідчення"):
+        if t.startswith(_dt + ':'):
+            doc_type = _dt
+            t = t.split(':', 1)[1].strip()
+            break
+    parts = t.split(None, 1)
+    series = parts[0] if parts else ''
+    number = parts[1] if len(parts) > 1 else ''
+    return doc_type, series, number
+
+def _format_doc_info(doc_type, series, number):
+    """Збирає (тип, серія, номер) назад у текст для збереження в notes.
+    Якщо тип — 'Паспорт' (типовий), формат лишається як і раніше
+    ('СЕРІЯ НОМЕР'), щоб не зламати сумісність з існуючими звітами."""
+    series = (series or '').strip()
+    number = (number or '').strip()
+    if not series and not number:
+        return ''
+    body = f"{series} {number}".strip()
+    if doc_type and doc_type != 'Паспорт':
+        return f"{doc_type}: {body}"
+    return body
+
+
 def _attach_guest_autocomplete(e_name, e_phone=None, e_series=None, e_pnum=None, parent_win=None):
     _popup = [None]
 
@@ -8753,10 +8987,14 @@ def _open_checkin_existing(parent, b, room, on_save=None):
     e_phone = ent(gf, "+380...", w=200); e_phone.grid(row=1,column=1,padx=8,pady=3,sticky='w')
     if _phone_val:
         e_phone.delete(0,'end'); e_phone.insert(0, _phone_val)
-    lbl(gf, "Серія паспорта:", 11, color=C['text2']).grid(row=2,column=0,sticky='w',pady=3)
-    e_series = ent(gf, "АА", w=100); e_series.grid(row=2,column=1,padx=8,pady=3,sticky='w')
-    lbl(gf, "Номер паспорта:", 11, color=C['text2']).grid(row=3,column=0,sticky='w',pady=3)
-    e_pnum  = ent(gf, "123456", w=160); e_pnum.grid(row=3,column=1,padx=8,pady=3,sticky='w')
+    lbl(gf, "Тип документа:", 11, color=C['text2']).grid(row=2,column=0,sticky='w',pady=3)
+    doc_type_var = ctk.StringVar(value='Паспорт')
+    ctk.CTkOptionMenu(gf, values=DOCUMENT_TYPES, variable=doc_type_var, width=200
+                       ).grid(row=2,column=1,padx=8,pady=3,sticky='w')
+    lbl(gf, "Серія:", 11, color=C['text2']).grid(row=3,column=0,sticky='w',pady=3)
+    e_series = ent(gf, "АА", w=100); e_series.grid(row=3,column=1,padx=8,pady=3,sticky='w')
+    lbl(gf, "Номер:", 11, color=C['text2']).grid(row=4,column=0,sticky='w',pady=3)
+    e_pnum  = ent(gf, "123456", w=160); e_pnum.grid(row=4,column=1,padx=8,pady=3,sticky='w')
     _attach_guest_autocomplete(e_name, e_phone, e_series, e_pnum)
 
     # Аванс при бронюванні (вже сплачений)
@@ -8882,7 +9120,7 @@ def _open_checkin_existing(parent, b, room, on_save=None):
     def do_checkin():
         pseries = e_series.get().strip()
         pnum    = e_pnum.get().strip()
-        passport_info = f"{pseries} {pnum}".strip()
+        passport_info = _format_doc_info(doc_type_var.get(), pseries, pnum)
         try: dep = float(e_dep.get() or 0)
         except: dep = 0.0
 
@@ -9492,10 +9730,14 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
     e_name = ent(gf, "Іванов Іван", w=300); e_name.grid(row=0,column=1,padx=8,pady=3)
     lbl(gf,"Телефон:",11,color=C['text2']).grid(row=1,column=0,sticky='w',pady=3)
     e_phone = ent(gf, "+380...", w=300); e_phone.grid(row=1,column=1,padx=8,pady=3)
-    lbl(gf,"Серія паспорта:",11,color=C['text2']).grid(row=2,column=0,sticky='w',pady=3)
-    e_pass_series = ent(gf, "АА", w=120); e_pass_series.grid(row=2,column=1,padx=8,pady=3,sticky='w')
-    lbl(gf,"Номер паспорта:",11,color=C['text2']).grid(row=3,column=0,sticky='w',pady=3)
-    e_pass_num = ent(gf, "123456", w=180); e_pass_num.grid(row=3,column=1,padx=8,pady=3,sticky='w')
+    lbl(gf,"Тип документа:",11,color=C['text2']).grid(row=2,column=0,sticky='w',pady=3)
+    doc_type_var = ctk.StringVar(value='Паспорт')
+    ctk.CTkOptionMenu(gf, values=DOCUMENT_TYPES, variable=doc_type_var, width=220
+                       ).grid(row=2,column=1,padx=8,pady=3,sticky='w')
+    lbl(gf,"Серія:",11,color=C['text2']).grid(row=3,column=0,sticky='w',pady=3)
+    e_pass_series = ent(gf, "АА", w=120); e_pass_series.grid(row=3,column=1,padx=8,pady=3,sticky='w')
+    lbl(gf,"Номер:",11,color=C['text2']).grid(row=4,column=0,sticky='w',pady=3)
+    e_pass_num = ent(gf, "123456", w=180); e_pass_num.grid(row=4,column=1,padx=8,pady=3,sticky='w')
 
     _attach_guest_autocomplete(e_name, e_phone, e_pass_series, e_pass_num)
     # Дати
@@ -9761,7 +10003,7 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
             messagebox.showerror("", "Вкажіть коментар (причину) знижки"); return
 
         # Створити/знайти гостя
-        passport_info = f"{pseries} {pnum}".strip()
+        passport_info = _format_doc_info(doc_type_var.get(), pseries, pnum)
         g = query("SELECT id FROM guests WHERE phone=%s", (phone,), fetch='one')
         if g:
             gid = g['id']
@@ -11872,10 +12114,14 @@ class BookingsFrame(tk.Frame):
         pc = card(sc); pc.pack(fill='x',padx=12,pady=5)
         lbl(pc,"🪪  Документ гостя",13,True).pack(anchor='w',padx=12,pady=(10,5))
         pf = tk.Frame(pc, bg=C['card']); pf.pack(fill='x',padx=12,pady=(0,10))
-        lbl(pf,"Серія:",11,color=C['text2']).grid(row=0,column=0,sticky='w',pady=3)
-        e_series = ent(pf,"АА",w=90); e_series.grid(row=0,column=1,padx=8,pady=3,sticky='w')
-        lbl(pf,"Номер:",11,color=C['text2']).grid(row=1,column=0,sticky='w',pady=3)
-        e_pnum = ent(pf,"123456",w=140); e_pnum.grid(row=1,column=1,padx=8,pady=3,sticky='w')
+        lbl(pf,"Тип документа:",11,color=C['text2']).grid(row=0,column=0,sticky='w',pady=3)
+        doc_type_var = ctk.StringVar(value='Паспорт')
+        ctk.CTkOptionMenu(pf, values=DOCUMENT_TYPES, variable=doc_type_var, width=220
+                           ).grid(row=0,column=1,padx=8,pady=3,sticky='w')
+        lbl(pf,"Серія:",11,color=C['text2']).grid(row=1,column=0,sticky='w',pady=3)
+        e_series = ent(pf,"АА",w=90); e_series.grid(row=1,column=1,padx=8,pady=3,sticky='w')
+        lbl(pf,"Номер:",11,color=C['text2']).grid(row=2,column=0,sticky='w',pady=3)
+        e_pnum = ent(pf,"123456",w=140); e_pnum.grid(row=2,column=1,padx=8,pady=3,sticky='w')
 
         # Оплата
         oc = card(sc); oc.pack(fill='x',padx=12,pady=5)
@@ -11946,7 +12192,7 @@ class BookingsFrame(tk.Frame):
         def do_checkin():
             try: dep = float(e_dep.get() or 0)
             except: dep = 0.0
-            passport_info = f"{e_series.get().strip()} {e_pnum.get().strip()}".strip()
+            passport_info = _format_doc_info(doc_type_var.get(), e_series.get().strip(), e_pnum.get().strip())
             total_with_dep = room_total + dep
 
             # Зберегти паспорт у нотатки
@@ -13050,6 +13296,13 @@ class BookingDetailDlg(ctk.CTkToplevel):
         # віднімання знижки при повторному редагуванні).
         _m_disc_edit = _re_ci_edit.search(r'Знижка:\s*([\d.,]+)\s*₴\s*\(([^)]*)\)', _notes_raw0)
         _prior_discount = float(_m_disc_edit.group(1).replace(',', '.')) if _m_disc_edit else 0.0
+        # Документ гостя (паспорт/військовий квиток/посвідчення) — раніше
+        # зберігався в нотатках, але поля для нього тут не було, тому при
+        # редагуванні бронювання їх не було видно і не можна було змінити.
+        _m_pass_edit = _re_ci_edit.search(
+            r'Паспорт:\s*(.*?)(?=\n|\s{2,}(?:Знижка:|Фактичне заселення:)|\Z)', _notes_raw0)
+        _pass_str_default = _m_pass_edit.group(1).strip() if _m_pass_edit else ''
+        _doc_type_default, _series_default, _number_default = _parse_doc_info(_pass_str_default)
 
         ci_card = card(sc); ci_card.pack(fill='x', padx=12, pady=5)
         lbl(ci_card, "🕒  Фактичне заселення", 13, True).pack(anchor='w', padx=12, pady=(10,5))
@@ -13070,6 +13323,21 @@ class BookingDetailDlg(ctk.CTkToplevel):
         lbl(gf,"Телефон:",11,color=C['text2']).grid(row=1,column=0,sticky='w',pady=3)
         e_phone = ent(gf, w=230); e_phone.grid(row=1,column=1,padx=8,pady=3,sticky='w')
         e_phone.insert(0, str(_phone))
+
+        # Документ гостя
+        doc_card = card(sc); doc_card.pack(fill='x', padx=12, pady=5)
+        lbl(doc_card, "🪪  Документ гостя", 13, True).pack(anchor='w', padx=12, pady=(10,5))
+        docf = tk.Frame(doc_card, bg=C['card']); docf.pack(fill='x', padx=12, pady=(0,10))
+        lbl(docf,"Тип документа:",11,color=C['text2']).grid(row=0,column=0,sticky='w',pady=3)
+        doc_type_var = ctk.StringVar(value=_doc_type_default)
+        ctk.CTkOptionMenu(docf, values=DOCUMENT_TYPES, variable=doc_type_var, width=220
+                           ).grid(row=0,column=1,padx=8,pady=3,sticky='w')
+        lbl(docf,"Серія:",11,color=C['text2']).grid(row=1,column=0,sticky='w',pady=3)
+        e_doc_series = ent(docf, "АА", w=100); e_doc_series.grid(row=1,column=1,padx=8,pady=3,sticky='w')
+        if _series_default: e_doc_series.insert(0, _series_default)
+        lbl(docf,"Номер:",11,color=C['text2']).grid(row=2,column=0,sticky='w',pady=3)
+        e_doc_number = ent(docf, "123456", w=160); e_doc_number.grid(row=2,column=1,padx=8,pady=3,sticky='w')
+        if _number_default: e_doc_number.insert(0, _number_default)
 
         # Дати проживання
         d_card = card(sc); d_card.pack(fill='x', padx=12, pady=5)
@@ -13197,6 +13465,14 @@ class BookingDetailDlg(ctk.CTkToplevel):
                 notes = f"Знижка: {discount:.0f}₴ ({discount_comment})  " + notes
             else:
                 notes = _re_ci_edit.sub(r'Знижка:\s*[\d.,]+\s*₴\s*\([^)]*\)\s*', '', notes).strip()
+
+            # ── Оновити документ гостя в нотатках ──
+            _new_doc_str = _format_doc_info(
+                doc_type_var.get(), e_doc_series.get().strip(), e_doc_number.get().strip())
+            notes = _re_ci_edit.sub(
+                r'Паспорт:\s*.*?(?=\n|\s{2,}(?:Знижка:|Фактичне заселення:)|\Z)', '', notes).strip()
+            if _new_doc_str:
+                notes = f"Паспорт: {_new_doc_str}  " + notes
             try:
                 if b.get('guest_id'):
                     _qe("UPDATE guests SET name=%s, phone=%s WHERE id=%s",
