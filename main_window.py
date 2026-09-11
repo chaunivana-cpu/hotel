@@ -12123,6 +12123,7 @@ class BookingsFrame(tk.Frame):
               'category','notes','email','booked_at')
         widths=[40,70,180,120,90,90,55,85,85,85,120,120,220,160,130]
         ff,self.tree=mktree(self,cols,16,widths)
+        self.tree.configure(style="H2.Treeview")  # 2-рядкові комірки (дата+час) — вищий рядок
         _labels2=['#','Кімн.','Гість','Тел.','Заїзд','Виїзд','Н','Всього','Оплач.','Борг','Статус',
                   'Категорія','Нотатка','Email','Заброньовано']
         self._all_fields = list(zip(cols, _labels2, widths))
@@ -12222,10 +12223,23 @@ class BookingsFrame(tk.Frame):
                     total = float(b['total_amount'] or 0)
                     if total == 0:
                         total = float(b.get('price_per_day') or 0) * max(n_disp, 1)
+                # ── Дата + час зверху/знизу в комірці (як у «Заселені»/«Виселені») ──
+                import datetime as _dt_bkfmt
+                def _fmt_dt2(v):
+                    if isinstance(v, _dt_bkfmt.datetime):
+                        return v.strftime('%d.%m.%Y\n%H:%M')
+                    if isinstance(v, _dt_bkfmt.date):
+                        return v.strftime('%d.%m.%Y')
+                    s = str(v or '')
+                    if len(s) >= 16 and ' ' in s:
+                        return s[:10] + '\n' + s[11:16]
+                    return s[:10]
+                cin_disp2 = _fmt_dt2(b['check_in'])
+                cout_disp2 = cout_disp if _is_hourly else _fmt_dt2(cout_disp)
                 paid_ttl = paid_map.get(bid_int, 0.0)
                 debt = max(total - paid_ttl, 0)
                 rows.append((b['id'], b['room_number'], b.get('guest_name', ''),
-                             b.get('guest_phone', ''), b['check_in'], cout_disp,
+                             b.get('guest_phone', ''), cin_disp2, cout_disp2,
                              n_disp, f"{total:.0f}₴", f"{paid_ttl:.0f}₴", f"{debt:.0f}₴",
                              STATUS_UA.get(b['status'], b['status']),
                              (b.get('cat_name') or b.get('room_category') or ''),
@@ -12569,7 +12583,9 @@ class BookingDlg(ctk.CTkToplevel):
 
         for lt,key,ph,val in [
             ("Заїзд *",'cin',"РРРР-ММ-ДД",str(date.today())),
+            ("Час заїзду",'cin_time',"ГГ:ХХ","14:00"),
             ("Виїзд *",'cout',"РРРР-ММ-ДД",str(date.today()+timedelta(days=1))),
+            ("Час виїзду",'cout_time',"ГГ:ХХ","12:00"),
             ("Ціна/ніч *",'price',"₴",""),
             ("Дорослих",'adults',"","1"),("Дітей",'kids',"","0"),
         ]:
@@ -12659,10 +12675,21 @@ class BookingDlg(ctk.CTkToplevel):
 
     def _save(self):
         from app.modules.logic import save_guest, create_booking
+        import datetime as _dt_bdlg
         try:
-            cin=date.fromisoformat(self.fields['cin'].get().strip())
-            cout=date.fromisoformat(self.fields['cout'].get().strip())
+            cin_d=date.fromisoformat(self.fields['cin'].get().strip())
+            cout_d=date.fromisoformat(self.fields['cout'].get().strip())
         except: messagebox.showerror("","Невірна дата (РРРР-ММ-ДД)"); return
+        try:
+            cin_t = _dt_bdlg.datetime.strptime(self.fields['cin_time'].get().strip() or '14:00', '%H:%M').time()
+        except Exception:
+            messagebox.showerror("","Невірний час заїзду (ГГ:ХХ)"); return
+        try:
+            cout_t = _dt_bdlg.datetime.strptime(self.fields['cout_time'].get().strip() or '12:00', '%H:%M').time()
+        except Exception:
+            messagebox.showerror("","Невірний час виїзду (ГГ:ХХ)"); return
+        cin = _dt_bdlg.datetime.combine(cin_d, cin_t)
+        cout = _dt_bdlg.datetime.combine(cout_d, cout_t)
         if cout<=cin: messagebox.showerror("","Виїзд має бути пізніше заїзду"); return
         name=self.fields['name'].get().strip()
         if not name: messagebox.showerror("","Введіть ім'я гостя"); return
@@ -13592,12 +13619,35 @@ class BookingDetailDlg(ctk.CTkToplevel):
         d_card = card(sc); d_card.pack(fill='x', padx=12, pady=5)
         lbl(d_card, "📅  Дати проживання", 13, True).pack(anchor='w', padx=12, pady=(10,5))
         df = tk.Frame(d_card, bg=C['card']); df.pack(fill='x', padx=12, pady=(0,10))
+        import datetime as _dt_editb
+        def _split_date_time(v, default_time):
+            """Розбиває значення check_in/check_out (date, datetime або
+            рядок) на (РРРР-ММ-ДД, ГГ:ХХ) для двох окремих полів вводу."""
+            if v is None:
+                return '', default_time
+            if isinstance(v, _dt_editb.datetime):
+                return v.strftime('%Y-%m-%d'), v.strftime('%H:%M')
+            if isinstance(v, _dt_editb.date):
+                return v.strftime('%Y-%m-%d'), default_time
+            s = str(v)
+            if ' ' in s:
+                d_part, t_part = s.split(' ', 1)
+                return d_part[:10], t_part[:5] or default_time
+            return s[:10], default_time
+        _ci_date_def, _ci_time_def = _split_date_time(b.get('check_in'), '14:00')
+        _co_date_def, _co_time_def = _split_date_time(b.get('check_out'), '12:00')
         lbl(df,"Заїзд (РРРР-ММ-ДД):",11,color=C['text2']).grid(row=0,column=0,sticky='w',pady=3)
         e_ci = ent(df, w=150); e_ci.grid(row=0,column=1,padx=8,pady=3,sticky='w')
-        e_ci.insert(0, str(b.get('check_in','')))
+        e_ci.insert(0, _ci_date_def)
+        lbl(df,"Час заїзду (ГГ:ХХ):",11,color=C['text2']).grid(row=0,column=2,sticky='w',pady=3,padx=(14,0))
+        e_ci_time = ent(df, w=90); e_ci_time.grid(row=0,column=3,padx=8,pady=3,sticky='w')
+        e_ci_time.insert(0, _ci_time_def)
         lbl(df,"Виїзд (РРРР-ММ-ДД):",11,color=C['text2']).grid(row=1,column=0,sticky='w',pady=3)
         e_co = ent(df, w=150); e_co.grid(row=1,column=1,padx=8,pady=3,sticky='w')
-        e_co.insert(0, str(b.get('check_out','')))
+        e_co.insert(0, _co_date_def)
+        lbl(df,"Час виїзду (ГГ:ХХ):",11,color=C['text2']).grid(row=1,column=2,sticky='w',pady=3,padx=(14,0))
+        e_co_time = ent(df, w=90); e_co_time.grid(row=1,column=3,padx=8,pady=3,sticky='w')
+        e_co_time.insert(0, _co_time_def)
         lbl(df,"Дорослих:",11,color=C['text2']).grid(row=2,column=0,sticky='w',pady=3)
         e_ad = ent(df, w=80); e_ad.grid(row=2,column=1,padx=8,pady=3,sticky='w')
         e_ad.insert(0, str(b.get('adults','') or ''))
@@ -13677,12 +13727,22 @@ class BookingDetailDlg(ctk.CTkToplevel):
         def _save():
             import datetime as _dted
             try:
-                ci = _dted.date.fromisoformat(e_ci.get().strip())
-                co = _dted.date.fromisoformat(e_co.get().strip())
-                if co <= ci:
-                    _st.configure(text="❌ Виїзд має бути пізніше заїзду", text_color=C['red']); return
+                ci_d = _dted.date.fromisoformat(e_ci.get().strip())
+                co_d = _dted.date.fromisoformat(e_co.get().strip())
             except Exception:
                 _st.configure(text="❌ Невірний формат дати (РРРР-ММ-ДД)", text_color=C['red']); return
+            try:
+                ci_t = _dted.datetime.strptime(e_ci_time.get().strip() or '14:00', '%H:%M').time()
+            except Exception:
+                _st.configure(text="❌ Невірний формат часу заїзду (ГГ:ХХ)", text_color=C['red']); return
+            try:
+                co_t = _dted.datetime.strptime(e_co_time.get().strip() or '12:00', '%H:%M').time()
+            except Exception:
+                _st.configure(text="❌ Невірний формат часу виїзду (ГГ:ХХ)", text_color=C['red']); return
+            ci = _dted.datetime.combine(ci_d, ci_t)
+            co = _dted.datetime.combine(co_d, co_t)
+            if co <= ci:
+                _st.configure(text="❌ Виїзд має бути пізніше заїзду", text_color=C['red']); return
             try:
                 adults = int(e_ad.get().strip() or 1)
                 price  = float((e_price.get().strip() or '0').replace(',', '.'))
