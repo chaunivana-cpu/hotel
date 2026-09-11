@@ -2254,6 +2254,16 @@ _CHECKBOX_CFG = {
     'cash_register_id': '',
     'token': '',           # кешований JWT токен
     'shift_id': '',        # поточна зміна
+    # ── Резервний варіант: локальний фіскальний реєстратор (РРО) через
+    # COM-порт, замість хмарного Checkbox.ua. Поки що НЕ підключено жоден
+    # конкретний пристрій — секція нижче лише готує місце (перемикач,
+    # порт/швидкість, тест з'єднання), щоб потім, коли з'явиться конкретна
+    # модель РРО, додати лише її протокол (com_rro_create_receipt нижче),
+    # не чіпаючи решту програми.
+    'fiscal_mode': 'cloud',   # 'cloud' (Checkbox.ua) | 'com' (локальний РРО)
+    'com_port': 'COM3',
+    'com_baud': 9600,
+    'com_model': '',          # модель РРО — заповнюється, коли буде відомо
 }
 
 def _cbx_load():
@@ -2373,14 +2383,116 @@ def cbx_create_receipt(amount: float, payment_type: str, description: str,
 
 import threading
 
-def cbx_auto_receipt(amount: float, payment_type: str, description: str, 
-                     guest_name: str = '', phone: str = ''):
-    """Пробити чек у фоновому потоці, щоб інтерфейс не тормозив."""
+# ── Резервний варіант: локальний РРО через COM-порт ──────────────────────
+# ВАЖЛИВО: справжня фіскалізація (передача чека в ДПС) можлива ЛИШЕ через
+# протокол КОНКРЕТНОЇ моделі РРО (у кожного виробника — ШТРИХ-М, Datecs,
+# ІКС тощо — свій набір байтових команд), якого зараз ще не вказано. Поки
+# конкретної моделі немає, ця функція працює як БЕЗПЕЧНИЙ ЗАГЛУШКОВИЙ
+# варіант: перевіряє й відкриває COM-порт, друкує чек ЯК ЗВИЧАЙНИЙ (НЕ
+# фіскальний) документ через уже наявну POS-логіку (_print_pos) — щоб хоч
+# щось роздрукувалось і порт/дріт можна було перевірити вже зараз.
+#
+# Коли з'явиться конкретна модель РРО — треба замінити ЛИШЕ тіло цієї
+# функції на реальний протокол виробника (зазвичай: спец. байтові команди
+# з контрольною сумою замість простого тексту). Решта програми (виклики
+# з кас/оплат) міняти не потрібно — вони йдуть через com_rro_create_receipt.
+def com_rro_test_connection() -> str:
+    """Пробує відкрити налаштований COM-порт РРО. Повертає текст статусу."""
+    import serial as _ser_rro
+    port = _CHECKBOX_CFG.get('com_port', 'COM3')
+    baud = int(_CHECKBOX_CFG.get('com_baud', 9600) or 9600)
+    try:
+        with _ser_rro.Serial(port, baud, timeout=2) as s:
+            pass
+        return f"✅ Порт {port} відкрито успішно (швидкість {baud})."
+    except Exception as e:
+        raise RuntimeError(f"Не вдалося відкрити {port}: {e}")
+
+def com_rro_create_receipt(amount: float, payment_type: str, description: str,
+                            guest_name: str = '', phone: str = '') -> dict:
+    """Резервна 'фіскалізація' через COM-порт (заглушка — див. коментар
+    вище файлу). payment_type: 'CASH' або 'CARD'."""
+    port = _CHECKBOX_CFG.get('com_port', 'COM3')
+    baud = int(_CHECKBOX_CFG.get('com_baud', 9600) or 9600)
+    model = _CHECKBOX_CFG.get('com_model', '')
+    if not model:
+        log_info("[COM РРО] Модель РРО ще не вказана в налаштуваннях — "
+                 "друкую як звичайний (НЕфіскальний) чек через COM.")
+    import datetime as _dt_rro
+    lines = [
+        f"  {'ФІСКАЛЬНИЙ ЧЕК' if model else 'ЧЕК (не фіскальний, РРО не налаштовано)'}",
+        f"  {_dt_rro.datetime.now().strftime('%d.%m.%Y %H:%M:%S')}",
+        f"{'-'*40}",
+        f"  {description[:38]}",
+        f"  Сума: {amount:.2f}₴  ({'Готівка' if payment_type=='CASH' else 'Картка'})",
+    ]
+    if guest_name: lines.append(f"  Гість: {guest_name}")
+    if phone: lines.append(f"  Тел: {phone}")
+    lines.append(f"{'-'*40}")
+    text = '\n'.join(lines) + '\n'
+    try:
+        import serial as _ser_rro
+        with _ser_rro.Serial(port, baud, timeout=3) as s:
+            s.write(text.encode('cp1251', errors='replace'))
+            s.write(b'\n\n\n')
+    except Exception as e:
+        raise RuntimeError(f"COM РРО ({port}): {e}")
+    return {'id': '', 'port': port, 'mode': 'com', 'fiscal': bool(model)}
+
+def close_fiscal_shift():
+    """Закриває зміну на фіскальному РРО (Checkbox Z-звіт) ОДРАЗУ ПІСЛЯ
+    закриття внутрішньої зміни програми — щоб касир не забув окремо
+    зайти в Checkbox і закрити зміну там теж. Повертає короткий текст
+    статусу для показу на вікні «Зміну закрито» (best-effort: якщо сам
+    РРО зараз недоступний — внутрішню зміну це не блокує, лише
+    повідомляє про проблему)."""
     if not _CHECKBOX_CFG.get('enabled'):
         return None
+    mode = _CHECKBOX_CFG.get('fiscal_mode', 'cloud')
+    try:
+        if mode == 'com':
+            return ("ℹ️ РРО через COM: автоматичне закриття зміни (Z-звіт) для "
+                     "конкретної моделі ще не реалізоване — закрийте зміну на пристрої вручну.")
+        resp = cbx_close_shift()
+        sid = resp.get('id','') if isinstance(resp, dict) else ''
+        return f"✅ Зміну в Checkbox закрито (Z-звіт), ID: {sid}" if sid else "✅ Зміну в Checkbox закрито (Z-звіт)."
+    except Exception as e:
+        return f"⚠️ Не вдалося закрити зміну в Checkbox: {e}\nЗайдіть у Checkbox вручну і закрийте зміну (Z-звіт)!"
+
+def check_fiscal_x_report():
+    """Повертає короткий текст поточного X-звіту (стан зміни) з Checkbox —
+    щоб касир міг перевірити фіскальну зміну, не заходячи на сайт Checkbox."""
+    if not _CHECKBOX_CFG.get('enabled'):
+        return "🔴 РРО вимкнено в налаштуваннях."
+    mode = _CHECKBOX_CFG.get('fiscal_mode', 'cloud')
+    if mode == 'com':
+        return "🔌 Режим: локальний РРО через COM-порт (X-звіт для конкретної моделі поки не реалізовано)."
+    try:
+        sh = cbx_get_shift()
+        sid = sh.get('id','—')
+        opened = str(sh.get('opened_at',''))[:16]
+        balance = sh.get('balance', {}) if isinstance(sh, dict) else {}
+        cash = balance.get('balance', 0) if isinstance(balance, dict) else 0
+        return f"✅ Зміна Checkbox відкрита | ID: {sid} | з {opened} | залишок: {cash/100:.2f}₴"
+    except Exception as e:
+        return f"❌ Зміна Checkbox закрита або недоступна: {e}"
+
+def cbx_auto_receipt(amount: float, payment_type: str, description: str, 
+                     guest_name: str = '', phone: str = ''):
+    """Пробити чек у фоновому потоці, щоб інтерфейс не тормозив.
+    Використовує хмарний Checkbox.ua АБО локальний РРО через COM-порт —
+    залежно від _CHECKBOX_CFG['fiscal_mode']."""
+    if not _CHECKBOX_CFG.get('enabled'):
+        return None
+    _mode = _CHECKBOX_CFG.get('fiscal_mode', 'cloud')
 
     def _threaded_task():
         try:
+            if _mode == 'com':
+                resp = com_rro_create_receipt(amount, payment_type, description, guest_name, phone)
+                log_info(f"[COM РРО] Чек надруковано через {resp.get('port')} "
+                         f"({'фіскальний' if resp.get('fiscal') else 'НЕфіскальний — модель РРО не вказана'})")
+                return
             # Сам запит до API (може тривати 5-10 секунд)
             resp = cbx_create_receipt(amount, payment_type, description, guest_name, phone)
             receipt_id = resp.get('id','')
@@ -15302,6 +15414,28 @@ class CashierFrame(tk.Frame):
         if shift_start_dt:
             lbl(hdr, f"Зміна відкрита: {shift_start_dt.strftime('%d.%m %H:%M')}",
                 11, color=C['text2']).pack(side='left', padx=15)
+        # ── Індикатор фіскальної зміни (Checkbox/РРО) — завжди на видному
+        # місці, поруч із заголовком каси, щоб касир одразу бачив стан. ──
+        try:
+            if _CHECKBOX_CFG.get('enabled'):
+                _fisc_lbl = lbl(hdr, "🧾 РРО: перевірка...", 11, color=C['text2'])
+                _fisc_lbl.pack(side='left', padx=15)
+                def _upd_fisc_lbl():
+                    try:
+                        _st = check_fiscal_x_report()
+                        _clr = C['green'] if _st.startswith('✅') else (C['red'] if _st.startswith('❌') else C['text2'])
+                        def _apply():
+                            try:
+                                if _fisc_lbl.winfo_exists():
+                                    _fisc_lbl.configure(text=f"🧾 {_st[:60]}", text_color=_clr)
+                            except Exception:
+                                pass
+                        self.after(0, _apply)
+                    except Exception:
+                        pass
+                threading.Thread(target=_upd_fisc_lbl, daemon=True).start()
+        except Exception:
+            pass
         refresh_btn(hdr, self._refresh_data, side='right', padx=8)
         btn(hdr, "💸 Переміщення", self._add_transfer, C['yellow'], 150, height=36).pack(side='right', padx=4)
 
@@ -20495,6 +20629,13 @@ class ReportsFrame(tk.Frame):
             except Exception as _se:
                 print(f"[Z-звіт] session clear error: {_se}")
 
+            # ── Закрити зміну і на фіскальному РРО (Checkbox Z-звіт) ──────
+            _fiscal_status = None
+            try:
+                _fiscal_status = close_fiscal_shift()
+            except Exception as _fe:
+                _fiscal_status = f"⚠️ Помилка закриття РРО: {_fe}"
+
             def _after_shift_receipt_closed2():
                 # Сховати головне вікно — обов'язковий релогін
                 try:
@@ -20502,7 +20643,8 @@ class ReportsFrame(tk.Frame):
                 except Exception:
                     pass
                 # Показати вікно підсумків зміни (блокує до релогіну)
-                ShiftClosedDlg(self, today, cash_total, card_total, transfer_total, grand_total, tx_count)
+                ShiftClosedDlg(self, today, cash_total, card_total, transfer_total, grand_total, tx_count,
+                                fiscal_status=_fiscal_status)
 
             try:
                 self._do_print_report_fn(on_close=_after_shift_receipt_closed2)
@@ -22769,6 +22911,13 @@ class ReportsFrame(tk.Frame):
                     except Exception as _se:
                         print(f"[Z-звіт] session clear error: {_se}")
 
+                    # ── Закрити зміну і на фіскальному РРО (Checkbox Z-звіт) ──
+                    _fiscal_status = None
+                    try:
+                        _fiscal_status = close_fiscal_shift()
+                    except Exception as _fe:
+                        _fiscal_status = f"⚠️ Помилка закриття РРО: {_fe}"
+
                     def _after_shift_receipt_closed():
                         # Сховати головне вікно — обов'язковий релогін
                         try:
@@ -22776,7 +22925,8 @@ class ReportsFrame(tk.Frame):
                         except Exception:
                             pass
                         # Показати вікно підсумків зміни (блокує до релогіну)
-                        ShiftClosedDlg(self, today, cash_total, card_total, transfer_total, grand_total, tx_count)
+                        ShiftClosedDlg(self, today, cash_total, card_total, transfer_total, grand_total, tx_count,
+                                        fiscal_status=_fiscal_status)
 
                     do_print_report(on_close=_after_shift_receipt_closed)
 
@@ -22792,7 +22942,7 @@ class ReportsFrame(tk.Frame):
 # ══════════════════════════════════════════════════════
 class ShiftClosedDlg(ctk.CTkToplevel):
     """Показує підсумки закритої зміни і пропонує авторизуватись."""
-    def __init__(self, parent, shift_date, cash, card_amt, transfer_amt, total, tx_count):
+    def __init__(self, parent, shift_date, cash, card_amt, transfer_amt, total, tx_count, fiscal_status=None):
         super().__init__(parent)
         self.title("✅ Зміну закрито")
         self.configure(fg_color=C['bg'])
@@ -22803,7 +22953,7 @@ class ShiftClosedDlg(ctk.CTkToplevel):
         # Блокуємо закриття хрестиком — тільки через кнопку "Авторизуватись"
         self.protocol("WM_DELETE_WINDOW", lambda: None)
         self._parent = parent
-        self._build(shift_date, cash, card_amt, transfer_amt, total, tx_count)
+        self._build(shift_date, cash, card_amt, transfer_amt, total, tx_count, fiscal_status)
         # Модальне вікно — захоплює фокус
         self.after(100, self._make_modal)
 
@@ -22815,7 +22965,7 @@ class ShiftClosedDlg(ctk.CTkToplevel):
         except Exception:
             pass
 
-    def _build(self, shift_date, cash, card_amt, transfer_amt, total, tx_count):
+    def _build(self, shift_date, cash, card_amt, transfer_amt, total, tx_count, fiscal_status=None):
         scroll = ctk.CTkScrollableFrame(self, fg_color=C['bg'])
         scroll.pack(fill='both', expand=True, padx=15, pady=15)
 
@@ -22838,6 +22988,14 @@ class ShiftClosedDlg(ctk.CTkToplevel):
         tot = card(scroll); tot.pack(fill='x', pady=5)
         lbl(tot, f"✅  Разом за зміну: {total:.2f}₴", 20, True, '#9b59b6').pack(pady=12)
         lbl(tot, f"Транзакцій: {tx_count}", 12, color=C['text2']).pack(pady=(0,12))
+
+        # ── Статус фіскальної зміни (Checkbox Z-звіт) — завжди на видному місці ──
+        if fiscal_status:
+            _fcolor = C['green'] if fiscal_status.startswith('✅') else (
+                      C['yellow'] if fiscal_status.startswith(('⚠️','ℹ️')) else C['red'])
+            fcard = card(scroll); fcard.pack(fill='x', pady=5)
+            lbl(fcard, "🧾  Фіскальна зміна (Checkbox)", 12, True).pack(anchor='w', padx=15, pady=(10,2))
+            lbl(fcard, fiscal_status, 11, color=_fcolor).pack(anchor='w', padx=15, pady=(0,10))
 
         info = card(scroll); info.pack(fill='x', pady=5)
         lbl(info, "🔐  Каса обнулена. Для початку нової зміни\nнеобхідна авторизація.",
@@ -27784,6 +27942,63 @@ class SettingsFrame(tk.Frame):
         sc.pack(fill='both', expand=True)
         f = tk.Frame(sc, bg=C['bg']); f.pack(fill='both', expand=True, padx=20, pady=15)
         lbl(f, "🧾  Checkbox РРО — Фіскальні чеки", 15, True).pack(anchor='w', pady=(0,12))
+
+        # ── Вибір способу фіскалізації: хмара Checkbox.ua / локальний РРО ──
+        mode_card = card(f); mode_card.pack(fill='x', pady=5)
+        lbl(mode_card, "🔀  Спосіб фіскалізації", 13, True).pack(anchor='w', padx=12, pady=(10,4))
+        mode_var = ctk.StringVar(value=_CHECKBOX_CFG.get('fiscal_mode', 'cloud'))
+        mode_row = tk.Frame(mode_card, bg=C['card']); mode_row.pack(fill='x', padx=12, pady=(0,4))
+        ctk.CTkRadioButton(mode_row, text="☁️ Хмарний Checkbox.ua", variable=mode_var, value='cloud',
+                            command=lambda: _on_mode_change()).pack(side='left', padx=(0,20), pady=6)
+        ctk.CTkRadioButton(mode_row, text="🔌 Локальний РРО через COM-порт (резерв)", variable=mode_var, value='com',
+                            command=lambda: _on_mode_change()).pack(side='left', pady=6)
+
+        # ── Поля локального РРО (COM-порт) ──
+        com_card = card(f)
+        lbl(com_card, "🔌  Локальний РРО через COM-порт", 13, True).pack(anchor='w', padx=12, pady=(10,4))
+        lbl(com_card, "⚠️ Модель РРО ще не вказана — поки що друкує звичайний (НЕфіскальний) чек "
+                       "через COM, щоб перевірити з'єднання. Коли буде відомий конкретний пристрій "
+                       "(ШТРИХ-М, Datecs, ІКС тощо) — додамо його справжній протокол фіскалізації.",
+            10, color=C['yellow']).pack(anchor='w', padx=12, pady=(0,8))
+        com_f = tk.Frame(com_card, bg=C['card']); com_f.pack(fill='x', padx=15, pady=(0,6))
+        lbl(com_f, "COM-порт:", 11, color=C['text2']).grid(row=0, column=0, sticky='w', pady=5)
+        e_com_port = ent(com_f, w=120); e_com_port.grid(row=0, column=1, padx=12, sticky='w')
+        e_com_port.insert(0, _CHECKBOX_CFG.get('com_port', 'COM3'))
+        lbl(com_f, "Швидкість (baud):", 11, color=C['text2']).grid(row=1, column=0, sticky='w', pady=5)
+        e_com_baud = ent(com_f, w=120); e_com_baud.grid(row=1, column=1, padx=12, sticky='w')
+        e_com_baud.insert(0, str(_CHECKBOX_CFG.get('com_baud', 9600)))
+        lbl(com_f, "Модель РРО:", 11, color=C['text2']).grid(row=2, column=0, sticky='w', pady=5)
+        e_com_model = ent(com_f, w=200, ph="напр. ШТРИХ-М, Datecs, ІКС (поки не заповнено)")
+        e_com_model.grid(row=2, column=1, padx=12, sticky='w')
+        e_com_model.insert(0, _CHECKBOX_CFG.get('com_model', ''))
+
+        def _save_com_fields():
+            _CHECKBOX_CFG['com_port'] = e_com_port.get().strip() or 'COM3'
+            try: _CHECKBOX_CFG['com_baud'] = int(e_com_baud.get().strip() or 9600)
+            except Exception: _CHECKBOX_CFG['com_baud'] = 9600
+            _CHECKBOX_CFG['com_model'] = e_com_model.get().strip()
+            _CHECKBOX_CFG['fiscal_mode'] = mode_var.get()
+            _cbx_save()
+
+        def do_test_com():
+            _save_com_fields()
+            try:
+                msg = com_rro_test_connection()
+                messagebox.showinfo("✅ COM-порт", msg)
+            except Exception as e:
+                messagebox.showerror("❌ COM-порт", str(e))
+
+        com_bf = tk.Frame(com_card, bg=C['card']); com_bf.pack(fill='x', padx=15, pady=(0,10))
+        btn(com_bf, "🔌 Тест з'єднання", do_test_com, C['accent'], 170, height=36).pack(side='left', padx=(0,8))
+        btn(com_bf, "💾 Зберегти", _save_com_fields, C['green'], 140, height=36).pack(side='left')
+
+        def _on_mode_change():
+            if mode_var.get() == 'com':
+                com_card.pack(fill='x', pady=5)
+            else:
+                com_card.pack_forget()
+            _save_com_fields()
+        _on_mode_change()  # застосувати початкову видимість
 
         pc = card(f); pc.pack(fill='x', pady=5)
         pf = tk.Frame(pc, bg=C['card']); pf.pack(fill='x', padx=15, pady=10)
