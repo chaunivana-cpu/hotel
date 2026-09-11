@@ -1357,6 +1357,30 @@ def get_current_shift_id():
             except Exception:
                 pass
             return _sid
+
+        # ── БД відповіла, але відкритої зміни не знайдено ────────────────
+        # Якщо ЗАРАЗ ми працюємо через ХМАРНИЙ резервний сервер (основний
+        # недоступний) — можливо, зміна БУЛА відкрита на основному, але ще
+        # не встигла долетіти в хмару (миттєвий push при відкритті зміни —
+        # best-effort і міг не спрацювати; планова синхронізація раз на 6
+        # годин теж могла ще не наступити). У цьому випадку довіряємо
+        # локальному session.json ЦІЄЇ машини — саме вона відкривала зміну,
+        # тож знає її id напевно, навіть якщо хмара про це "не знає".
+        try:
+            from app.utils.db import get_backend_status as _gbsCS
+            if _gbsCS().get('backend') == 'cloud':
+                sfile = os.path.join(get_data_dir(), 'session.json')
+                with open(sfile, encoding='utf-8') as f:
+                    _sj = json.load(f)
+                _local_sid = _sj.get('shift_id')
+                if _local_sid and (not username or _sj.get('user') == username or role in ('admin','manager')):
+                    try:
+                        log_info(f"[shift] Хмара не бачить відкриту зміну — беру з локального session.json: #{_local_sid}")
+                    except Exception:
+                        pass
+                    return _local_sid
+        except Exception:
+            pass
     except Exception:
         pass
     # Fallback — session.json
@@ -1611,6 +1635,22 @@ def save_session_start(user=None, force_new=False):
                 _cS.commit()
         except Exception as e:
             print(f"shift create error: {e}")
+
+        # ── Одразу відправляємо нову зміну в хмару ──────────────────────────
+        # Раніше таблиця shifts потрапляла в хмару лише разом з плановою
+        # синхронізацією довідників раз на 6 годин (start_reference_sync_
+        # scheduler). Якщо основний сервер падав ДО цього планового синку,
+        # хмара ще "не знала" про щойно відкриту зміну — і застосунок, перейшовши
+        # на хмару, чесно бачив "відкритих змін немає" й пропонував відкрити нову
+        # (хоча на основному вона вже була відкрита). Тому пушимо хмару відразу
+        # тут, у фоновому потоці, щоб не затримувати відкриття зміни користувачу.
+        try:
+            import threading as _th_shcloud
+            from app.utils.db import push_reference_data_to_cloud as _push_shift_cloud
+            _th_shcloud.Thread(target=_push_shift_cloud, daemon=True,
+                                name="shift-open-cloud-push").start()
+        except Exception as _e_shcloud:
+            print(f"shift cloud push error: {_e_shcloud}")
     # ────────────────────────────────────────────────────────────────────────
 
     with open(sfile, 'w', encoding='utf-8') as f:
@@ -3362,8 +3402,12 @@ def _make_qr_ascii(url, width=36):
         return f"  QR: {url}"
 
 
-def print_text(title, lines, qr_url=None):
-    """Завжди показує вікно-перегляд чеку з кнопками Роздрукувати / Відміна."""
+def print_text(title, lines, qr_url=None, on_close=None):
+    """Завжди показує вікно-перегляд чеку з кнопками Роздрукувати / Відміна.
+    on_close (опційно) — викликається ПІСЛЯ закриття цього вікна (і через
+    друк, і через відміну, і через хрестик) — щоб наступні модальні вікна
+    (наприклад підсумок закриття зміни) не з'являлись ПОВЕРХ вікна чеку,
+    заважаючи натиснути «Роздрукувати»."""
     import datetime, os, tempfile
     now = datetime.datetime.now().strftime('%d.%m.%Y %H:%M:%S')
     _W = 52
@@ -3476,15 +3520,22 @@ def print_text(title, lines, qr_url=None):
         else:
             _win_print_file(fname, text)
             win.destroy()
+        if on_close:
+            try: on_close()
+            except Exception: pass
 
     def do_cancel():
         win.destroy()
+        if on_close:
+            try: on_close()
+            except Exception: pass
 
     btn(bf, '🖨  Роздрукувати', do_print, C['green'], 200, height=40).pack(side='left', padx=4)
     btn(bf, '✖  Відміна', do_cancel, C['red'], 140, height=40).pack(side='right', padx=4)
 
-    # Закрити по Escape
+    # Закрити по Escape або хрестику вікна — теж викликає on_close
     win.bind('<Escape>', lambda e: do_cancel())
+    win.protocol('WM_DELETE_WINDOW', do_cancel)
 
 def bind_mousewheel(widget):
     """Прив'язати скрол колесом миші — ОДИН обробник, idempotent."""
@@ -4383,6 +4434,31 @@ class SetupWindow(ctk.CTk):
                 open_shift = None
                 try: log_error(f"[STARTUP] _login: запит shifts ПОМИЛКА за {(_time_mod.monotonic()-_t_sh)*1000:.0f}мс", _esh)
                 except Exception: pass
+
+            # ── БД відповіла, але відкритої зміни не знайдено ────────────
+            # Якщо зараз працюємо через ХМАРНИЙ резервний сервер (основний
+            # недоступний) — можливо, зміна БУЛА відкрита на основному до
+            # аварії, просто ще не встигла долетіти в хмару (миттєвий push
+            # при відкритті зміни — best-effort, а планова синхронізація раз
+            # на 6 годин теж могла ще не наступити). Перевіряємо локальний
+            # session.json ЦІЄЇ машини — якщо саме ЦЕЙ користувач нещодавно
+            # відкривав зміну тут, продовжуємо її, а не питаємо про нову
+            # (інакше касова готівка/залоги, введені вранці, "губляться").
+            if not open_shift:
+                try:
+                    from app.utils.db import get_backend_status as _gbsL
+                    if _gbsL().get('backend') == 'cloud':
+                        _sfileL = os.path.join(get_data_dir(), 'session.json')
+                        with open(_sfileL, encoding='utf-8') as _fL:
+                            _sjL = json.load(_fL)
+                        if _sjL.get('user') == username and _sjL.get('shift_id'):
+                            try: log_info(f"[STARTUP] _login: хмара не бачить зміну — продовжую локальну #{_sjL.get('shift_id')} (backend=cloud)")
+                            except Exception: pass
+                            open_shift = {'id': _sjL['shift_id'], 'username': username,
+                                          'full_name': username,
+                                          'opened_at': _sjL.get('login_dt', '')}
+                except Exception:
+                    pass
 
             if open_shift:
                 owner = open_shift.get('username','')
@@ -20419,19 +20495,28 @@ class ReportsFrame(tk.Frame):
             except Exception as _se:
                 print(f"[Z-звіт] session clear error: {_se}")
 
+            def _after_shift_receipt_closed2():
+                # Сховати головне вікно — обов'язковий релогін
+                try:
+                    self.winfo_toplevel().withdraw()
+                except Exception:
+                    pass
+                # Показати вікно підсумків зміни (блокує до релогіну)
+                ShiftClosedDlg(self, today, cash_total, card_total, transfer_total, grand_total, tx_count)
+
             try:
-                self._do_print_report_fn()
+                self._do_print_report_fn(on_close=_after_shift_receipt_closed2)
+            except TypeError:
+                # Стара сигнатура _do_print_report_fn без on_close — друкуємо
+                # як раніше і одразу показуємо підсумок (без затримки).
+                try:
+                    self._do_print_report_fn()
+                except Exception as _epr:
+                    log_error("close_shift: друк звіту", _epr)
+                _after_shift_receipt_closed2()
             except Exception as _epr:
                 log_error("close_shift: друк звіту", _epr)
-
-            # Сховати головне вікно — обов'язковий релогін
-            try:
-                self.winfo_toplevel().withdraw()
-            except Exception:
-                pass
-
-            # Показати вікно підсумків зміни (блокує до релогіну)
-            ShiftClosedDlg(self, today, cash_total, card_total, transfer_total, grand_total, tx_count)
+                _after_shift_receipt_closed2()
 
         act = ctk.CTkFrame(parent, fg_color='transparent'); act.pack(fill='x', padx=5, pady=8)
         btn(act, "🔴  Закрити зміну", close_shift, C['red'], 180).pack(side='left', padx=4)
@@ -22344,7 +22429,7 @@ class ReportsFrame(tk.Frame):
         act = ctk.CTkFrame(self.result, fg_color='transparent')
         act.pack(fill='x', padx=5, pady=8)
 
-        def do_print_report():
+        def do_print_report(on_close=None):
             lines = [
                 f"  {'Z-ЗВІТ (ЗАКРИВАЮЧИЙ)' if is_z else 'X-ЗВІТ (ПРОМІЖНИЙ)'}",
                 f"  Дата: {today.strftime('%d.%m.%Y')}",
@@ -22392,7 +22477,7 @@ class ReportsFrame(tk.Frame):
                     lines.append(f"  {str(_sd.get('name',''))[:28]:<28} {float(_sd.get('qty') or 0):>3.0f} шт  {float(_sd.get('total') or 0):>8.2f}₴")
             if is_z:
                 lines += [f"{'─'*52}", "  *** ЗМІНУ ЗАКРИТО ***"]
-            print_text(f"{'Z-звіт' if is_z else 'X-звіт'} {today.strftime('%d.%m.%Y')}", lines)
+            print_text(f"{'Z-звіт' if is_z else 'X-звіт'} {today.strftime('%d.%m.%Y')}", lines, on_close=on_close)
 
         self._do_print_report_fn = do_print_report
         btn(act, "🖨  Роздрукувати звіт", do_print_report, C['accent'], 200).pack(side='left', padx=4)
@@ -22684,16 +22769,16 @@ class ReportsFrame(tk.Frame):
                     except Exception as _se:
                         print(f"[Z-звіт] session clear error: {_se}")
 
-                    do_print_report()
+                    def _after_shift_receipt_closed():
+                        # Сховати головне вікно — обов'язковий релогін
+                        try:
+                            self.winfo_toplevel().withdraw()
+                        except Exception:
+                            pass
+                        # Показати вікно підсумків зміни (блокує до релогіну)
+                        ShiftClosedDlg(self, today, cash_total, card_total, transfer_total, grand_total, tx_count)
 
-                    # Сховати головне вікно — обов'язковий релогін
-                    try:
-                        self.winfo_toplevel().withdraw()
-                    except Exception:
-                        pass
-
-                    # Показати вікно підсумків зміни (блокує до релогіну)
-                    ShiftClosedDlg(self, today, cash_total, card_total, transfer_total, grand_total, tx_count)
+                    do_print_report(on_close=_after_shift_receipt_closed)
 
                 btn(act, "🔴  Закрити зміну", close_shift, C['red'], 180).pack(side='left', padx=4)
                 warn = card(self.result); warn.pack(fill='x', padx=5, pady=5)
