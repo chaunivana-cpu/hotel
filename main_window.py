@@ -1657,6 +1657,27 @@ def apply_style():
           background=[('selected', C['accent']), ('focus', C['card'])],
           foreground=[('selected', 'white')])
 
+    # Окремий стиль для таблиць, де в комірці два рядки тексту (наприклад
+    # дата зверху + час знизу — "Заїзд / час", "Виїзд / час"). При звичайній
+    # rowheight=30 (розрахованій на 1 рядок) другий рядок тексту вилазив за
+    # межі рядка таблиці й наповзав на наступний запис — виглядало так,
+    # ніби час "напівприкритий" сусіднім рядком.
+    s.configure("H2.Treeview",
+                background=C['card'], foreground=C['text'],
+                fieldbackground=C['card'],
+                rowheight=46,
+                font=('Segoe UI', 10),
+                borderwidth=0, relief='flat')
+    s.configure("H2.Treeview.Heading",
+                background='#2b3042',
+                foreground='#dbe4ff',
+                font=('Segoe UI', 10, 'bold'),
+                relief='flat',
+                padding=(10, 8))
+    s.map("H2.Treeview",
+          background=[('selected', C['accent']), ('focus', C['card'])],
+          foreground=[('selected', 'white')])
+
     # Окремий стиль для таблиць звітів, які створюються напряму через ttk.Treeview.
     for name in ('Rev', 'Pay'):
         s.configure(f'{name}.Treeview',
@@ -11295,6 +11316,7 @@ class CheckedinFrame(tk.Frame):
               'category','notes','email','booked_at')
         widths=[40,90,175,108,88,88,42,85,70,80,70,85,72,120,220,160,130]
         ff,self.tree=mktree(self,cols,20,widths)
+        self.tree.configure(style="H2.Treeview")  # 2-рядкові комірки (дата+час) — вищий рядок
         _labels=['#','Кімн.','Гість','Тел.','Заїзд / час','Виїзд','Діб','Ціна/ніч','Аванс','Доплата','Залог','Сплачено','Борг',
                  'Категорія','Нотатка','Email','Заброньовано']
         self._all_fields = list(zip(cols, _labels, widths))
@@ -11449,13 +11471,33 @@ class CheckedinFrame(tk.Frame):
                 return (cat, int(m.group(1)) if m else 10**9, s)
 
             def _to_naive_dt(v):
-                """Знімає tzinfo, щоб порівняння naive/aware datetime не падало."""
-                try:
-                    if v is not None and hasattr(v, 'tzinfo') and v.tzinfo is not None:
-                        return v.replace(tzinfo=None)
-                except Exception:
-                    pass
-                return v
+                """Приводить значення до naive datetime: знімає tzinfo (щоб
+                порівняння naive/aware не падало) і парсить рядки — деякі
+                джерела (офлайн-кеш/SQLite fallback) повертають дату/час
+                як текст, а не datetime, через що '<=' з datetime падав."""
+                import datetime as _dtp_ci
+                if v is None:
+                    return None
+                if isinstance(v, _dtp_ci.datetime):
+                    try:
+                        return v.replace(tzinfo=None) if v.tzinfo is not None else v
+                    except Exception:
+                        return v
+                if isinstance(v, _dtp_ci.date):
+                    return _dtp_ci.datetime(v.year, v.month, v.day)
+                s = str(v).strip()
+                if not s:
+                    return None
+                s = s.replace('T', ' ')
+                import re as _re_tz_ci
+                s = _re_tz_ci.sub(r'(Z|[+-]\d{2}:?\d{2})$', '', s).strip()
+                for _fmt in ('%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S',
+                             '%Y-%m-%d %H:%M', '%Y-%m-%d'):
+                    try:
+                        return _dtp_ci.datetime.strptime(s, _fmt)
+                    except Exception:
+                        continue
+                return None
 
             groups = []
             try:
@@ -11755,6 +11797,7 @@ class CheckedOutFrame(tk.Frame):
         cols = ('id','room','guest','phone','cin','cout','n','total','adv','dep','paid','debt')
         widths = [40,68,165,108,88,100,38,75,65,65,75,72]
         ff, self.tree = mktree(self, cols, 20, widths)
+        self.tree.configure(style="H2.Treeview")  # 2-рядкові комірки (дата+час) — вищий рядок
         for c, h in zip(cols, ['#','Кімн.','Гість','Тел.','Заїзд','Виїзд / час','Н','Всього','Аванс','Залог','Оплач.','Борг']):
             self.tree.heading(c, text=h)
         self.tree.bind('<Double-1>', lambda e: self._open())
@@ -11924,12 +11967,31 @@ class CheckedOutFrame(tk.Frame):
                 return (cat, int(m.group(1)) if m else 10**9, s)
 
             def _to_naive_dt_co(v):
-                try:
-                    if v is not None and hasattr(v, 'tzinfo') and v.tzinfo is not None:
-                        return v.replace(tzinfo=None)
-                except Exception:
-                    pass
-                return v
+                """Приводить значення до naive datetime і парсить рядки —
+                джерело може повернути дату/час текстом (офлайн/кеш)."""
+                import datetime as _dtp_co
+                if v is None:
+                    return None
+                if isinstance(v, _dtp_co.datetime):
+                    try:
+                        return v.replace(tzinfo=None) if v.tzinfo is not None else v
+                    except Exception:
+                        return v
+                if isinstance(v, _dtp_co.date):
+                    return _dtp_co.datetime(v.year, v.month, v.day)
+                s = str(v).strip()
+                if not s:
+                    return None
+                s = s.replace('T', ' ')
+                import re as _re_tz_co
+                s = _re_tz_co.sub(r'(Z|[+-]\d{2}:?\d{2})$', '', s).strip()
+                for _fmt in ('%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S',
+                             '%Y-%m-%d %H:%M', '%Y-%m-%d'):
+                    try:
+                        return _dtp_co.datetime.strptime(s, _fmt)
+                    except Exception:
+                        continue
+                return None
 
             groups = []
             try:
