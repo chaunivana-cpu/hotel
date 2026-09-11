@@ -2753,6 +2753,26 @@ def _print_pos(text):
         # щоб Windows-драйвер не стискав текст до вузької області.
         port = _POS_SETTINGS.get('port','USB001')
 
+        def _gen_qr_bitmap(url, size):
+            """Генерує QR-код як чітке чорно-біле PIL-зображення ФІКСОВАНОГО
+            розміру (size x size пікселів), щоб на чеку він завжди був
+            однаковий, а не 'величезний' блок з символів █."""
+            try:
+                from PIL import Image as _ImgQ
+                import qrcode as _qrc3
+                qr3 = _qrc3.QRCode(version=None,
+                                    error_correction=_qrc3.constants.ERROR_CORRECT_M,
+                                    box_size=10, border=2)
+                qr3.add_data(url)
+                qr3.make(fit=True)
+                qimg = qr3.make_image(fill_color='black', back_color='white').convert('1')
+                # NEAREST — щоб модулі QR лишались чіткими прямокутниками,
+                # а не розмивались при масштабуванні.
+                qimg = qimg.resize((size, size), _ImgQ.NEAREST)
+                return qimg
+            except Exception:
+                return None
+
         def _escpos_raster_print(printer_name, receipt_text):
             try:
                 from PIL import Image, ImageDraw, ImageFont
@@ -2764,10 +2784,13 @@ def _print_pos(text):
 
             import os as _os_rp
             import tempfile as _tmp_rp
+            import re as _re_rp
 
             WIDTH = 576       # Epson TM-T20II: 80 мм / 203 dpi
             SIDE = 8
             TEXT_W = WIDTH - SIDE * 2
+            QR_SIZE = 260     # фіксований розмір QR-картинки на чеку (px)
+            QR_MARK = '\x00QR_IMAGE\x00'
 
             # Windows fonts — Arial має українські символи.
             font_candidates = [
@@ -2779,11 +2802,24 @@ def _print_pos(text):
             if not font_path:
                 raise RuntimeError("Не знайдено системний шрифт Arial/Segoe UI/Tahoma")
 
+            # ── Згорнути ASCII-блок QR-коду (рядки з █/пробілів) в один
+            # плейсхолдер, щоб замінити його справжньою картинкою фіксованого
+            # розміру, а не малювати кожен рядок матриці окремим текстовим
+            # рядком (саме через це QR друкувався величезним).
+            _raw_all = str(receipt_text).replace('\r\n','\n').replace('\r','\n').split('\n')
+            _ascii_qr_re = _re_rp.compile(r'^[█▀▄ ]+$')
+            raw_lines = []
+            for _ln in _raw_all:
+                if _ln.strip('█▀▄ ') == '' and any(ch in _ln for ch in '█▀▄') and _ascii_qr_re.match(_ln):
+                    if not raw_lines or raw_lines[-1] != QR_MARK:
+                        raw_lines.append(QR_MARK)
+                    continue
+                raw_lines.append(_ln)
+            raw_lines = raw_lines if raw_lines else ['']
+
             # Розмір підбираємо по найдовшому рядку, щоб чек використовував
             # майже всю ширину, але довгі рядки не обрізались.
-            raw_lines = str(receipt_text).replace('\r\n','\n').replace('\r','\n').split('\n')
-            raw_lines = raw_lines if raw_lines else ['']
-            longest = max((len(x) for x in raw_lines), default=1)
+            longest = max((len(x) for x in raw_lines if x != QR_MARK), default=1)
 
             base_size = 27
             if longest > 46:
@@ -2802,13 +2838,27 @@ def _print_pos(text):
             line_h = max(30, bbox[3] - bbox[1] + 8)
             top = 10
             bottom = 18
-            img_h = top + len(raw_lines) * line_h + bottom
+            qr_pad = 14  # відступ зверху/знизу навколо QR-картинки
+
+            # Висота кожного "рядка" — окремо для тексту й для QR-картинки.
+            heights = [(QR_SIZE + qr_pad * 2) if x == QR_MARK else line_h for x in raw_lines]
+            img_h = top + sum(heights) + bottom
 
             img = Image.new("1", (WIDTH, img_h), 1)
             draw = ImageDraw.Draw(img)
 
+            _qr_bitmap_cache = {}
+            y = top
             for idx, line in enumerate(raw_lines):
-                y = top + idx * line_h
+                if line == QR_MARK:
+                    if _HOTEL_QR_URL and _HOTEL_QR_URL not in _qr_bitmap_cache:
+                        _qr_bitmap_cache[_HOTEL_QR_URL] = _gen_qr_bitmap(_HOTEL_QR_URL, QR_SIZE)
+                    qbmp = _qr_bitmap_cache.get(_HOTEL_QR_URL)
+                    if qbmp is not None:
+                        qx = (WIDTH - QR_SIZE) // 2
+                        img.paste(qbmp, (qx, y + qr_pad))
+                    y += heights[idx]
+                    continue
 
                 # Центрування тільки для рядків, які явно були центровані
                 # старим ESC/POS форматуванням або виглядають як заголовок.
@@ -2826,6 +2876,7 @@ def _print_pos(text):
                     x = SIDE
 
                 draw.text((x, y), line, font=fnt, fill=0)
+                y += heights[idx]
 
             # ESC/POS GS v 0 raster image — розбиваємо на горизонтальні
             # смуги (band). Якщо надіслати все зображення однією командою
@@ -3248,18 +3299,43 @@ def _make_qr_canvas(parent, url, size=180):
 
 
 def _make_qr_ascii(url, width=36):
-    """Генерує ASCII-представлення QR-коду для POS-принтера."""
+    """Генерує КОМПАКТНЕ ASCII-представлення QR-коду ФІКСОВАНОГО (а не
+    'величезного') розміру для текстового друку на POS-принтері.
+
+    Раніше кожен модуль QR друкувався як 2 символи '██' в один рядок на
+    модуль — це робило QR удвічі ширшим за модулі (легко ширше за рулон
+    паперу, тому текст 'розповзався'/переносився) і в 2 рази вищим, ніж
+    треба, тому на чеку він виглядав величезним.
+
+    Тепер: 1 символ = 1 модуль по горизонталі, а по вертикалі два рядки
+    модулів пакуються в один символ через блоки половинної висоти
+    (▀ верх, ▄ низ, █ обидва, пробіл — жоден). Так QR завжди має
+    однаковий, компактний, майже квадратний розмір незалежно від типу
+    принтера (serial/network/lp/direct/tcp_server), як і фіксована
+    картинка QR на Epson (usb_raw)."""
     try:
         import qrcode as _qrc
         qr = _qrc.QRCode(version=None, error_correction=_qrc.constants.ERROR_CORRECT_M,
-                          box_size=1, border=1)
+                          box_size=1, border=2)
         qr.add_data(url)
         qr.make(fit=True)
         matrix = qr.get_matrix()
+        n = len(matrix)
         lines = []
-        for row in matrix:
-            line = ''.join('██' if cell else '  ' for cell in row)
-            lines.append(f"  {line}")
+        for y in range(0, n, 2):
+            top_row = matrix[y]
+            bot_row = matrix[y + 1] if y + 1 < n else [0] * n
+            chars = []
+            for top, bot in zip(top_row, bot_row):
+                if top and bot:
+                    chars.append('█')
+                elif top:
+                    chars.append('▀')
+                elif bot:
+                    chars.append('▄')
+                else:
+                    chars.append(' ')
+            lines.append('  ' + ''.join(chars))
         return '\n'.join(lines)
     except Exception:
         return f"  QR: {url}"
@@ -11733,7 +11809,12 @@ class CheckedOutFrame(tk.Frame):
                        g.phone AS guest_phone, b.check_in, b.check_out, b.notes,
                        COALESCE(b.total_amount, 0) AS total_amount,
                        COALESCE(
-                           NULLIF(substring(b.notes from 'Фактичне виселення: ([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2})'), ''),
+                           CASE
+                               WHEN substring(b.notes from 'Фактичне виселення: ([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2})')
+                                    ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}$'
+                               THEN substring(b.notes from 'Фактичне виселення: ([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2})')::timestamp
+                               ELSE NULL
+                           END,
                            (SELECT MAX(p.created_at) FROM payments p WHERE p.booking_id = b.id),
                            b.check_out::timestamp
                        ) AS updated_at
@@ -11816,34 +11897,132 @@ class CheckedOutFrame(tk.Frame):
                     checkout_time = str(b.get('check_out',''))[:10]
                 adv_str = f"{adv:.0f}₴" if adv > 0 else "—"
                 dep_str = f"{dep:.0f}₴" if dep > 0 else "—"
-                rows.append((
-                    b['id'], b['room_number'], b.get('guest_name',''),
-                    b.get('guest_phone',''), b['check_in'], checkout_time,
-                    n, f"{total:.0f}₴", adv_str, dep_str,
-                    f"{paid_ttl:.0f}₴", f"{debt:.0f}₴",
-                    'debt' if debt > 0 else ''
-                ))
+                rows.append({
+                    'vals': (b['id'], b['room_number'], b.get('guest_name',''),
+                             b.get('guest_phone',''), b['check_in'], checkout_time,
+                             n, f"{total:.0f}₴", adv_str, dep_str,
+                             f"{paid_ttl:.0f}₴", f"{debt:.0f}₴"),
+                    'debt': debt > 0,
+                    'room_number': b['room_number'],
+                    'checkout_dt': b.get('updated_at'),
+                })
 
-            self.after(0, lambda: self._apply_rows(rows))
+            # ── Групування як у «Заселені»: виселення поточної зміни —
+            # завжди зверху (без заголовка), відсортовані по номеру кімнати;
+            # виселення попередніх змін — нижче, під роздільником, згруповані
+            # по зміні (найновіша зверху), кожна група підписана датою і
+            # касиром цієї зміни. ──────────────────────────────────────
+            def _room_sort_key_co(room_txt):
+                import re as _re_rn2
+                s = str(room_txt or '')
+                sl = s.lower()
+                if 'рожев' in sl: cat = 0
+                elif 'золот' in sl: cat = 1
+                elif 'номер' in sl: cat = 2
+                else: cat = 3
+                m = _re_rn2.match(r'\s*(\d+)', s)
+                return (cat, int(m.group(1)) if m else 10**9, s)
+
+            def _to_naive_dt_co(v):
+                try:
+                    if v is not None and hasattr(v, 'tzinfo') and v.tzinfo is not None:
+                        return v.replace(tzinfo=None)
+                except Exception:
+                    pass
+                return v
+
+            groups = []
+            try:
+                session_start = _to_naive_dt_co(get_session_start())
+                cur_rows, past_rows = [], []
+                for r in rows:
+                    ca = _to_naive_dt_co(r.get('checkout_dt'))
+                    if session_start and ca and ca >= session_start:
+                        cur_rows.append(r)
+                    else:
+                        past_rows.append(r)
+
+                cur_rows.sort(key=lambda r: _room_sort_key_co(r['room_number']))
+                if cur_rows:
+                    groups.append((None, cur_rows))
+
+                if past_rows:
+                    try:
+                        from app.utils.db import query as _qSh3
+                        all_shifts = _qSh3("SELECT id, full_name, username, opened_at FROM shifts ORDER BY opened_at DESC") or []
+                        for _sh in all_shifts:
+                            _sh['opened_at'] = _to_naive_dt_co(_sh.get('opened_at'))
+                    except Exception:
+                        all_shifts = []
+
+                    def _find_shift_co(ca):
+                        if not ca: return None
+                        for sh in all_shifts:
+                            if sh.get('opened_at') and sh['opened_at'] <= ca:
+                                return sh
+                        return None
+
+                    buckets = {}
+                    for r in past_rows:
+                        sh = _find_shift_co(_to_naive_dt_co(r.get('checkout_dt')))
+                        key = sh['id'] if sh else None
+                        buckets.setdefault(key, {'shift': sh, 'rows': []})
+                        buckets[key]['rows'].append(r)
+
+                    def _bucket_sort_key_co(item):
+                        sh = item[1]['shift']
+                        if sh and sh.get('opened_at'):
+                            return sh['opened_at']
+                        import datetime as _dt_bk2
+                        return _dt_bk2.datetime.min
+
+                    for key, b_ in sorted(buckets.items(), key=_bucket_sort_key_co, reverse=True):
+                        b_['rows'].sort(key=lambda r: _room_sort_key_co(r['room_number']))
+                        sh = b_['shift']
+                        if sh:
+                            _oa = sh.get('opened_at')
+                            _oa_s = _oa.strftime('%d.%m.%Y') if hasattr(_oa, 'strftime') else str(_oa)[:10]
+                            _name = sh.get('full_name') or sh.get('username') or '—'
+                            hdr_txt = (_oa_s, f"Зміна: {_name}")
+                        else:
+                            hdr_txt = ('', "Попередні зміни")
+                        groups.append((hdr_txt, b_['rows']))
+            except Exception as _e_grp_co:
+                log_error("CheckedOutFrame grouping", _e_grp_co)
+                groups = []
+
+            if not groups:
+                _flat = sorted(rows, key=lambda r: _room_sort_key_co(r['room_number']))
+                groups = [(None, _flat)] if _flat else []
+
+            self.after(0, lambda: self._apply_rows(groups))
         except Exception as e:
             log_error("CheckedOutFrame._load_bg", e)
         finally:
             self._loading_in_progress = False
 
-    def _apply_rows(self, rows):
+    def _apply_rows(self, groups):
         self.tree.delete(*self.tree.get_children())
-        total_sum = 0.0
-        for r in rows:
-            self.tree.insert('', 'end', iid=r[0], tags=(r[-1],), values=r[:-1])
-            try: total_sum += float(str(r[7]).replace('₴',''))
-            except: pass
         self.tree.tag_configure('debt', foreground='#e74c3c')
+        self.tree.tag_configure('shift_header', background=C['card2'], foreground=C['yellow'])
+        _hdr_i = 0
+        for hdr_txt, grp_rows in groups:
+            if hdr_txt:
+                _hdr_i += 1
+                _date_col, _name_col = hdr_txt
+                self.tree.insert('', 'end', iid=f"__hdr_{_hdr_i}", tags=('shift_header',),
+                                  values=('', _date_col, _name_col) + ('',) * (len(('id','room','guest','phone','cin','cout','n','total','adv','dep','paid','debt')) - 3))
+            for r in grp_rows:
+                self.tree.insert('', 'end', iid=r['vals'][0],
+                                  tags=('debt',) if r['debt'] else (),
+                                  values=r['vals'])
         try: self.tree.after(10, lambda: self.tree.yview_moveto(0))
-        except: pass
+        except Exception: pass
 
     def _sel(self):
         s = self.tree.selection()
-        if not s: messagebox.showwarning("", "Оберіть запис"); return None
+        if not s or str(s[0]).startswith('__hdr_'):
+            messagebox.showwarning("", "Оберіть запис"); return None
         return int(s[0])
 
     def _open(self):
@@ -27308,6 +27487,84 @@ class SettingsFrame(tk.Frame):
         bf2 = tk.Frame(f, bg=C['bg']); bf2.pack(fill='x', pady=10)
         btn(bf2,"🖨 Тест друку",do_test,C['accent'],150,height=42).pack(side='left',padx=(0,8))
         btn(bf2,"💾 Зберегти",do_save,C['green'],140,height=42).pack(side='left')
+
+        # ═══ QR-КОД НА ЧЕКАХ ═══
+        lbl(f, "📱  QR-код на чеках", 15, True).pack(anchor='w', pady=(18,12))
+        qc = card(f); qc.pack(fill='x', pady=5)
+        qf = tk.Frame(qc, bg=C['card']); qf.pack(fill='x', padx=15, pady=10)
+
+        import json as _jqr, os as _osqr
+
+        def _qr_cfg_path():
+            base = _osqr.path.normpath(_osqr.path.join(
+                _osqr.path.dirname(_osqr.path.abspath(__file__)), '..', '..', 'data'))
+            _osqr.makedirs(base, exist_ok=True)
+            return _osqr.path.join(base, 'qr_config.json')
+
+        def _load_qr_cfg():
+            try:
+                p3 = _qr_cfg_path()
+                if _osqr.path.exists(p3):
+                    with open(p3, 'r', encoding='utf-8') as _f3:
+                        return _jqr.load(_f3)
+            except Exception: pass
+            return {'enabled': True, 'url': 'https://hotels24.ua/hotel/6954'}
+
+        def _save_qr_cfg(cfg_qr):
+            try:
+                with open(_qr_cfg_path(), 'w', encoding='utf-8') as _f3:
+                    _jqr.dump(cfg_qr, _f3, ensure_ascii=False, indent=2)
+                global _HOTEL_QR_URL
+                _HOTEL_QR_URL = cfg_qr['url'] if cfg_qr.get('enabled') else None
+                return True
+            except Exception as e:
+                messagebox.showerror("Помилка", str(e))
+                return False
+
+        qr_cfg = _load_qr_cfg()
+
+        qr_enabled_var = ctk.BooleanVar(value=qr_cfg.get('enabled', True))
+        qr_chk_f = tk.Frame(qf, bg=C['card']); qr_chk_f.pack(fill='x', pady=(0,8))
+        ctk.CTkCheckBox(qr_chk_f, text="Показувати QR-код на чеках",
+                        variable=qr_enabled_var,
+                        fg_color=C['accent'], hover_color=C['accent'],
+                        font=('Segoe UI', 12)).pack(side='left')
+
+        qr_url_f = tk.Frame(qf, bg=C['card']); qr_url_f.pack(fill='x', pady=(0,4))
+        lbl(qr_url_f, "Посилання (URL):", 11, color=C['text2']).pack(anchor='w')
+        qr_url_var = tk.StringVar(value=qr_cfg.get('url', ''))
+        qr_row = tk.Frame(qr_url_f, bg=C['card']); qr_row.pack(fill='x', pady=(2,0))
+        qr_url_entry = tk.Entry(qr_row, textvariable=qr_url_var,
+                                font=('Segoe UI', 11),
+                                bg=C['bg'], fg=C['text'],
+                                insertbackground=C['text'],
+                                relief='flat', bd=4)
+        qr_url_entry.pack(side='left', fill='x', expand=True)
+
+        def _paste_qr_url():
+            try:
+                clip = qr_url_entry.clipboard_get()
+                qr_url_var.set(clip.strip())
+            except Exception: pass
+
+        def _clear_qr_url():
+            qr_url_var.set('')
+            qr_url_entry.focus_set()
+
+        btn(qr_row, "📋 Вставити", _paste_qr_url, C['accent'], 105).pack(side='left', padx=(6,2))
+        btn(qr_row, "✕", _clear_qr_url, C['red'], 36).pack(side='left')
+        lbl(qr_url_f, "Наприклад: сайт готелю, Google Maps, Instagram, Hotels24", 9,
+            color=C['text2']).pack(anchor='w', pady=(2,0))
+        lbl(qr_url_f, "На чеку QR друкується фіксованого розміру (як картинка), "
+            "не залежно від довжини посилання.", 9, color=C['text2']).pack(anchor='w', pady=(4,0))
+
+        def do_save_qr():
+            cfg_qr = {'enabled': qr_enabled_var.get(), 'url': qr_url_var.get().strip()}
+            if _save_qr_cfg(cfg_qr):
+                messagebox.showinfo("✅ Збережено", "QR-налаштування збережено!\nВийде на наступному чеку.")
+
+        qr_bf = tk.Frame(qf, bg=C['card']); qr_bf.pack(fill='x', pady=(6,0))
+        btn(qr_bf, "💾 Зберегти QR", do_save_qr, C['green'], 150).pack(side='left')
 
     def _checkbox_tab(self, p):
         """Вкладка інтеграції з Checkbox РРО."""
