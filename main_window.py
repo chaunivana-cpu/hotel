@@ -15283,9 +15283,9 @@ class CashierFrame(tk.Frame):
         ]):
             st.columnconfigure(i, weight=1)
             c = ctk.CTkFrame(st, fg_color=color, corner_radius=12)
-            c.grid(row=0, column=i, padx=6, pady=6, sticky='ew', ipady=12)
-            val_lbl = lbl(c, val, 24, True, 'white'); val_lbl.pack(pady=(10,2))
-            lbl(c, lt, 11, color='white').pack(pady=(0,10))
+            c.grid(row=0, column=i, padx=6, pady=4, sticky='ew', ipady=4)
+            val_lbl = lbl(c, val, 18, True, 'white'); val_lbl.pack(pady=(6,0))
+            lbl(c, lt, 10, color='white').pack(pady=(0,6))
             self._stat_lbls[key] = val_lbl
 
         # cash_total / card_total / transfer_total вже обраховано з SQL вище
@@ -15301,14 +15301,41 @@ class CashierFrame(tk.Frame):
             ("🔒 Залишок залогів",  f"{max(dep_total_bg + _op_dep - ret_total, 0):.0f}₴", '#e67e22',   'dep_split'),
         ]):
             c = ctk.CTkFrame(sf, fg_color=color, corner_radius=10)
-            c.grid(row=0, column=col, padx=8, pady=4, sticky='ew', ipady=10)
-            val_lbl = lbl(c, val, 26, True, 'white'); val_lbl.pack(pady=(8,2))
-            lbl(c, lt, 11, color='white').pack(pady=(0,8))
+            c.grid(row=0, column=col, padx=8, pady=4, sticky='ew', ipady=4)
+            val_lbl = lbl(c, val, 19, True, 'white'); val_lbl.pack(pady=(6,0))
+            lbl(c, lt, 10, color='white').pack(pady=(0,6))
             self._split_lbls[key] = val_lbl
 
         METHOD_UA = {'cash':'готівка','card':'картка','transfer':'переказ','online':'онлайн'}
 
-        ap = card(self); ap.pack(fill='both', expand=True, padx=20, pady=8)
+        # ── Переміщення коштів (зліва) + Транзакції зміни (справа) ──
+        split_row = tk.Frame(self, bg=C['bg']); split_row.pack(fill='both', expand=True, padx=20, pady=8)
+        split_row.columnconfigure(0, weight=1)
+        split_row.columnconfigure(1, weight=2)
+        split_row.rowconfigure(0, weight=1)
+
+        tr_card = card(split_row); tr_card.grid(row=0, column=0, sticky='nsew', padx=(0,8))
+        tr_hdr = tk.Frame(tr_card, bg=C['card']); tr_hdr.pack(fill='x', padx=12, pady=(10,5))
+        lbl(tr_hdr, "💸  Переміщення коштів зміни", 13, True).pack(side='left')
+        btn(tr_hdr, "+ Додати", self._add_transfer, C['yellow'], 100, height=30).pack(side='right')
+        ff3, tt = mktree(tr_card, ('time','amount','reason','user'), 10, [100,90,180,110])
+        for c_, h in zip(('time','amount','reason','user'), ['Час','Сума','Призначення','Касир']):
+            tt.heading(c_, text=h)
+        tt.tag_configure('transfer', foreground='#f39c12')
+        if current_shift_id:
+            from app.utils.db import query as _tq
+            tr_rows = _tq("""SELECT created_at, amount, reason, username
+                FROM cash_transfers WHERE shift_id=%s ORDER BY created_at DESC""",
+                (current_shift_id,)) or []
+            for r in tr_rows:
+                t = r['created_at']
+                ts = t.strftime('%H:%M:%S') if hasattr(t,'strftime') else str(t)[:8]
+                tt.insert('', 'end', tags=('transfer',), values=(
+                    ts, f"{float(r['amount']):.0f}₴", r['reason'], r['username'] or ''))
+        ff3.pack(fill='both', expand=True, padx=8, pady=(0,10))
+        self._transfer_tree = tt
+
+        ap = card(split_row); ap.grid(row=0, column=1, sticky='nsew', padx=(8,0))
         lbl(ap, "📋  Транзакції зміни", 13, True).pack(anchor='w', padx=12, pady=(10,5))
         ff2, at = mktree(ap, ('time','room','guest','amount','method','note'),
                          10, [110, 90, 200, 90, 80, 260])
@@ -15338,28 +15365,6 @@ class CashierFrame(tk.Frame):
         ff2.pack(fill='both', expand=True, padx=8, pady=(0,10))
         self._pay_tree = at
         self._all_tree = at
-
-        # ── Переміщення коштів ──
-        tr_card = card(self); tr_card.pack(fill='x', padx=20, pady=8)
-        tr_hdr = tk.Frame(tr_card, bg=C['card']); tr_hdr.pack(fill='x', padx=12, pady=(10,5))
-        lbl(tr_hdr, "💸  Переміщення коштів зміни", 13, True).pack(side='left')
-        btn(tr_hdr, "+ Додати", self._add_transfer, C['yellow'], 100, height=30).pack(side='right')
-        ff3, tt = mktree(tr_card, ('time','amount','reason','user'), 5, [130,100,320,120])
-        for c_, h in zip(('time','amount','reason','user'), ['Час','Сума','Призначення','Касир']):
-            tt.heading(c_, text=h)
-        tt.tag_configure('transfer', foreground='#f39c12')
-        if current_shift_id:
-            from app.utils.db import query as _tq
-            tr_rows = _tq("""SELECT created_at, amount, reason, username
-                FROM cash_transfers WHERE shift_id=%s ORDER BY created_at DESC""",
-                (current_shift_id,)) or []
-            for r in tr_rows:
-                t = r['created_at']
-                ts = t.strftime('%H:%M:%S') if hasattr(t,'strftime') else str(t)[:8]
-                tt.insert('', 'end', tags=('transfer',), values=(
-                    ts, f"{float(r['amount']):.0f}₴", r['reason'], r['username'] or ''))
-        ff3.pack(fill='x', padx=8, pady=(0,10))
-        self._transfer_tree = tt
 
     def _add_transfer(self):
         """Діалог додавання переміщення коштів."""
