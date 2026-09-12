@@ -3471,6 +3471,31 @@ def _make_qr_canvas(parent, url, size=180):
 
 
 
+def _fix_mojibake(s):
+    """Виправляє типове 'кракозябри' — коли коректний UTF-8 текст (напр.
+    українська назва товару) десь помилково прочитаний як cp1251, і в
+    результаті замість літер виходить щось на кшталт 'Р РІ Р Р†Р Р…Рѕ'.
+    Стандартний, надійний тест: якщо перекодувати рядок назад у cp1251, а
+    потім розкодувати як utf-8 — і це вдається БЕЗ помилки і дає кириличні
+    літери — це майже напевно ознака саме такого зіпсованого тексту
+    (звичайний правильний текст так "випадково" не переробляється).
+    Якщо ознак немає — повертає рядок без змін."""
+    if not s or not isinstance(s, str):
+        return s
+    try:
+        fixed = s.encode('cp1251').decode('utf-8')
+        if any(('А' <= ch <= 'я') or ch in 'ЄєІіЇїҐґ' for ch in fixed):
+            return fixed
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        pass
+    return s
+
+def _looks_like_mojibake(s):
+    """True, якщо рядок схожий на зіпсований (кракозябри) текст."""
+    if not s or not isinstance(s, str):
+        return False
+    return _fix_mojibake(s) != s
+
 def _make_qr_ascii(url, width=36):
     """Генерує КОМПАКТНЕ ASCII-представлення QR-коду ФІКСОВАНОГО (а не
     'величезного') розміру для текстового друку на POS-принтері.
@@ -4665,6 +4690,56 @@ _NAV_ICON_COLORS = {
 }
 
 
+class NavButton(tk.Frame):
+    """Кастомна кнопка лівого меню: іконка окремим (більшим) шрифтом від
+    назви пункту. Звичайний CTkButton малює весь текст ОДНИМ шрифтом,
+    тож збільшити лише емодзі-іконку, не зачепивши розмір назви, іншим
+    способом не вийде. Підтримує .configure(fg_color=, text_color=),
+    щоб не переписувати код, який керує підсвіткою активного пункту."""
+    def __init__(self, parent, icon, name, icon_color, command, bg_color, hover_color):
+        super().__init__(parent, bg=bg_color, cursor='hand2')
+        self._fg_color = 'transparent'
+        self._bg_normal = bg_color
+        self._hover_color = hover_color
+        self._command = command
+        self.icon_lbl = tk.Label(self, text=icon, font=('Segoe UI Emoji', 16),
+                                  bg=bg_color, fg=icon_color)
+        self.icon_lbl.pack(side='left', padx=(12, 6), pady=6)
+        self.text_lbl = tk.Label(self, text=name, font=('Segoe UI', 12, 'bold'),
+                                  bg=bg_color, fg=icon_color, anchor='w')
+        self.text_lbl.pack(side='left', fill='both', expand=True, pady=6)
+        for w in (self, self.icon_lbl, self.text_lbl):
+            w.bind('<Button-1>', lambda e: self._command())
+            w.bind('<Enter>', self._on_enter)
+            w.bind('<Leave>', self._on_leave)
+
+    def _on_enter(self, e=None):
+        if self._fg_color == 'transparent':
+            self._set_bg(self._hover_color)
+
+    def _on_leave(self, e=None):
+        if self._fg_color == 'transparent':
+            self._set_bg(self._bg_normal)
+
+    def _set_bg(self, color):
+        super().configure(bg=color)
+        self.icon_lbl.configure(bg=color)
+        self.text_lbl.configure(bg=color)
+
+    def configure(self, **kw):
+        fg = kw.pop('fg_color', None)
+        tc = kw.pop('text_color', None)
+        if fg is not None:
+            self._fg_color = fg
+            self._set_bg(self._bg_normal if fg == 'transparent' else fg)
+        if tc is not None:
+            self.icon_lbl.configure(fg=tc)
+            self.text_lbl.configure(fg=tc)
+        if kw:
+            super().configure(**kw)
+    config = configure
+
+
 class HotelApp(ctk.CTk):
     def _quit(self):
         try:
@@ -5614,11 +5689,10 @@ class HotelApp(ctk.CTk):
             if not _sidebar_visible(key):
                 continue
             _color = _NAV_ICON_COLORS.get(key, C['text'])
-            b = ctk.CTkButton(
-                self._sb_nav, text=f" {icon}  {name}", anchor='w',
-                fg_color='transparent', hover_color=C['card2'],
-                text_color=_color, font=('Segoe UI', 13, 'bold'), height=44,
-                corner_radius=10, command=lambda k=key: self._show(k))
+            b = NavButton(
+                self._sb_nav, icon, name, _color,
+                command=lambda k=key: self._show(k),
+                bg_color=C['card'], hover_color=C['card2'])
             b.pack(fill='x', padx=10, pady=2)
             self.nav[key] = b
 
@@ -6334,9 +6408,9 @@ class DashboardFrame(tk.Frame):
         for i, (key, title, clr, val) in enumerate(_STAT_DEFS):
             _st_cols.columnconfigure(i, weight=1)
             cf = ctk.CTkFrame(_st_cols, fg_color=clr, corner_radius=12)
-            cf.grid(row=0, column=i, padx=4, pady=4, sticky='ew', ipady=4)
-            num_lbl = lbl(cf, val, 26, True, 'white'); num_lbl.pack(pady=(6,2))
-            ttl_lbl = lbl(cf, title, 10, color='white'); ttl_lbl.pack(pady=(0,6))
+            cf.grid(row=0, column=i, padx=4, pady=4, sticky='ew', ipady=2)
+            num_lbl = lbl(cf, val, 18, True, 'white'); num_lbl.pack(pady=(4,0))
+            ttl_lbl = lbl(cf, title, 9, color='white'); ttl_lbl.pack(pady=(0,4))
             self._stat_card_lbls[key] = (num_lbl, ttl_lbl)
 
         lbl(self, "🗺️  Статус номерів", 15, True).pack(anchor='w', padx=20, pady=(12,4))
@@ -25018,6 +25092,7 @@ class SettingsFrame(tk.Frame):
         refresh_btn(tb,lambda:self._load_svcs(),side='left',padx=4,pady=6)
         btn(tb,"📥 Імпорт XLS",lambda:self._menu_import_xls(),C['green'],130).pack(side='left',padx=4)
         btn(tb,"📤 Експорт XLS",lambda:self._menu_export_xls(),'#9b59b6',130).pack(side='left',padx=4)
+        btn(tb,"🔧 Кракозябри",lambda:self._menu_fix_mojibake(),'#e67e22',140).pack(side='left',padx=4)
         ff,self.svcs_t=mktree(p,('id','name','cat','price','unit','qty','stock','barcode','act'),14,[50,220,100,80,60,80,80,140,50])
         for c,h in zip(('id','name','cat','price','unit','qty','stock','barcode','act'),
                         ['ID','Назва / Категорія','Категорія','Ціна','Од.','К-сть','Залишок','Штрих-код','Акт.']):
@@ -25235,6 +25310,48 @@ class SettingsFrame(tk.Frame):
             messagebox.showinfo("✅",f"Збережено {len(rows)} позицій\n{path}")
         except Exception as e: messagebox.showerror("Помилка",str(e))
 
+    def _menu_fix_mojibake(self):
+        """Сканує назви товарів (і категорій) у меню на предмет 'кракозябрів'
+        (зіпсованого кодування) і пропонує виправити знайдені записи."""
+        from app.utils.db import query as _q_mj, execute as _ex_mj
+        try:
+            svcs = _q_mj("SELECT id, name, category FROM services") or []
+        except Exception as e:
+            messagebox.showerror("Помилка", f"Не вдалося прочитати товари: {e}"); return
+        fixes = []  # (id, old_name, new_name, old_cat, new_cat)
+        for s in svcs:
+            old_name = s.get('name') or ''
+            old_cat = s.get('category') or ''
+            new_name = _fix_mojibake(old_name)
+            new_cat = _fix_mojibake(old_cat)
+            if new_name != old_name or new_cat != old_cat:
+                fixes.append((s['id'], old_name, new_name, old_cat, new_cat))
+        if not fixes:
+            messagebox.showinfo("✅", "Кракозябрів не знайдено — всі назви виглядають коректно."); return
+
+        win = dlg_win(self, "🔧 Виправлення кракозябрів", "600x460")
+        f = tk.Frame(win, bg=C['bg']); f.pack(fill='both', expand=True, padx=15, pady=12)
+        lbl(f, f"Знайдено {len(fixes)} записів зі схожим на зіпсоване кодування текстом:", 12).pack(anchor='w', pady=(0,8))
+        pf, pt = mktree(f, ('old','new'), 12, [270, 270])
+        pt.heading('old', text='Було'); pt.heading('new', text='Стане')
+        for _id, on, nn, oc, nc in fixes:
+            pt.insert('', 'end', values=(on, nn))
+        pf.pack(fill='both', expand=True, pady=(0,10))
+        _st = lbl(f, "", 10); _st.pack(anchor='w')
+        def do_apply():
+            if not messagebox.askyesno("Підтвердження", f"Виправити {len(fixes)} записів у базі?"): return
+            ok = err = 0
+            for _id, on, nn, oc, nc in fixes:
+                try:
+                    _ex_mj("UPDATE services SET name=%s, category=%s WHERE id=%s", (nn, nc, _id))
+                    ok += 1
+                except Exception:
+                    err += 1
+            _st.configure(text=f"✅ Виправлено: {ok}" + (f", помилок: {err}" if err else ""), text_color=C['green'])
+            self._load_svcs()
+            win.after(1200, win.destroy)
+        btn(f, "✅ Виправити всі", do_apply, C['green'], 180).pack(anchor='w')
+
     def _menu_import_xls(self):
         from app.modules.logic import save_service
         import tkinter.filedialog as fd
@@ -25319,11 +25436,13 @@ class SettingsFrame(tk.Frame):
                         for r in real_rows:
                             name=str(r[0]).strip() if r else ''
                             if not name: skipped+=1; continue
+                            name=_fix_mojibake(name)  # виправляємо кракозябри, якщо файл прочитано не тим кодуванням
                             try:
                                 raw=str(r[2]).replace(',','.').replace('₴','').strip() if len(r)>2 else '0'
                                 price=float(raw) if raw else 0.0
                             except Exception: price=0.0
                             cat_val=str(r[3]).strip() if len(r)>3 and str(r[3]).strip() else cat_var.get()
+                            cat_val=_fix_mojibake(cat_val)
                             unit_val=str(r[4]).strip() if len(r)>4 and str(r[4]).strip() and str(r[4]).strip() not in ('0','✓','✗') else unit_var.get()
                             # «Код (КТ)» з файлу — це barcode/артикул, редагований користувачем.
                             # Раніше ця колонка взагалі не читалась при імпорті, тому будь-яка
@@ -25599,6 +25718,7 @@ class SettingsFrame(tk.Frame):
         def _save():
             _name=flds['name'].get().strip()
             if not _name: _st.configure(text="❌ Введіть назву",text_color=C['red']); return
+            _name=_fix_mojibake(_name)  # захист від кракозябрів при вставці зіпсованого тексту
             try: _price=float(flds['price'].get().replace(',','.') or 0)
             except: _st.configure(text="❌ Ціна — число",text_color=C['red']); return
             _unit=flds['unit'].get().strip() or 'шт'
