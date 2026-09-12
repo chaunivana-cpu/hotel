@@ -18409,9 +18409,14 @@ def _open_sauna_checkin_dlg(parent, room, on_save=None, booking=None):
             svc_total = sum(float(sv.get('total', 0)) for sv in _f())
         except (NameError, Exception):
             svc_total = 0.0
-        total = base + svc_total
+        try:
+            _disc_h = max(float(e_discount_h.get() or 0), 0.0)
+        except (NameError, Exception):
+            _disc_h = 0.0
+        total = max(base + svc_total - _disc_h, 0.0)
         svc_str = f" + {svc_total:.0f}₴ послуги" if svc_total > 0 else ""
-        lbl_total.configure(text=f"{total:.0f}₴  ({h:.1f}г × {default_price:.0f}₴{svc_str})")
+        disc_str = f" − {_disc_h:.0f}₴ знижка" if _disc_h > 0 else ""
+        lbl_total.configure(text=f"{total:.0f}₴  ({h:.1f}г × {default_price:.0f}₴{svc_str}{disc_str})")
         _topay = max(0.0, total - _adv_amount)
         if lbl_topay is not None:
             lbl_topay.configure(text=f"{_topay:.0f}₴", text_color=C['green'] if _topay > 0 else C['text2'])
@@ -18477,6 +18482,26 @@ def _open_sauna_checkin_dlg(parent, room, on_save=None, booking=None):
     lbl(pf,"Нотатка:",12).grid(row=4,column=0,sticky='w',pady=4)
     e_note = ent(pf,"",w=280); e_note.grid(row=4,column=1,padx=(15,0),pady=4,sticky='w')
 
+    # ── Знижка (з обов'язковим коментарем-причиною) — як при заселенні номерів ──
+    disc_frame_h = tk.Frame(p_card, bg=C['card']); disc_frame_h.pack(fill='x', padx=12, pady=(4,10))
+    ctk.CTkLabel(disc_frame_h, text="🏷 Знижка:", font=('Segoe UI',11),
+                 text_color=C['text2']).pack(side='left', padx=(0,6))
+    e_discount_h = ent(disc_frame_h, "0", w=80); e_discount_h.pack(side='left')
+    ctk.CTkLabel(disc_frame_h, text="₴", font=('Segoe UI',11), text_color=C['text2']).pack(side='left', padx=(4,14))
+    ctk.CTkLabel(disc_frame_h, text="Коментар:", font=('Segoe UI',11),
+                 text_color=C['text2']).pack(side='left', padx=(0,6))
+    e_discount_comment_h = ent(disc_frame_h, "напр. постійний клієнт", w=220)
+    e_discount_comment_h.pack(side='left')
+    _disc_hint_h = ctk.CTkLabel(disc_frame_h, text="", font=('Segoe UI',11,'bold'), text_color=C['yellow'])
+    _disc_hint_h.pack(side='left', padx=(10,0))
+    def _upd_disc_hint_h(*_):
+        try:
+            d = max(float(e_discount_h.get() or 0), 0.0)
+            _disc_hint_h.configure(text=f"(-{d:.0f}₴)" if d > 0 else "")
+        except Exception:
+            _disc_hint_h.configure(text="")
+    e_discount_h.bind('<KeyRelease>', lambda e: (_upd_disc_hint_h(), _update_total()))
+
     # ── Визначити категорію для послуг ──────────────────────────────────
     _cat_nm = (room.get('cat_name') or '').lower()
     _svc_keys = ['бані'] if any(k in _cat_nm for k in ['баня','бані','sauna','лазня']) else ['бесідки']
@@ -18509,7 +18534,14 @@ def _open_sauna_checkin_dlg(parent, room, on_save=None, booking=None):
         price_per_hour = default_price
         if price_per_hour <= 0:
             messagebox.showerror("","Ціна не вказана для цієї категорії. Перевірте Налаштування → Категорії."); return
-        total = price_per_hour * h
+        try:
+            discount_h = max(float(e_discount_h.get() or 0), 0.0)
+        except Exception:
+            messagebox.showerror("","Знижка має бути числом"); return
+        discount_comment_h = e_discount_comment_h.get().strip()
+        if discount_h > 0 and not discount_comment_h:
+            messagebox.showerror("","Вкажіть коментар (причину) знижки"); return
+        total = max(price_per_hour * h - discount_h, 0.0)
         try: dep = float(e_dep.get() or 0)
         except: dep = 0.0
 
@@ -18529,6 +18561,8 @@ def _open_sauna_checkin_dlg(parent, room, on_save=None, booking=None):
             gid = g['id']
 
         note_text = f"Баня: {h:.1f} год ({ci_dt.strftime('%H:%M')}–{co_dt.strftime('%H:%M')})"
+        if discount_h > 0:
+            note_text = f"Знижка: {discount_h:.0f}₴ ({discount_comment_h})  " + note_text
         extra = e_note.get().strip()
         if extra: note_text += f". {extra}"
 
@@ -18626,6 +18660,7 @@ def _open_sauna_checkin_dlg(parent, room, on_save=None, booking=None):
             f"  Кінець  : {co_dt.strftime('%d.%m.%Y  %H:%M')}",
             f"  Годин   : {h:.1f}",
             f"  Ціна/год: {price_per_hour:.0f}₴",
+        ] + ([f"  Знижка  : -{discount_h:.0f}₴ ({discount_comment_h})"] if discount_h > 0 else []) + [
             f"  Баня    : {total:.0f}₴",
         ]
         if _adv_paid_ci > 0:
