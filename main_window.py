@@ -7325,21 +7325,62 @@ def _CleaningFrame_seed_cleaners():
 
 
 def _CleaningFrame_seed_log_from_rooms():
-    """Синхронізує журнал — додає записи для кімнат зі статусом cleaning яких ще немає в незавершених записах."""
+    """Синхронізує журнал — додає записи для кімнат зі статусом cleaning
+    яких ще немає в незавершених записах.
+
+    ВАЖЛИВО (самовиправлення): якщо для кімнати вже Є завершений запис у
+    журналі (прибиральницю призначено, час закінчення проставлено), але
+    сам номер у таблиці rooms досі має статус 'cleaning' — це означає, що
+    оновлення статусу кімнати в БД тоді НЕ спрацювало (наприклад, тимчасова
+    помилка з'єднання), хоча журнал вже показує "прибрано". У такому
+    випадку раніше сюди щоразу додавався НОВИЙ примарний запис "Авто-запис"
+    без прибиральниці — виглядало, ніби прибрана кімната знову і знову
+    з'являється в списку на прибирання. Тепер замість цього ми просто
+    доганяємо статус кімнати в БД до того, що вже зафіксовано в журналі —
+    без створення зайвого запису."""
     import datetime as _dt_seed
     try:
         existing = _cl_load()
         # Кімнати що вже є в журналі як незавершені (finished порожній)
         in_log = {e['room'] for e in existing if not e.get('finished', '').strip()}
+        # Останній ЗАВЕРШЕНИЙ запис по кожній кімнаті (з непорожнім new_status,
+        # відмінним від 'cleaning') — вважаємо це "справжнім" підсумковим
+        # статусом кімнати з точки зору журналу.
+        last_resolved = {}
+        for e in existing:
+            if e.get('finished', '').strip() and e.get('new_status') and e.get('new_status') != 'cleaning':
+                last_resolved[e['room']] = e  # ORDER BY id ASC у _cl_load — останній переважає
         from app.utils.db import get_conn as _gc_seed
         with _gc_seed() as _c_seed:
             with _c_seed.cursor() as _cur_seed:
                 _cur_seed.execute(
-                    "SELECT number FROM rooms WHERE status='cleaning' ORDER BY number"
+                    "SELECT id, number FROM rooms WHERE status='cleaning' ORDER BY number"
                 )
-                cleaning_rooms = [str(r[0]) for r in _cur_seed.fetchall()]
-        # Додаємо тільки ті кімнати яких немає в журналі
-        missing = [r for r in cleaning_rooms if r not in in_log]
+                cleaning_rooms = [(r[0], str(r[1])) for r in _cur_seed.fetchall()]
+            # Самовиправлення: доганяємо статус кімнати в БД, якщо журнал
+            # вже показує, що прибирання завершене іншим статусом.
+            healed = []
+            for room_id, room_num in cleaning_rooms:
+                resolved = last_resolved.get(room_num)
+                if resolved:
+                    try:
+                        _sql_heal = "UPDATE rooms SET status=%s WHERE id=%s"
+                        _params_heal = (resolved['new_status'], room_id)
+                        with _c_seed.cursor() as _cur_h:
+                            _cur_h.execute(_sql_heal, _params_heal)
+                        _c_seed.commit()
+                        if getattr(_c_seed, 'backend', None) == 'main':
+                            try:
+                                from app.utils.db import mirror_execute_to_cloud as _mirr_heal
+                                _mirr_heal(_sql_heal, _params_heal)
+                            except Exception:
+                                pass
+                        healed.append(room_num)
+                    except Exception:
+                        pass
+        # Додаємо "Авто-запис" лише для кімнат, які реально ще ніхто не
+        # завершував (і які не щойно самовиправлені вище).
+        missing = [r for _id, r in cleaning_rooms if r not in in_log and r not in healed]
         if not missing:
             return
         now_str = _dt_seed.datetime.now().strftime('%d.%m.%Y %H:%M')
@@ -7799,6 +7840,7 @@ class CleaningFrame(tk.Frame):
                 # Оновити тільки цей запис в БД (не перезаписувати весь лог)
                 _cl_update(log_idx, self._log, self._log[log_idx])
             # Оновити статус кімнати в БД напряму
+            _room_status_ok = False
             try:
                 from app.utils.db import get_conn as _gce, mirror_execute_to_cloud as _mirr_rm1
                 _wce = _gce()
@@ -7815,10 +7857,26 @@ class CleaningFrame(tk.Frame):
                             _params_rm1 = (new_st, row_e[0])
                             _cure.execute(_sql_rm1, _params_rm1)
                     _ce.commit()
-                if row_e and getattr(_wce, 'backend', None) == 'main':
-                    _mirr_rm1(_sql_rm1, _params_rm1)
+                if row_e:
+                    _room_status_ok = True
+                    if getattr(_wce, 'backend', None) == 'main':
+                        _mirr_rm1(_sql_rm1, _params_rm1)
             except Exception as _ex_upd:
                 import traceback; traceback.print_exc()
+                messagebox.showerror(
+                    "⚠️ Статус кімнати НЕ оновлено",
+                    f"Запис у журналі прибирань збережено, але статус кімнати №{room_num} "
+                    f"у базі оновити НЕ вдалось:\n{_ex_upd}\n\n"
+                    f"Через це кімната може знову з'явитись у списку на прибирання. "
+                    f"Спробуйте зберегти ще раз, коли з'явиться зв'язок з сервером."
+                )
+                win.destroy(); self._load_log(); return
+            if not _room_status_ok:
+                messagebox.showwarning(
+                    "⚠️ Кімнату не знайдено",
+                    f"Кімнату №{room_num} не знайдено в базі — статус НЕ оновлено. "
+                    f"Запис у журналі збережено, але кімната може знову з'явитись у списку на прибирання."
+                )
             win.destroy(); self._load_log()
 
         bf = ctk.CTkFrame(scroll, fg_color='transparent'); bf.pack(fill='x', pady=10)
