@@ -7095,10 +7095,13 @@ class DashboardFrame(tk.Frame):
                             if strictly else
                             f"⚠️ Виїзд сьогодні: {len(today_co)} номерів — Виселити або Продовжити")
 
-                    ov = tk.Frame(self._grid_canvas, bg=_bg,
+                    # Раніше .place() клав банер ПОВЕРХ _grid_canvas — при
+                    # прокрутці сітки плитки заїжджали під нього й губились.
+                    # Тепер банер — окремий рядок-сусід ПЕРЕД canvas, займає
+                    # своє місце і зсуває сітку вниз, нічого не закриваючи.
+                    ov = tk.Frame(self._grid_canvas.master, bg=_bg,
                                   highlightbackground=_fg, highlightthickness=2)
-                    # place поверх canvas зверху зліва з правого відступу
-                    ov.place(relx=0.0, rely=0.0, anchor='nw', relwidth=1.0, y=0)
+                    ov.pack(in_=self._grid_canvas.master, before=self._grid_canvas, fill='x', side='top')
                     self._overdue_tile_overlay = ov
 
                     hf = tk.Frame(ov, bg=_bg); hf.pack(fill='x', padx=8, pady=(5, 3))
@@ -7107,7 +7110,7 @@ class DashboardFrame(tk.Frame):
                     tk.Button(hf, text='✕', bg=_bg, fg='#888888',
                               relief='flat', bd=0, cursor='hand2',
                               font=('Segoe UI', 10),
-                              command=lambda: ov.place_forget()).pack(side='right')
+                              command=lambda: ov.pack_forget()).pack(side='right')
 
                     cf = tk.Frame(ov, bg=_bg); cf.pack(fill='x', padx=8, pady=(0, 5))
                     for b in overdue[:12]:
@@ -7122,7 +7125,6 @@ class DashboardFrame(tk.Frame):
                     if len(overdue) > 12:
                         tk.Label(cf, text=f"  +{len(overdue)-12} ще",
                                  bg=_bg, fg='#888888', font=('Segoe UI', 8)).pack(side='left', padx=3)
-                    ov.lift()
                 except Exception as _ove:
                     log_error("Dashboard: tile overlay", _ove)
             self.after(100, _build_tile_overlay)
@@ -7201,9 +7203,9 @@ class DashboardFrame(tk.Frame):
                     _msg = (f"{_ico} {len(strictly)} прострочених виїздів — Виселити або Продовжити"
                             if strictly else
                             f"⚠️ Виїзд сьогодні: {len(today_co)} номерів — Виселити або Продовжити")
-                    ov = tk.Frame(self._grid_canvas, bg=_bg,
+                    ov = tk.Frame(self._grid_canvas.master, bg=_bg,
                                   highlightbackground=_fg, highlightthickness=2)
-                    ov.place(relx=0.0, rely=0.0, anchor='nw', relwidth=1.0, y=0)
+                    ov.pack(in_=self._grid_canvas.master, before=self._grid_canvas, fill='x', side='top')
                     self._overdue_tile_overlay = ov
                     hf = tk.Frame(ov, bg=_bg); hf.pack(fill='x', padx=8, pady=(5, 3))
                     tk.Label(hf, text=_msg, bg=_bg, fg=_fg,
@@ -7211,7 +7213,7 @@ class DashboardFrame(tk.Frame):
                     tk.Button(hf, text='✕', bg=_bg, fg='#888888',
                               relief='flat', bd=0, cursor='hand2',
                               font=('Segoe UI', 10),
-                              command=lambda: ov.place_forget()).pack(side='right')
+                              command=lambda: ov.pack_forget()).pack(side='right')
                     cf = tk.Frame(ov, bg=_bg); cf.pack(fill='x', padx=8, pady=(0, 5))
                     for b in overdue[:12]:
                         d  = b.get('days_late', 0)
@@ -7225,7 +7227,6 @@ class DashboardFrame(tk.Frame):
                     if len(overdue) > 12:
                         tk.Label(cf, text=f"  +{len(overdue)-12} ще",
                                  bg=_bg, fg='#888888', font=('Segoe UI', 8)).pack(side='left', padx=3)
-                    ov.lift()
                 except Exception: pass
             self.after(50, _rebuild_overlay)
 
@@ -10987,10 +10988,14 @@ class ChessFrame(tk.Frame):
                            if _strictly else
                            f"⚠️  Виїзд сьогодні: {len(_today_co)} номерів — Виселити або Продовжити")
 
-                # Overlay прикріплюємо до canvas (вже намальованого)
-                ov = tk.Frame(grid_wrap, bg=_bg_c,
+                # Раніше цей банер робився через .place() ПОВЕРХ grid_wrap —
+                # тобто накладався на шапку/перші рядки шахматки і закривав
+                # їх. Тепер створюємо його як звичайний рядок-сусід ПЕРЕД
+                # grid_wrap (через pack(before=...)) — він займає своє
+                # місце і зсуває сітку вниз, нічого не затуляючи.
+                ov = tk.Frame(self.canvas_area, bg=_bg_c,
                               highlightbackground=_brd_c, highlightthickness=2)
-                ov.place(relx=0.0, rely=0.0, anchor='nw', relwidth=1.0, y=0)
+                ov.pack(in_=self.canvas_area, before=grid_wrap, fill='x', side='top')
 
                 hf = tk.Frame(ov, bg=_bg_c); hf.pack(fill='x', padx=10, pady=(6, 3))
                 tk.Label(hf, text=_btitle, bg=_bg_c, fg=_brd_c,
@@ -10998,7 +11003,7 @@ class ChessFrame(tk.Frame):
                 tk.Button(hf, text='✕', bg=_bg_c, fg='#888888',
                           relief='flat', bd=0, cursor='hand2',
                           font=('Segoe UI', 10),
-                          command=lambda: ov.place_forget()).pack(side='right')
+                          command=lambda: ov.pack_forget()).pack(side='right')
 
                 cf = tk.Frame(ov, bg=_bg_c); cf.pack(fill='x', padx=10, pady=(0, 6))
                 for _b in _overdue_chess[:12]:
