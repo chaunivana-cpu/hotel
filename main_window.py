@@ -11900,6 +11900,7 @@ class CheckedinFrame(tk.Frame):
     def _apply_checkedin_rows(self, groups):
         self.tree.delete(*self.tree.get_children())
         self.tree.tag_configure('debt', foreground='#e74c3c')
+        self.tree.tag_configure('nodebt', foreground='#2ecc71')
         self.tree.tag_configure('shift_header', background=C['card2'], foreground=C['yellow'])
         _hdr_i = 0
         for hdr_txt, grp_rows in groups:
@@ -11910,7 +11911,7 @@ class CheckedinFrame(tk.Frame):
                                   values=('', _date_col, _name_col) + ('',) * (len(self._all_fields) - 3))
             for r in grp_rows:
                 self.tree.insert('', 'end', iid=r['vals'][0],
-                                  tags=('debt',) if r['debt'] else (),
+                                  tags=('debt',) if r['debt'] else ('nodebt',),
                                   values=r['vals'])
         try: self.tree.after(10, lambda: self.tree.yview_moveto(0))
         except Exception: pass
@@ -12391,6 +12392,7 @@ class CheckedOutFrame(tk.Frame):
     def _apply_rows(self, groups):
         self.tree.delete(*self.tree.get_children())
         self.tree.tag_configure('debt', foreground='#e74c3c')
+        self.tree.tag_configure('nodebt', foreground='#2ecc71')
         self.tree.tag_configure('shift_header', background=C['card2'], foreground=C['yellow'])
         _hdr_i = 0
         for hdr_txt, grp_rows in groups:
@@ -12401,7 +12403,7 @@ class CheckedOutFrame(tk.Frame):
                                   values=('', _date_col, _name_col) + ('',) * (len(('id','room','guest','phone','cin','cout','n','total','adv','dep','paid','debt')) - 3))
             for r in grp_rows:
                 self.tree.insert('', 'end', iid=r['vals'][0],
-                                  tags=('debt',) if r['debt'] else (),
+                                  tags=('debt',) if r['debt'] else ('nodebt',),
                                   values=r['vals'])
         try: self.tree.after(10, lambda: self.tree.yview_moveto(0))
         except Exception: pass
@@ -13692,7 +13694,7 @@ class BookingDetailDlg(ctk.CTkToplevel):
             messagebox.showerror("", "Не вдалося знайти цей платіж")
             return
 
-        win = dlg_win(self, "✏️ Редагувати платіж", "420x420")
+        win = dlg_win(self, "✏️ Редагувати платіж", "460x760")
         scroll = ctk.CTkScrollableFrame(win, fg_color=C['bg'])
         scroll.pack(fill='both', expand=True, padx=10, pady=10)
 
@@ -13735,6 +13737,47 @@ class BookingDetailDlg(ctk.CTkToplevel):
         try: e_amt.insert(0, f"{float(p.get('amount') or 0):.0f}")
         except Exception: e_amt.insert(0, "0")
 
+        # ── Дата й час платежу ──
+        f_dt = card(scroll); f_dt.pack(fill='x', pady=4)
+        lbl(f_dt, "📅 Дата й час платежу:", 12, True).pack(anchor='w', padx=12, pady=(8,3))
+        import datetime as _dt_ep
+        _cur_dt = p.get('created_at')
+        if hasattr(_cur_dt, 'strftime'):
+            _cur_dt_str = _cur_dt.strftime('%Y-%m-%d %H:%M')
+        else:
+            _cur_dt_str = (str(_cur_dt or '')[:16] or _dt_ep.datetime.now().strftime('%Y-%m-%d %H:%M'))
+        e_dt = ent(f_dt, "РРРР-ММ-ДД ГГ:ХХ", w=380); e_dt.pack(padx=12, pady=(0,8))
+        e_dt.insert(0, _cur_dt_str)
+
+        # ── Отримано від клієнта / Здача (лише довідково, для готівки) ──
+        f_cash = card(scroll); f_cash.pack(fill='x', pady=4)
+        lbl(f_cash, "💵 Отримано від клієнта (необов'язково):", 12, True).pack(anchor='w', padx=12, pady=(8,3))
+        e_recv = ent(f_cash, "напр. 500", w=380); e_recv.pack(padx=12, pady=(0,4))
+        _change_lbl = lbl(f_cash, "Здача: —", 11, color=C['text2'])
+        _change_lbl.pack(anchor='w', padx=12, pady=(0,8))
+        def _upd_change(*_):
+            try:
+                recv = float((e_recv.get() or '0').replace(',', '.'))
+                amt_now = float((e_amt.get() or '0').replace(',', '.'))
+                diff = recv - amt_now
+                if recv > 0:
+                    _change_lbl.configure(text=f"Здача: {diff:.0f}₴" if diff >= 0 else f"⚠️ Не вистачає {-diff:.0f}₴",
+                                           text_color=C['text2'] if diff >= 0 else C['red'])
+                else:
+                    _change_lbl.configure(text="Здача: —", text_color=C['text2'])
+            except Exception:
+                _change_lbl.configure(text="Здача: —", text_color=C['text2'])
+        e_recv.bind('<KeyRelease>', _upd_change)
+        e_amt.bind('<KeyRelease>', _upd_change)
+
+        # ── Знижка (з обов'язковим коментарем) — зменшує суму платежу ──
+        f_disc = card(scroll); f_disc.pack(fill='x', pady=4)
+        lbl(f_disc, "🏷 Знижка (необов'язково):", 12, True).pack(anchor='w', padx=12, pady=(8,3))
+        disc_row = tk.Frame(f_disc, bg=C['card']); disc_row.pack(fill='x', padx=12, pady=(0,8))
+        e_disc = ent(disc_row, "0", w=100); e_disc.pack(side='left')
+        lbl(disc_row, "₴   Коментар:", 11, color=C['text2']).pack(side='left', padx=(6,6))
+        e_disc_comment = ent(disc_row, "напр. постійний клієнт", w=220); e_disc_comment.pack(side='left')
+
         f3 = card(scroll); f3.pack(fill='x', pady=4)
         lbl(f3, "💳 Метод оплати:", 12, True).pack(anchor='w', padx=12, pady=(8,3))
         _meth_map = {'готівка':'cash','картка':'card','переказ':'transfer','онлайн':'online'}
@@ -13753,11 +13796,34 @@ class BookingDetailDlg(ctk.CTkToplevel):
                 _st.configure(text="❌ Невірна сума", text_color=C['red']); return
             if amt <= 0:
                 _st.configure(text="❌ Сума має бути більше 0", text_color=C['red']); return
+            try:
+                disc = max(float((e_disc.get() or '0').strip().replace(',', '.')), 0.0)
+            except ValueError:
+                _st.configure(text="❌ Знижка має бути числом", text_color=C['red']); return
+            disc_comment = e_disc_comment.get().strip()
+            if disc > 0 and not disc_comment:
+                _st.configure(text="❌ Вкажіть коментар (причину) знижки", text_color=C['red']); return
+            if disc > amt:
+                _st.configure(text="❌ Знижка більша за суму платежу", text_color=C['red']); return
+            amt_final = amt - disc
+            try:
+                pay_dt = _dt_ep.datetime.strptime(e_dt.get().strip(), '%Y-%m-%d %H:%M')
+            except Exception:
+                _st.configure(text="❌ Невірні дата/час (РРРР-ММ-ДД ГГ:ХХ)", text_color=C['red']); return
             note = e_note.get().strip()
+            _recv_txt = e_recv.get().strip()
+            if _recv_txt:
+                try:
+                    recv_v = float(_recv_txt.replace(',', '.'))
+                    note += f" | Отримано: {recv_v:.0f}₴, здача: {max(recv_v - amt_final, 0):.0f}₴"
+                except Exception:
+                    pass
+            if disc > 0:
+                note += f" | Знижка: {disc:.0f}₴ ({disc_comment})"
             method = _meth_map.get(meth_var.get(), 'cash')
             try:
-                _qp("UPDATE payments SET amount=%s, method=%s, note=%s WHERE id=%s",
-                    (amt, method, note, int(pid)), fetch=None)
+                _qp("UPDATE payments SET amount=%s, method=%s, note=%s, created_at=%s WHERE id=%s",
+                    (amt_final, method, note, pay_dt, int(pid)), fetch=None)
             except Exception as _ex:
                 _st.configure(text=f"❌ {_ex}", text_color=C['red']); return
             win.destroy(); self._rebuild()
@@ -13892,6 +13958,24 @@ class BookingDetailDlg(ctk.CTkToplevel):
         _notes_raw0 = str(b.get('notes','') or '')
         _m_ci_edit = _re_ci_edit.search(r'Фактичне заселення:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})', _notes_raw0)
         _ci_actual_default = _m_ci_edit.group(1) if _m_ci_edit else ''
+        # Якщо в нотатках позначки нема (буває у старих/імпортованих
+        # бронюваннях, або якщо крок запису часу колись не спрацював) —
+        # орієнтовно відновлюємо час заселення з першого платежу
+        # "Оплата/Доплата/Залог при заселенні" по цьому бронюванню, щоб
+        # поле не лишалось порожнім без потреби вручну вводити його.
+        if not _ci_actual_default and b.get('status') == 'checkedin':
+            try:
+                _ci_pay_row = _qe(
+                    """SELECT MIN(created_at) AS dt FROM payments
+                       WHERE booking_id=%s AND (note LIKE 'Оплата при заселенні%%'
+                             OR note LIKE 'Доплата при заселенні%%'
+                             OR note LIKE 'Залог при заселенні%%')""",
+                    (self.bid,), fetch='one') or {}
+                _ci_dt_fallback = _ci_pay_row.get('dt')
+                if _ci_dt_fallback and hasattr(_ci_dt_fallback, 'strftime'):
+                    _ci_actual_default = _ci_dt_fallback.strftime('%Y-%m-%d %H:%M')
+            except Exception:
+                pass
         # Якщо знижку вже застосовували раніше — знаходимо її тут (заздалегідь),
         # щоб коректно порахувати "Сума всього" нижче (без подвійного
         # віднімання знижки при повторному редагуванні).
@@ -14027,12 +14111,60 @@ class BookingDetailDlg(ctk.CTkToplevel):
                     if not _total_val:
                         _total_val = float(b.get('price_per_day') or 0)
         e_total.insert(0, f"{_total_val:.2f}")
-        lbl(pf,"🏷 Знижка:",11,color=C['text2']).grid(row=2,column=0,sticky='w',pady=3)
-        disc_row = tk.Frame(pf, bg=C['card']); disc_row.grid(row=2,column=1,padx=8,pady=3,sticky='w')
+
+        # ── Аванс при бронюванні / Залог — інформаційно, з реальних платежів ──
+        try:
+            _adv_row = _qe("""SELECT COALESCE(SUM(amount),0) AS s FROM payments
+                               WHERE booking_id=%s AND note LIKE 'Аванс%%'""",
+                           (self.bid,), fetch='one') or {}
+            _adv_paid = float(_adv_row.get('s') or 0)
+        except Exception:
+            _adv_paid = 0.0
+        try:
+            _dep_row = _qe("""SELECT
+                                 COALESCE(SUM(amount) FILTER (WHERE note LIKE 'Залог%%'),0) AS dep,
+                                 COALESCE(SUM(amount) FILTER (WHERE note LIKE 'Повернення залогу%%'),0) AS ret
+                               FROM payments WHERE booking_id=%s""",
+                          (self.bid,), fetch='one') or {}
+            _dep_paid = float(_dep_row.get('dep') or 0) - float(_dep_row.get('ret') or 0)
+        except Exception:
+            _dep_paid = 0.0
+        lbl(pf, "Аванс при бронюванні:", 11, color=C['text2']).grid(row=3, column=0, sticky='w', pady=3)
+        lbl(pf, f"{_adv_paid:.0f}₴" if _adv_paid > 0 else "—", 11, True,
+            C['green'] if _adv_paid > 0 else C['text2']).grid(row=3, column=1, padx=8, pady=3, sticky='w')
+        lbl(pf, "Залог:", 11, color=C['text2']).grid(row=4, column=0, sticky='w', pady=3)
+        dep_row = tk.Frame(pf, bg=C['card']); dep_row.grid(row=4, column=1, padx=8, pady=3, sticky='w')
+        e_dep_edit = ent(dep_row, "0", w=90); e_dep_edit.pack(side='left')
+        e_dep_edit.insert(0, f"{_dep_paid:.0f}" if _dep_paid > 0 else "0")
+        ctk.CTkLabel(dep_row, text="₴", font=('Segoe UI',11), text_color=C['text2']).pack(side='left', padx=(4,0))
+        lbl(pf, "🏷 Знижка:", 11, color=C['text2']).grid(row=5, column=0, sticky='w', pady=3)
+        disc_row = tk.Frame(pf, bg=C['card']); disc_row.grid(row=5, column=1, padx=8, pady=3, sticky='w')
         e_disc = ent(disc_row, "0", w=90); e_disc.pack(side='left')
         ctk.CTkLabel(disc_row, text="₴", font=('Segoe UI',11), text_color=C['text2']).pack(side='left', padx=(4,10))
         ctk.CTkLabel(disc_row, text="Коментар:", font=('Segoe UI',11), text_color=C['text2']).pack(side='left', padx=(0,6))
         e_disc_comment = ent(disc_row, "причина", w=140); e_disc_comment.pack(side='left')
+        lbl(pf, "⚠️ Зміна залогу створить коригувальний платіж (різницю) в історії.",
+            9, color=C['text2']).grid(row=6, column=0, columnspan=2, sticky='w', pady=(2,0))
+
+        # ── До доплати за проживання = Сума всього − Аванс − Знижка (БЕЗ
+        # залогу — залог не входить у вартість проживання, повертається
+        # окремо). ──
+        _todopl_lbl = lbl(pf, "", 13, True, C['yellow'])
+        _todopl_lbl.grid(row=7, column=0, columnspan=2, sticky='w', pady=(8,0))
+        def _upd_todopl(*_):
+            try:
+                _t = float((e_total.get() or '0').replace(',', '.'))
+            except Exception:
+                _t = _total_val
+            try:
+                _d = max(float((e_disc.get() or '0').replace(',', '.')), 0.0)
+            except Exception:
+                _d = 0.0
+            _rest = max(_t - _adv_paid - _d, 0.0)
+            _todopl_lbl.configure(text=f"💳 До доплати за номер: {_rest:.0f}₴  (без залогу)")
+        e_total.bind('<KeyRelease>', _upd_todopl)
+        e_disc.bind('<KeyRelease>', _upd_todopl)
+        _upd_todopl()
         # Якщо знижку вже застосовували раніше — підтягуємо її, щоб повторне
         # збереження не плодило дублікати рядка "Знижка: ..." у нотатках.
         if _m_disc_edit:
@@ -14078,6 +14210,10 @@ class BookingDetailDlg(ctk.CTkToplevel):
             discount_comment = e_disc_comment.get().strip()
             if discount > 0 and not discount_comment:
                 _st.configure(text="❌ Вкажіть коментар (причину) знижки", text_color=C['red']); return
+            try:
+                dep_new = max(float((e_dep_edit.get().strip() or '0').replace(',', '.')), 0.0)
+            except ValueError:
+                _st.configure(text="❌ Залог має бути числом", text_color=C['red']); return
             name  = e_name.get().strip()
             phone = e_phone.get().strip()
             notes = e_notes.get('1.0','end').strip()
@@ -14114,6 +14250,17 @@ class BookingDetailDlg(ctk.CTkToplevel):
                 _qe("""UPDATE bookings SET check_in=%s, check_out=%s, adults=%s,
                        price_per_day=%s, total_amount=%s, notes=%s WHERE id=%s""",
                     (ci, co, adults, price, total, notes, self.bid), fetch=None)
+                # ── Коригування залогу, якщо суму в полі змінили вручну ──
+                _dep_diff = round(dep_new - _dep_paid, 2)
+                if abs(_dep_diff) >= 0.01:
+                    if _dep_diff > 0:
+                        _qe("""INSERT INTO payments (booking_id,amount,method,note,shift_id,created_at)
+                               VALUES (%s,%s,'cash','Залог при заселенні (коригування)',%s,NOW())""",
+                            (self.bid, _dep_diff, get_current_shift_id()), fetch=None)
+                    else:
+                        _qe("""INSERT INTO payments (booking_id,amount,method,note,shift_id,created_at)
+                               VALUES (%s,%s,'cash','Повернення залогу (коригування)',%s,NOW())""",
+                            (self.bid, abs(_dep_diff), get_current_shift_id()), fetch=None)
             except Exception as _ex:
                 _st.configure(text=f"❌ {_ex}", text_color=C['red']); return
             win.destroy(); self._rebuild()
@@ -14308,8 +14455,37 @@ class PaymentDlg(ctk.CTkToplevel):
 
     def _build(self):
         from app.modules.logic import get_balance
-        from app.utils.db import get_conn
+        from app.utils.db import get_conn, query as _qbal
         self._bal = get_balance(self.bid)
+
+        # ── Пораховуємо борг НАПРЯМУ з платежів (та сама формула, що і в
+        # списку «Заселені»/«Виселені»): total_amount − (аванс + доплата).
+        # Залог у борг НЕ віднімається — він повертається гостю окремо, і
+        # не є оплатою за проживання. get_balance() з app.modules.logic
+        # тут навмисно НЕ використовується для суми боргу, бо там залог
+        # віднімається від боргу, через що цифра розходилась зі списком
+        # бронювань (показувало менший борг, ніж насправді).
+        try:
+            _b_row = _qbal("SELECT total_amount, price_per_day, check_in, check_out FROM bookings WHERE id=%s",
+                           (self.bid,), fetch='one') or {}
+            _total = float(_b_row.get('total_amount') or 0)
+            if not _total:
+                try:
+                    _n = max((_b_row['check_out'] - _b_row['check_in']).days, 1)
+                    _total = float(_b_row.get('price_per_day') or 0) * _n
+                except Exception:
+                    _total = 0.0
+            _pr = _qbal("""SELECT
+                    COALESCE(SUM(CASE WHEN amount>0 AND (note IS NULL
+                        OR (note NOT LIKE 'Залог при заселенні%%' AND note NOT LIKE 'deposit%%'
+                            AND note NOT LIKE 'Повернення залогу%%' AND note NOT LIKE 'Аванс%%'))
+                        THEN amount END),0) AS paid_dopla,
+                    COALESCE(SUM(CASE WHEN amount>0 AND note LIKE 'Аванс%%' THEN amount END),0) AS adv
+                FROM payments WHERE booking_id=%s""", (self.bid,), fetch='one') or {}
+            _paid_live = float(_pr.get('paid_dopla') or 0) + float(_pr.get('adv') or 0)
+            _debt = max(_total - _paid_live, 0)
+        except Exception:
+            _debt = self._bal.get('debt', 0)
 
         # Дістаємо дані гостя для чека
         self._guest_name = ''; self._guest_phone = ''; self._room_number = ''
@@ -14340,7 +14516,6 @@ class PaymentDlg(ctk.CTkToplevel):
             lbl(f, f"🧑 {self._guest_name}  |  №{self._room_number}", 12,
                 color=C['text2']).pack(pady=(0,4))
 
-        _debt = self._bal.get('debt', 0)
         lbl(f, f"Борг: {_debt:.0f}₴", 22, True,
             C['red'] if _debt > 0 else C['green']).pack(pady=4)
 
@@ -26502,25 +26677,55 @@ class SettingsFrame(tk.Frame):
         # ── Очистити тестові дані ─────────────────────────────────────────
         cl = card(scroll); cl.pack(fill='x', padx=10, pady=(0,10))
         lbl(cl, "🧹  Підготовка до запуску (очищення тестових даних)", 14, True).pack(anchor='w', padx=12, pady=(12,4))
-        lbl(cl, "Видаляє всі тестові бронювання, гостей, платежі, зміни та ресторанні замовлення.\n"
-                "Зберігає: номери, категорії, послуги, меню, користувачів, налаштування.",
+        lbl(cl, "Обери, що саме видалити. Номери, категорії, послуги, меню, "
+                "користувачів і налаштування ця дія не чіпає в будь-якому разі.",
             11, color=C['text2']).pack(anchor='w', padx=12, pady=(0,8))
+
+        # Список пунктів для вибіркового очищення: (ключ, підпис, таблиця(і))
+        _CLEANUP_ITEMS = [
+            ('restaurant', 'Ресторанні замовлення',        ['restaurant_order_items', 'restaurant_orders']),
+            ('payments',   'Платежі',                       ['payments']),
+            ('services',   'Замовлення послуг (бані/альтанки)', ['service_orders']),
+            ('bookings',   'Бронювання',                    ['bookings']),
+            ('guests',     'Гості (база гостей)',           ['guests']),
+            ('shifts',     'Зміни (журнал змін касира)',    ['shifts']),
+            ('sessions',   'Сесії входу',                   ['sessions']),
+            ('room_status','Статус номерів (скинути на "вільний")', None),
+            ('cache',      'Локальний кеш (SQLite)',        None),
+        ]
+        _cleanup_vars = {}
+        chk_frame = tk.Frame(cl, bg=C['card']); chk_frame.pack(fill='x', padx=12, pady=(0,6))
+        for key, label, _tbls in _CLEANUP_ITEMS:
+            v = tk.BooleanVar(value=True)
+            _cleanup_vars[key] = v
+            ctk.CTkCheckBox(chk_frame, text=label, variable=v,
+                             font=('Segoe UI', 11)).pack(anchor='w', pady=2)
+
+        def _select_all(val):
+            for v in _cleanup_vars.values():
+                v.set(val)
+        sel_row = tk.Frame(cl, bg=C['card']); sel_row.pack(fill='x', padx=12, pady=(0,8))
+        btn(sel_row, "☑ Обрати все", lambda: _select_all(True), C['card2'], 140, height=30).pack(side='left', padx=(0,6))
+        btn(sel_row, "☐ Зняти все", lambda: _select_all(False), C['card2'], 140, height=30).pack(side='left')
 
         clean_info = lbl(cl, "", 11); clean_info.pack(anchor='w', padx=12)
 
         def _do_cleanup():
             from tkinter import messagebox as _mb
+            _chosen = [(key, label, tbls) for key, label, tbls in _CLEANUP_ITEMS if _cleanup_vars[key].get()]
+            if not _chosen:
+                _mb.showwarning("", "Нічого не обрано для очищення."); return
+            _names = '\n'.join(f"  • {label}" for _k, label, _t in _chosen)
             ans = _mb.askyesno(
-                "⚠️ Очистити тестові дані",
-                "Це видалить ВСІ бронювання, гостей, платежі, зміни та замовлення!\n\n"
-                "❗ Цю дію НЕ МОЖНА скасувати.\n\n"
-                "Ви впевнені що хочете підготувати систему до реального використання?",
+                "⚠️ Очистити обрані дані",
+                f"Буде видалено (незворотно):\n\n{_names}\n\n"
+                "❗ Цю дію НЕ МОЖНА скасувати.\n\nПродовжити?",
                 icon='warning')
             if not ans:
                 return
             ans2 = _mb.askyesno(
                 "Підтвердіть ще раз",
-                "Останнє підтвердження:\nВидалити ВСІ тестові дані?",
+                "Останнє підтвердження:\nВидалити обрані дані?",
                 icon='warning')
             if not ans2:
                 return
@@ -26529,55 +26734,51 @@ class SettingsFrame(tk.Frame):
                 deleted = {}
                 with _gcc() as _conn_cl:
                     with _conn_cl.cursor() as _cur_cl:
-                        # Список таблиць у ПРАВИЛЬНОМУ порядку (дочірні перед батьківськими)
-                        tables_to_clean = [
-                            ('restaurant_order_items', 'Позиції замовлень ресторану'),
-                            ('restaurant_orders',      'Ресторанні замовлення'),
-                            ('payments',               'Платежі'),
-                            ('service_orders',         'Замовлення послуг'),
-                            ('bookings',               'Бронювання'),
-                            ('guests',                 'Гості'),
-                            ('shifts',                 'Зміни'),
-                            ('sessions',               'Сесії'),
-                        ]
-                        for tbl, label in tables_to_clean:
-                            try:
-                                _cur_cl.execute(f"SAVEPOINT sp_{tbl}")
-                                _cur_cl.execute(f"DELETE FROM {tbl}")
-                                deleted[label] = f"{_cur_cl.rowcount} рядків"
-                                _cur_cl.execute(f"RELEASE SAVEPOINT sp_{tbl}")
-                            except Exception as _et:
-                                _cur_cl.execute(f"ROLLBACK TO SAVEPOINT sp_{tbl}")
-                                deleted[label] = f"пропущено ({_et})"
-                        # Скинути статус номерів на 'free'
-                        try:
-                            _cur_cl.execute("SAVEPOINT sp_rooms")
-                            _cur_cl.execute("UPDATE rooms SET status='free', deposit_amount=0")
-                            deleted['Статус номерів'] = 'скинуто'
-                            _cur_cl.execute("RELEASE SAVEPOINT sp_rooms")
-                        except Exception: pass
+                        for key, label, tbls in _chosen:
+                            if key == 'room_status':
+                                try:
+                                    _cur_cl.execute("SAVEPOINT sp_rooms")
+                                    _cur_cl.execute("UPDATE rooms SET status='free', deposit_amount=0")
+                                    deleted[label] = 'скинуто'
+                                    _cur_cl.execute("RELEASE SAVEPOINT sp_rooms")
+                                except Exception as _et:
+                                    _cur_cl.execute("ROLLBACK TO SAVEPOINT sp_rooms")
+                                    deleted[label] = f"пропущено ({_et})"
+                                continue
+                            if key == 'cache':
+                                continue  # обробляється окремо нижче (не потребує БД-транзакції)
+                            for tbl in tbls:
+                                try:
+                                    _cur_cl.execute(f"SAVEPOINT sp_{tbl}")
+                                    _cur_cl.execute(f"DELETE FROM {tbl}")
+                                    deleted[f"{label} ({tbl})" if len(tbls) > 1 else label] = f"{_cur_cl.rowcount} рядків"
+                                    _cur_cl.execute(f"RELEASE SAVEPOINT sp_{tbl}")
+                                except Exception as _et:
+                                    _cur_cl.execute(f"ROLLBACK TO SAVEPOINT sp_{tbl}")
+                                    deleted[f"{label} ({tbl})" if len(tbls) > 1 else label] = f"пропущено ({_et})"
                     _conn_cl.commit()
 
-                # Очистити SQLite кеш
-                try:
-                    from app.utils.db_cache import _cache_instance as _ci_cl
-                    if _ci_cl:
-                        _ci_cl.full_sync()
-                except Exception: pass
+                if any(key == 'cache' for key, _l, _t in _chosen):
+                    try:
+                        from app.utils.db_cache import _cache_instance as _ci_cl
+                        if _ci_cl:
+                            _ci_cl.full_sync()
+                        deleted['Локальний кеш (SQLite)'] = 'синхронізовано заново'
+                    except Exception as _ec2:
+                        deleted['Локальний кеш (SQLite)'] = f"пропущено ({_ec2})"
 
                 report = '\n'.join(f"  ✅ {k}: {v}" for k, v in deleted.items())
-                log_info(f"[CLEANUP] Тестові дані очищено:\n{report}")
+                log_info(f"[CLEANUP] Обрані тестові дані очищено:\n{report}")
                 clean_info.configure(text=f"✅ Очищено успішно!\n{report}", text_color=C['green'])
-                _mb.showinfo("✅ Готово!",
-                    f"Систему підготовлено до реального використання.\n\n{report}\n\n"
-                    "Рекомендується перезапустити програму.")
+                _mb.showinfo("✅ Готово!", f"Обрані дані видалено.\n\n{report}\n\n"
+                             "Рекомендується перезапустити програму.")
             except Exception as _ec:
                 log_error("[CLEANUP] помилка очищення", _ec)
                 clean_info.configure(text=f"❌ Помилка: {_ec}", text_color=C['red'])
                 _mb.showerror("Помилка", str(_ec))
 
         cl_bf = tk.Frame(cl, bg=C['card']); cl_bf.pack(fill='x', padx=12, pady=(4,12))
-        btn(cl_bf, "🧹 Очистити тестові дані", _do_cleanup, '#8B0000', 220).pack(side='left')
+        btn(cl_bf, "🧹 Очистити обране", _do_cleanup, '#8B0000', 220).pack(side='left')
 
     def _refresh_cloud_status_labels(self):
         """Оновлює написи 'Востаннє оновлено в хмарі' та 'Зараз працює: ...'.
