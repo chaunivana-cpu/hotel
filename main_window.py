@@ -4019,13 +4019,16 @@ class SetupWindow(ctk.CTk):
         self._build()
         self.update_idletasks()
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        _saved_geom = self._load_setup_geom()
+        _saved_geom, _saved_state = self._load_setup_geom()
         if _saved_geom:
             self.geometry(_saved_geom)
         else:
             w, h = min(520, sw - 40), min(620, sh - 40)
             x = (sw - w) // 2; y = (sh - h) // 2
             self.geometry(f"{w}x{h}+{x}+{y}")
+        if _saved_state == 'zoomed':
+            try: self.state('zoomed')
+            except Exception: pass
         self.minsize(400, 480)
         self.protocol("WM_DELETE_WINDOW", self._on_setup_close)
         try:
@@ -4035,28 +4038,30 @@ class SetupWindow(ctk.CTk):
 
     # ── Розмір/позиція вікна входу — запам'ятовуються між запусками ────────
     def _setup_geom_path(self):
-        p = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),'..','..','config','setup_window_geom.json'))
-        os.makedirs(os.path.dirname(p), exist_ok=True)
+        p = os.path.join(get_data_dir(), 'setup_window_geom.json')
+        try: os.makedirs(os.path.dirname(p), exist_ok=True)
+        except Exception: pass
         return p
 
     def _load_setup_geom(self):
         try:
             with open(self._setup_geom_path(), encoding='utf-8') as f:
-                geom = json.load(f).get('geometry', '')
+                _data = json.load(f)
+            geom = _data.get('geometry', '')
             # Базова перевірка, що розмір адекватний (не з'їхав за межі екрана
             # чи не залишився від іншого, набагато більшого монітора)
             if geom and 'x' in geom:
                 dims = geom.split('+')[0].split('x')
                 if len(dims) == 2 and int(dims[0]) >= 400 and int(dims[1]) >= 480:
-                    return geom
+                    return geom, _data.get('state', 'normal')
         except Exception:
             pass
-        return None
+        return None, 'normal'
 
     def _save_setup_geom(self):
         try:
             with open(self._setup_geom_path(), 'w', encoding='utf-8') as f:
-                json.dump({'geometry': self.geometry()}, f, ensure_ascii=False)
+                json.dump({'geometry': self.geometry(), 'state': self.state()}, f, ensure_ascii=False)
         except Exception as e:
             log_error("_save_setup_geom", e)
 
