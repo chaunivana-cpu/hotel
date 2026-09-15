@@ -1633,6 +1633,15 @@ def save_session_start(user=None, force_new=False):
                     if row:
                         s['shift_id'] = row[0]
                 _cS.commit()
+            # Одразу скидаємо кеш кімнат у RAM — інакше Дашборд/Каса могли
+            # намалюватись зі "старими" даними (з моменту ДО відкриття
+            # зміни) і показувати їх, поки хтось вручну не натисне
+            # "Оновити". Тепер перший же рендер після відкриття зміни
+            # гарантовано піде за свіжими даними.
+            try:
+                _invalidate_rooms_cache()
+            except Exception:
+                pass
         except Exception as e:
             print(f"shift create error: {e}")
 
