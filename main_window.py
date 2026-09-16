@@ -26582,6 +26582,42 @@ class SettingsFrame(tk.Frame):
         btn(cl_bf, "🔗 Тест хмари", self._test_cloud_db, C['green'], 130).pack(side='left', padx=4)
         btn(cl_bf, "📦 Ініціалізувати хмару", self._init_cloud_db, C['yellow'], 190).pack(side='left', padx=4)
         btn(cl_bf, "🔄 Оновити довідники в хмарі", self._push_cloud_refs, '#3498db', 220).pack(side='left', padx=4)
+
+        # ── Інтервал фонової синхронізації довідників у хмару ──────────────
+        try:
+            from app.utils.db import get_sync_interval as _get_sync_iv
+            _cur_iv_sec = _get_sync_iv()
+        except Exception:
+            _cur_iv_sec = 6 * 3600
+        iv_row = row_frm(cl_card)
+        ctk.CTkLabel(iv_row, text="Оновлювати довідники в хмарі кожні:",
+                     font=('Segoe UI',11), text_color=C['text2'], width=260, anchor='w').pack(side='left')
+        e_sync_iv = ent(iv_row, w=80); e_sync_iv.insert(0, str(max(_cur_iv_sec // 60, 1))); e_sync_iv.pack(side='left')
+        ctk.CTkLabel(iv_row, text="хвилин", font=('Segoe UI',11), text_color=C['text2']).pack(side='left', padx=(6,0))
+        _iv_status = lbl(cl_card, "", 10, color=C['text2'])
+        def _save_sync_iv():
+            try:
+                _mins = int(e_sync_iv.get().strip())
+                if _mins < 1:
+                    raise ValueError
+            except Exception:
+                _iv_status.configure(text="❌ Введіть ціле число хвилин (мінімум 1)", text_color=C['red'])
+                return
+            try:
+                from app.utils.db import save_sync_interval as _save_sync_iv_fn
+                _save_sync_iv_fn(_mins * 60)
+                _iv_status.configure(
+                    text=f"✅ Збережено — застосується з наступного циклу синхронізації "
+                         f"(не потрібно перезапускати програму).",
+                    text_color=C['green'])
+            except Exception as _e:
+                _iv_status.configure(text=f"❌ {_e}", text_color=C['red'])
+        btn(iv_row, "💾 Зберегти інтервал", _save_sync_iv, width=170).pack(side='left', padx=(12,0))
+        _iv_status.pack(anchor='w', padx=12, pady=(0,4))
+        lbl(cl_card, "За замовчуванням — 360 хв (6 год). Менший інтервал = хмара швидше "
+                      "«знатиме» про нові зміни/бронювання/кімнати на випадок аварії основного "
+                      "сервера, але й частіше навантажує обидва сервери.",
+            10, color=C['text2']).pack(anchor='w', padx=12, pady=(0,6))
         self.cloud_info = lbl(cl_card, "", 11, color=C['green'])
         self.cloud_info.configure(wraplength=850, justify='left')
         self.cloud_info.pack(anchor='w', padx=12, pady=(0,6))
