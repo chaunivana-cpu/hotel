@@ -5134,16 +5134,75 @@ try:
 except Exception as _sw_e:
     _logger.warning(f"smart window placement не активовано: {_sw_e}")
 
-# ══ ЗАХИСТ ВІД «НАСКРІЗНОГО» КЛІКУ ПРИ ЗАКРИТТІ ВІКНА КНОПКОЮ ═══════════════════
-# CustomTkinter 5.2.x спрацьовує кнопку в момент НАТИСКАННЯ. Якщо команда кнопки
-# закриває вікно (destroy), вікно зникає, поки користувач ще тримає кнопку миші,
-# і «відпускання» потрапляє на віджет ПІД вікном (напр. на рядок таблиці) — той
-# реагує кліком: відкриває картку гостя, ставить галочку тощо. Зовні це виглядало
-# так, ніби кнопка «Закрити» не працює (картка одразу з'являлась знову).
-# Тепер destroy() CTkToplevel, викликаний під час утримання кнопки миші,
-# виконується одразу після її відпускання (не довше ~2с).
-_SW_MOUSE_HELD = [False]
+# ══ ЗАХИСТ ВІД «НАСКРІЗНОГО» КЛІКУ ПРИ ЗАКРИТТІ ВІКНА МИШЕЮ ═══════════════════
+# Проблема. CustomTkinter 5.2.x спрацьовує кнопку в момент НАТИСКАННЯ. Якщо команда
+# кнопки закриває вікно (destroy), воно зникає, поки користувач ще тримає кнопку
+# миші, — і «відпускання» потрапляє на віджет ПІД вікном (рядок таблиці, плитка
+# номера, список меню...). Те реагує кліком: відкриває картку гостя/бронювання,
+# додає позицію в замовлення тощо. Зовні: «кнопка Закрити не працює», бо вікно
+# одразу з'являється знову. Те саме дає ПОДВІЙНИЙ клік по «Закрити»: другий клік
+# лягає на віджет під вікном (галочку перемикає, кнопку натискає, рядок обирає).
+# Захист у два шари (працює для ВСІХ вікон і віджетів програми, включно з новими):
+#   1) destroy() вікна (CTkToplevel і звичайних tk.Toplevel-діалогів), викликаний під
+#      час утримання кнопки миші, виконується одразу після її відпускання (≤ ~2с);
+#   2) щойно вікно закрито мишею, протягом _SW_GHOST_SECS у радіусі _SW_GHOST_PX від
+#      місця закриття «зайвий» клік (відпускання, другий клік подвійного) відкидається
+#      ще ДО обробників віджета: фільтр стоїть ПЕРШИМ у bindtags кожного віджета, тож
+#      захищені й CustomTkinter, і звичайні tk/ttk (Treeview, Listbox, Button...).
+_SW_MOUSE_HELD = [False]      # кнопку миші втримують (ставить CTkButton 5.x на <Button-1>)
 _SW_MOUSE_T = [0.0]
+_SW_PRESS_T = [0.0]           # час останньої події кнопки миші (будь-де в програмі)
+_SW_CLOSE = {'t': 0.0, 'x': -10**6, 'y': -10**6}     # коли і де вікно було закрите мишею
+_SW_GHOST_SECS = 0.55
+_SW_GHOST_PX = 40
+_SW_TAG = 'SwMouseFilter'
+
+def _sw_note_close(win):
+    """Запам'ятовує, де і коли вікно закрито мишею (для придушення «зайвого» кліку)."""
+    try:
+        import time as _nt
+        now = _nt.time()
+        if _SW_MOUSE_HELD[0] or (now - _SW_PRESS_T[0]) < 1.2:
+            x, y = win.winfo_pointerxy()
+            _SW_CLOSE['t'], _SW_CLOSE['x'], _SW_CLOSE['y'] = now, x, y
+    except Exception:
+        pass
+
+def _sw_note_ghost(widget=None):
+    """Позначає, що щойно щось закрито/сховано кліком миші В ЦЬОМУ МІСЦІ (для панелей і
+    банерів, які не є вікнами) — щоб продовження кліку не спрацювало на віджеті під ними."""
+    try:
+        import time as _gt
+        w = widget if widget is not None else tk._default_root
+        x, y = w.winfo_pointerxy()
+        _SW_CLOSE['t'], _SW_CLOSE['x'], _SW_CLOSE['y'] = _gt.time(), x, y
+    except Exception:
+        pass
+
+def _sw_ghost_click(event):
+    """True, якщо клік — «продовження» кліку, що щойно закрив вікно, у тому ж місці."""
+    try:
+        import time as _gt
+        if (_gt.time() - _SW_CLOSE['t']) > _SW_GHOST_SECS:
+            return False
+        return (abs(event.x_root - _SW_CLOSE['x']) <= _SW_GHOST_PX and
+                abs(event.y_root - _SW_CLOSE['y']) <= _SW_GHOST_PX)
+    except Exception:
+        return False
+
+def _sw_mouse_filter(event):
+    """Стоїть ПЕРШИМ у bindtags кожного віджета: веде облік натискань/відпускань миші
+    і відкидає «зайвий» клік одразу після закриття вікна (повернення 'break' зупиняє
+    всі наступні обробники — і Python-ові, і внутрішні обробники Tk)."""
+    try:
+        import time as _mf
+        _SW_PRESS_T[0] = _mf.time()
+        if event.type == tk.EventType.ButtonRelease:
+            _SW_MOUSE_HELD[0] = False
+        if _sw_ghost_click(event):
+            return 'break'
+    except Exception:
+        pass
 
 def _install_click_through_guard():
     if getattr(ctk.CTkToplevel, '_sw_ct_installed', False):
@@ -5153,62 +5212,88 @@ def _install_click_through_guard():
     def _mouse_held():
         return _SW_MOUSE_HELD[0] and (_ct_time.time() - _SW_MOUSE_T[0]) < 3.0
 
-    # 1) Фіксуємо натискання ДО виконання команди кнопки (лише для версій, де кнопка
-    #    спрацьовує на <Button-1>; у новіших — на відпусканні, там проблеми немає).
+    # ── шар 1а: фіксуємо натискання ДО виконання команди CTkButton (5.x спрацьовує на
+    #    <Button-1>; у 6.x — на відпусканні, там ця проблема не виникає). Скидає прапорець
+    #    відпускання у _sw_mouse_filter.
     if hasattr(ctk.CTkButton, '_clicked'):
         _orig_clicked = ctk.CTkButton._clicked
-
-        def _release(_e=None):
-            _SW_MOUSE_HELD[0] = False
 
         def _clicked(self, event=None):
             if event is not None:
                 _SW_MOUSE_HELD[0] = True
                 _SW_MOUSE_T[0] = _ct_time.time()
-                if not getattr(ctk.CTkButton, '_sw_rel_bound', False):
-                    try:
-                        # CustomTkinter забороняє bind_all на своїх віджетах — викликаємо базовий Tk
-                        tk.Misc.bind_all(self, '<ButtonRelease>', _release, add='+')
-                        ctk.CTkButton._sw_rel_bound = True
-                    except Exception:
-                        pass
             return _orig_clicked(self, event)
         ctk.CTkButton._clicked = _clicked
 
-    # 2) Відкладаємо destroy вікна, поки кнопка миші не відпущена.
-    _orig_destroy = ctk.CTkToplevel.destroy
+    # ── шар 1б: відкладаємо destroy вікна, поки кнопка миші не відпущена (якщо вдалось
+    #    це відстежити). Це лише «ввічлива пауза» — справжній захист від наскрізного
+    #    кліку дає шар 2 нижче (фільтр по місцю й часу закриття), який діє незалежно
+    #    від того, чи спрацювало відстеження відпускання. Тому чекати довго тут не
+    #    потрібно: якщо відпускання не зафіксовано за ~160мс, вікно просто закривається,
+    #    а шар 2 однаково прибере «зайвий» клік, коли фізичне відпускання таки станеться.
+    def _make_destroy(orig, is_ctk):
+        def _destroy(self):
+            try:
+                # CTkToplevel.destroy сам викликає tkinter.Toplevel.destroy — там уже все оброблено
+                if not is_ctk and isinstance(self, ctk.CTkToplevel):
+                    return orig(self)
+                if getattr(self, '_sw_destroy_pending', False):
+                    return                              # вже чекаємо відпускання
+                try:
+                    popup_like = bool(self.overrideredirect())   # підказки/випадні списки — без відкладання
+                except Exception:
+                    popup_like = False
+                if _mouse_held() and not popup_like:
+                    self._sw_destroy_pending = True
 
-    def _destroy(self):
-        try:
-            if getattr(self, '_sw_destroy_pending', False):
-                return                              # вже чекаємо відпускання
-            if _mouse_held():
-                self._sw_destroy_pending = True
-
-                def _poll(n=0):
-                    try:
-                        if not self.winfo_exists():
+                    def _poll(n=0):
+                        try:
+                            if not self.winfo_exists():
+                                return
+                        except Exception:
                             return
-                    except Exception:
-                        return
-                    if _mouse_held() and n < 100:   # до ~2с
-                        self.after(20, lambda: _poll(n + 1))
-                    else:
-                        try: _orig_destroy(self)
-                        except Exception: pass
-                self.after(20, _poll)
-                return
-        except Exception:
-            pass
-        return _orig_destroy(self)
-    ctk.CTkToplevel.destroy = _destroy
+                        if _mouse_held() and n < 8:   # ~160мс — лише ввічлива пауза;
+                            self.after(20, lambda: _poll(n + 1))
+                        else:
+                            _sw_note_close(self)
+                            try: orig(self)
+                            except Exception: pass
+                    self.after(20, _poll)
+                    return
+                _sw_note_close(self)
+            except Exception:
+                pass
+            return orig(self)
+        return _destroy
+
+    ctk.CTkToplevel.destroy = _make_destroy(ctk.CTkToplevel.destroy, True)
+    tk.Toplevel.destroy = _make_destroy(tk.Toplevel.destroy, False)
+
+    # ── шар 2: фільтр «зайвого» кліку — перший тег у bindtags кожного нового віджета
+    if not getattr(tk.BaseWidget, '_sw_tag_installed', False):
+        _orig_init = tk.BaseWidget.__init__
+
+        def _init(self, *a, **kw):
+            _orig_init(self, *a, **kw)
+            try:
+                if not getattr(tk.BaseWidget, '_sw_tag_bound', False):
+                    # CustomTkinter забороняє bind_all на своїх віджетах — викликаємо базовий Tk
+                    tk.Misc.bind_class(self, _SW_TAG, '<ButtonPress>', _sw_mouse_filter)
+                    tk.Misc.bind_class(self, _SW_TAG, '<ButtonRelease>', _sw_mouse_filter)
+                    tk.BaseWidget._sw_tag_bound = True
+                _tags = self.bindtags()
+                if _SW_TAG not in _tags:
+                    self.bindtags((_SW_TAG,) + tuple(_tags))
+            except Exception:
+                pass
+        tk.BaseWidget.__init__ = _init
+        tk.BaseWidget._sw_tag_installed = True
     ctk.CTkToplevel._sw_ct_installed = True
 
 try:
     _install_click_through_guard()
 except Exception as _ct_e:
     _logger.warning(f"click-through guard не активовано: {_ct_e}")
-
 
 def dlg_win(parent, title, size="500x400", modal=True):
     w = ctk.CTkToplevel(parent)
@@ -6800,7 +6885,7 @@ class HotelApp(ctk.CTk):
                                 fg_color="#444", hover_color="#555",
                                 font=("Segoe UI", 10), height=28, width=90).pack(side="left", padx=2)
                             ctk.CTkButton(self._upd_banner, text="✕",
-                                command=lambda: self._upd_banner.place_forget(),
+                                command=lambda: (_sw_note_ghost(self._upd_banner), self._upd_banner.place_forget()),
                                 fg_color="transparent", hover_color="#333",
                                 font=("Segoe UI", 11), height=28, width=30).pack(side="right", padx=4)
                         except Exception: pass
@@ -8850,7 +8935,7 @@ class DashboardFrame(tk.Frame):
                     tk.Button(hf, text='✕', bg=_bg, fg='#888888',
                               relief='flat', bd=0, cursor='hand2',
                               font=('Segoe UI', 10),
-                              command=lambda: ov.pack_forget()).pack(side='right')
+                              command=lambda: (_sw_note_ghost(ov), ov.pack_forget())).pack(side='right')
 
                     cf = tk.Frame(ov, bg=_bg); cf.pack(fill='x', padx=8, pady=(0, 5))
                     for b in overdue[:12]:
@@ -8953,7 +9038,7 @@ class DashboardFrame(tk.Frame):
                     tk.Button(hf, text='✕', bg=_bg, fg='#888888',
                               relief='flat', bd=0, cursor='hand2',
                               font=('Segoe UI', 10),
-                              command=lambda: ov.pack_forget()).pack(side='right')
+                              command=lambda: (_sw_note_ghost(ov), ov.pack_forget())).pack(side='right')
                     cf = tk.Frame(ov, bg=_bg); cf.pack(fill='x', padx=8, pady=(0, 5))
                     for b in overdue[:12]:
                         d  = b.get('days_late', 0)
@@ -12809,7 +12894,7 @@ class ChessFrame(tk.Frame):
                 tk.Button(hf, text='✕', bg=_bg_c, fg='#888888',
                           relief='flat', bd=0, cursor='hand2',
                           font=('Segoe UI', 10),
-                          command=lambda: ov.pack_forget()).pack(side='right')
+                          command=lambda: (_sw_note_ghost(ov), ov.pack_forget())).pack(side='right')
 
                 cf = tk.Frame(ov, bg=_bg_c); cf.pack(fill='x', padx=10, pady=(0, 6))
                 for _b in _overdue_chess[:12]:
