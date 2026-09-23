@@ -12695,6 +12695,48 @@ class ChessFrame(tk.Frame):
                 else:
                     try: chess = _sqlite_bookings(status=['confirmed','checkedin'], limit=1000)
                     except Exception: chess = []
+            # Заселені бронювання — ОКРЕМИМ запитом, БЕЗ фільтра по видимому
+            # вікну дат. get_chess(start,end) фільтрує за вікном шахматки, тож
+            # гість, що заїхав задовго до вікна і досі живе (прострочив виїзд,
+            # ще не виселений), у список не потрапляв — номер виглядав вільним,
+            # хоча гість там і живе. Тут само рахуємо борг (_SQL_STAY_TOTAL —
+            # те саме джерело правди, що й у "Заселені гості").
+            if not _conn_failed:
+                try:
+                    from app.utils.db import get_conn as _gc_ci
+                    with _gc_ci() as _cic:
+                        with _cic.cursor() as _cicur:
+                            _cicur.execute(f"""
+                                SELECT b.id, b.room_id, b.check_in, b.check_out, b.status,
+                                       COALESCE(g.name,'') as guest_name,
+                                       {_SQL_STAY_TOTAL} as _sw_total,
+                                       COALESCE((SELECT SUM(p.amount) FROM payments p
+                                                 WHERE p.booking_id=b.id AND p.amount>0
+                                                   AND p.note NOT ILIKE '%Залог%'
+                                                   AND p.note NOT ILIKE '%deposit%'
+                                                   AND p.note NOT ILIKE '%Повернення%'), 0) as _sw_paid
+                                FROM bookings b
+                                LEFT JOIN guests g ON g.id = b.guest_id
+                                WHERE b.status = 'checkedin'
+                            """)
+                            _cols_ci = [d[0] for d in _cicur.description]
+                            _checkedin_full = [dict(zip(_cols_ci, row)) for row in _cicur.fetchall()]
+                    for _b in _checkedin_full:
+                        _b['debt'] = max(float(_b.pop('_sw_total') or 0) - float(_b.pop('_sw_paid') or 0), 0)
+                    chess = [b for b in chess if b.get('status') != 'checkedin'] + _checkedin_full
+                except Exception as _e_ci:
+                    try: log_error("ChessFrame: заселені бронювання (без вікна дат)", _e_ci)
+                    except Exception: pass
+                    if OFFLINE_FALLBACK_ENABLED:
+                        try:
+                            _checkedin_full = _sqlite_bookings(status='checkedin', limit=1000)
+                            _pays = _sqlite_payments_for_bookings([b['id'] for b in _checkedin_full])
+                            for _b in _checkedin_full:
+                                _fin = calc_stay_financials(_b, _pays.get(int(_b['id']), []))
+                                _b['debt'] = _fin['debt']
+                            chess = [b for b in chess if b.get('status') != 'checkedin'] + _checkedin_full
+                        except Exception:
+                            pass
             if _conn_failed:
                 try:
                     if self.winfo_exists():
@@ -12985,11 +13027,20 @@ class ChessFrame(tk.Frame):
             # Гарантуємо мінімальну ширину 1 клітинки
             if x2 < x1+4: x2=x1+CW-4
             y1=ri*CH+3;                   y2=ri*CH+CH-3
-            color=C['green'] if b['status']=='checkedin' else C['accent']
+            # Заселені — червоним (номер зайнятий, гість живе); заброньовані
+            # (ще не заселені) — зеленим, як і просив користувач.
+            color=C['red'] if b['status']=='checkedin' else C['green']
             canvas.create_rectangle(x1,y1,x2,y2,fill=color,outline='')
             if x2-x1>20:
                 name=(b.get('guest_name') or '').split()[0]
-                canvas.create_text((x1+x2)//2,(y1+y2)//2,text=name,fill='white',font=('Segoe UI',8),width=x2-x1-4)
+                _debt=float(b.get('debt') or 0)
+                if _debt>0 and y2-y1>24:
+                    canvas.create_text((x1+x2)//2,(y1+y2)//2,
+                        text=f"{name}\n{_debt:.0f}\u20b4",fill='white',
+                        font=('Segoe UI',8),width=x2-x1-4,justify='center')
+                else:
+                    canvas.create_text((x1+x2)//2,(y1+y2)//2,text=name,fill='white',
+                        font=('Segoe UI',8),width=x2-x1-4)
 
         # Скрол тільки на canvas'ах шахматки — БЕЗ bind_all (він ламає скрол
         # у всій програмі). Вертикальний скрол синхронізує тіло й ліву
