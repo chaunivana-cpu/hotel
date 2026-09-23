@@ -12573,6 +12573,16 @@ class TodayDeparturesFrame(tk.Frame):
         self._load()
 
 
+def _sw_chess_effective_checkout(b, today):
+    """Для незаселеного/виселеного бронювання — планова дата виїзду як є. Для
+    прострочених (status='checkedin', планова дата виїзду вже минула, а гостя
+    ще не виселено) — подовжує до сьогодні+1, щоб плитка в шахматці й далі
+    показувала номер зайнятим, а не «обривалась» на минулій даті."""
+    co = b['check_out']
+    if b.get('status') == 'checkedin' and co <= today:
+        return max(co, today + timedelta(days=1))
+    return co
+
 class ChessFrame(tk.Frame):
     def __init__(self, parent, user):
         super().__init__(parent, bg=C['bg'])
@@ -12949,7 +12959,8 @@ class ChessFrame(tk.Frame):
             _booked_days = set()
             for b2 in self._chess:
                 if int(b2['room_id']) == int(room['id']):
-                    for di in range((min(b2['check_out'], end) - max(b2['check_in'], start_snap)).days):
+                    _co2 = _sw_chess_effective_checkout(b2, today)
+                    for di in range((min(_co2, end) - max(b2['check_in'], start_snap)).days):
                         _booked_days.add((max(b2['check_in'], start_snap) + timedelta(days=di)))
             # Статус відображаємо тільки на сьогодні (поточний стан номера)
             if today >= start_snap and today < end and today not in _booked_days:
@@ -12965,7 +12976,10 @@ class ChessFrame(tk.Frame):
             ri=next((i for i,r in enumerate(self._rooms) if int(r['id'])==_bid),None)
             if ri is None: continue
             ci=max(b['check_in'],start_snap)
-            co_raw=min(b['check_out'],end)
+            # Прострочений виїзд (гість ще НЕ виселений, а запланована дата виїзду вже
+            # минула) — плитку подовжуємо до сьогодні, інакше вона «обривалась» на
+            # плановій даті виїзду й номер виглядав вільним, хоча гість досі живе.
+            co_raw=min(_sw_chess_effective_checkout(b, today),end)
             co=co_raw if co_raw > ci else ci+timedelta(days=1)
             x1=(ci-start_snap).days*CW+2; x2=(co-start_snap).days*CW-2
             # Гарантуємо мінімальну ширину 1 клітинки
