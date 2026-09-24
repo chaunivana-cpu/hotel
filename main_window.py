@@ -15183,6 +15183,22 @@ class BookingDetailDlg(ctk.CTkToplevel):
             if not b:
                 self.after(0, lambda: self._show_msg(f'❌ Бронювання #{self.bid} не знайдено'))
                 return
+            # "Всього/Оплачено/Борг" — через ЄДИНУ функцію calc_stay_financials, а не
+            # get_balance() (яка не враховує прострочені доби понад заплановану дату
+            # виїзду). Раніше картка бронювання показувала СТАРИЙ (заниженй) borg,
+            # тоді як "Заселені гості" — правильний: та сама бронь показувала РІЗНІ
+            # цифри в різних вікнах. Booking/платежі для розрахунку читаємо напряму з
+            # БД (а не з get_booking()/get_payments(), чия форма словника невідома
+            # тут) — так само, як уже надійно працює для "Заселені гості" й шахматки.
+            try:
+                _brow_fin = _q("SELECT check_in, check_out, price_per_day, total_amount, status "
+                               "FROM bookings WHERE id=%s", (self.bid,)) or []
+                _b_fin = dict(_brow_fin[0]) if _brow_fin else dict(b or {})
+                _pay_fin = _q("SELECT amount, note FROM payments WHERE booking_id=%s", (self.bid,)) or []
+                _fin = calc_stay_financials(_b_fin, _pay_fin)
+                bal['total'] = _fin['total']; bal['paid'] = _fin['paid']; bal['debt'] = _fin['debt']
+            except Exception as _e_bal:
+                log_error(f"BookingDetailDlg._load_bg: перерахунок балансу bid={self.bid}", _e_bal)
             # Затримка 80мс щоб вікно встигло відрендеритись перед CTkScrollableFrame
             self.after(80, lambda: self._render(b, bal, svc, pay, deposits, fines, services))
         except Exception as e:
