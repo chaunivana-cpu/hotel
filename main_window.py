@@ -5692,8 +5692,16 @@ class SetupWindow(ctk.CTk):
             self.e_user.set(_lc.get('username',''))
             self.e_pass.insert(0, _lc.get('password',''))
             self._remember_var.set(True)
-        btn(lg,"▶  Увійти",self._login,height=42).pack(fill='x',padx=12,pady=(6,15))
+        btn(lg,"▶  Увійти",self._login,height=42).pack(fill='x',padx=12,pady=(6,6))
         self.e_pass.bind('<Return>', lambda e: self._login())
+        # ── Реєстрація нового рецепціоніста прямо з екрана входу ───────
+        # Роль тут навмисно завжди 'receptionist' — власник/адмін-ролі
+        # створюються тільки в Налаштування → Користувачі, вже під логіном.
+        ctk.CTkButton(lg, text="➕  Зареєструвати нового рецепціоніста",
+                      command=self._register_receptionist_dlg,
+                      fg_color='transparent', hover_color=C['card2'],
+                      text_color=C['accent'], font=('Segoe UI',11,'underline'),
+                      height=30).pack(fill='x', padx=12, pady=(0,15))
         # Відступ знизу щоб кнопка не обрізалась
         ctk.CTkFrame(scroll, fg_color='transparent', height=20).pack()
 
@@ -6067,6 +6075,62 @@ class SetupWindow(ctk.CTk):
             release_session(username)
         except Exception:
             pass
+
+    def _register_receptionist_dlg(self):
+        """Реєстрація нового користувача з роллю 'рецепціоніст' прямо з екрана
+        входу — без потреби спершу заходити під адміном. Використовує ту саму
+        save_user(), якою користується Налаштування → Користувачі, тож новий
+        акаунт одразу з'являється і там."""
+        win = dlg_win(self, "📋 Реєстрація рецепціоніста", "430x430")
+        f = card(win); f.pack(fill='both', expand=True, padx=15, pady=15)
+        lbl(f, "👤  Новий рецепціоніст", 15, True, C['accent']).pack(anchor='w', padx=12, pady=(10,2))
+        lbl(f, "Обліковий запис буде створено з роллю «Рецепціоніст».",
+            10, color=C['text2']).pack(anchor='w', padx=12, pady=(0,10))
+        flds = {}
+        for lt, key, show in [("Ім'я та прізвище *", 'full_name', None),
+                               ("Логін *", 'username', None),
+                               ("Пароль *", 'password', '*'),
+                               ("Повторити пароль *", 'password2', '*')]:
+            r = row_frm(f)
+            ctk.CTkLabel(r, text=lt, font=('Segoe UI',11), text_color=C['text2'],
+                        width=155, anchor='w').pack(side='left')
+            e = ent(r, w=210, show=show); e.pack(side='left'); flds[key] = e
+        status_lbl = lbl(f, "", 10); status_lbl.pack(anchor='w', padx=10, pady=(8,0))
+
+        def _register():
+            full_name = flds['full_name'].get().strip()
+            username  = flds['username'].get().strip()
+            password  = flds['password'].get()
+            password2 = flds['password2'].get()
+            if not full_name:
+                messagebox.showerror("", "Введіть ім'я та прізвище"); return
+            if not username:
+                messagebox.showerror("", "Введіть логін"); return
+            if len(password) < 4:
+                messagebox.showerror("", "Пароль має бути не менше 4 символів"); return
+            if password != password2:
+                messagebox.showerror("", "Паролі не збігаються"); return
+
+            def _do_save():
+                from app.modules.logic import save_user
+                save_user({'username': username, 'password': password,
+                           'full_name': full_name, 'role': 'receptionist',
+                           'active': True}, None)
+
+            def _on_success(_r):
+                try:
+                    win.destroy()
+                    messagebox.showinfo("✅", f"Користувача «{username}» зареєстровано.\nТепер можна увійти під ним.")
+                    self.e_user.set(username)
+                    self.e_pass.delete(0, 'end')
+                except Exception: pass
+
+            run_with_hourglass(win, save_btn, status_lbl, _do_save, _on_success,
+                               base_btn_text="✅ Зареєструватись", saving_text="⏳ Реєструю...")
+
+        save_btn = btn(f, "✅ Зареєструватись", _register, C['green'], height=40)
+        save_btn.pack(fill='x', padx=10, pady=(14,4))
+        btn(f, "Скасувати", win.destroy, C['card2'], height=32).pack(fill='x', padx=10)
 
     def _login(self):
         try: log_info("[STARTUP] _login: натиснуто 'Увійти', перевіряю з'єднання з БД")
