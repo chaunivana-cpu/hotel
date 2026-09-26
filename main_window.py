@@ -12091,8 +12091,20 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
     _rz_sum_lbl = ctk.CTkLabel(_razom_card, text="—", font=('Segoe UI',16,'bold'),
                                 text_color=C['green']); _rz_sum_lbl.pack(side='right', padx=14)
 
+    def _get_nights_now():
+        """Кількість діб проживання за поточними датами заїзду/виїзду."""
+        try:
+            ci = date.fromisoformat(e_in.get().strip())
+            co = date.fromisoformat(e_out.get().strip())
+            return max((co - ci).days, 1)
+        except Exception:
+            return 1
+
     def _get_total_now():
-        """Повертає (сума_за_номер, залог, разом) — з урахуванням знижки."""
+        """Повертає (сума_за_номер, залог, разом) — з урахуванням знижки.
+        Знижка вводиться за добу і діє на весь період проживання: якщо
+        знижка дорівнює ціні/добу — проживання стає повністю безкоштовним
+        (без боргу), а не лише за одну добу."""
         try:
             _txt = lbl_total.cget('text')  # напр. "770₴  (1 ніч × 770₴)"
             import re as _re
@@ -12103,7 +12115,8 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
         except Exception: _dep = 0.0
         try: _disc = max(float(e_discount.get() or 0), 0.0)
         except Exception: _disc = 0.0
-        _room_sum = max(_room_sum - _disc, 0.0)
+        _n = _get_nights_now()
+        _room_sum = max(_room_sum - _disc * _n, 0.0)
         return _room_sum, _dep, _room_sum + _dep
 
     def _upd_razom_new(*_):
@@ -12195,7 +12208,12 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
     def _upd_disc_hint(*_):
         try:
             d = max(float(e_discount.get() or 0), 0.0)
-            _disc_hint.configure(text=f"(-{d:.0f}₴)" if d > 0 else "")
+            if d > 0:
+                _n = _get_nights_now()
+                _disc_hint.configure(
+                    text=f"(-{d:.0f}₴/ніч × {_n} = -{d*_n:.0f}₴ за весь період)")
+            else:
+                _disc_hint.configure(text="")
         except Exception:
             _disc_hint.configure(text="")
     e_discount.bind('<KeyRelease>', lambda e: (_upd_disc_hint(), _upd_razom_new(), _upd_chg()))
@@ -12256,7 +12274,9 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
 
         # Створити бронювання з total_amount
         nights_cnt = (co - ci).days
-        room_total_amt = max(price * nights_cnt - discount, 0)
+        # Знижка діє за кожну добу проживання (на весь період), а не одноразово:
+        # якщо знижка == ціні/добу, проживання повністю безкоштовне, без боргу.
+        room_total_amt = max(price * nights_cnt - discount * nights_cnt, 0)
         _disc_note = f"Знижка: {discount:.0f}₴ ({discount_comment})  " if discount > 0 else ""
         query("""INSERT INTO bookings
                   (guest_id, room_id, check_in, check_out, price_per_day,
@@ -13525,17 +13545,43 @@ class CheckedinFrame(tk.Frame):
         self.e_srch.pack(side='left',pady=8)
         self.e_srch.bind('<Return>',lambda e:self._load())
 
-        cols=('id','room','guest','phone','cin','cout','n','price','adv','dopla','dep','sплачено','debt',
+        cols=('id','room','guest','phone','cin','cout','n','price','discount','adv','dopla','dep','sплачено','debt',
               'category','notes','email','booked_at')
-        widths=[40,90,175,108,88,88,42,85,70,80,70,85,72,120,220,160,130]
+        widths=[38,90,160,95,85,85,40,82,78,68,78,68,82,70,120,220,160,130]
         ff,self.tree=mktree(self,cols,20,widths)
         self.tree.configure(style="H2.Treeview")  # 2-рядкові комірки (дата+час) — вищий рядок
-        _labels=['#','Кімн.','Гість','Тел.','Заїзд / час','Виїзд','Діб','Ціна/ніч','Аванс','Доплата','Залог','Сплачено','Борг',
+        _labels=['#','Кімн.','Гість','Тел.','Заїзд / час','Виїзд','Діб','Ціна/ніч','Знижка','Аванс','Доплата','Залог','Сплачено','Борг',
                  'Категорія','Нотатка','Email','Заброньовано']
         self._all_fields = list(zip(cols, _labels, widths))
         for c,h in zip(cols,_labels):
             self.tree.heading(c,text=h)
         apply_table_layout(self.tree, 'checkedin', self._all_fields)
+        _td_ci = _get_table_layout_data('checkedin')
+        if not _td_ci.get('active'):
+            # Немає збереженого шаблону — ховаємо рідковживані колонки
+            # (Категорія, Нотатка, Email, Заброньовано), щоб основні дані —
+            # включно з "Знижка" — вміщались без горизонтальної прокрутки.
+            # Колонки нікуди не зникають — їх завжди можна увімкнути назад
+            # через "Налаштувати таблицю".
+            try:
+                self.tree.configure(displaycolumns=(
+                    'id','room','guest','phone','cin','cout','n','price','discount',
+                    'adv','dopla','dep','sплачено','debt'))
+            except Exception:
+                pass
+        else:
+            # Є збережений шаблон (можливо, збережений ДО того, як з'явилась
+            # колонка "Знижка") — якщо в ньому нема "discount", додаємо
+            # колонку одразу після "Ціна/ніч", щоб нова колонка не губилась
+            # через старі, раніше збережені налаштування вигляду таблиці.
+            try:
+                _cur_cols = list(self.tree.cget('displaycolumns'))
+                if 'discount' not in _cur_cols:
+                    _idx = _cur_cols.index('price') + 1 if 'price' in _cur_cols else len(_cur_cols)
+                    _cur_cols.insert(_idx, 'discount')
+                    self.tree.configure(displaycolumns=tuple(_cur_cols))
+            except Exception:
+                pass
         self.tree.bind('<Double-1>',lambda e:self._open())
 
         # Рядок кнопок пакуємо ПЕРШИМ з side='bottom' — так він завжди
@@ -13619,14 +13665,33 @@ class CheckedinFrame(tk.Frame):
             for b in data:
                 bid_int = int(b['id'])
                 n = (b['check_out'] - b['check_in']).days
-                total = float(b['total_amount'] or 0)
-                if total == 0:
-                    total = float(b.get('price_per_day') or 0) * max(n, 1)
                 paid_dopla = paid_map.get(bid_int, 0.0)   # доплата (без авансу і залогу)
                 dep        = dep_map.get(bid_int, 0.0)   # залог
                 adv        = adv_map.get(bid_int, 0.0)   # аванс
                 nights     = max(n, 1)
                 price_night = float(b.get('price_per_day') or 0)  # ціна за ніч
+                # Знижка за добу (з нотаток "Знижка: X₴ (причина)") — показуємо
+                # загальну суму знижки за весь період проживання (за добу × ночі).
+                discount_total = 0.0
+                try:
+                    import re as _re_disc_ci
+                    _m_disc_ci = _re_disc_ci.search(
+                        r'Знижка:\s*([\d.,]+)\s*₴', b.get('notes', '') or '')
+                    if _m_disc_ci:
+                        discount_total = float(_m_disc_ci.group(1).replace(',', '.')) * nights
+                except Exception:
+                    discount_total = 0.0
+                # ВАЖЛИВО: перераховуємо ціна×ночі лише якщо total_amount
+                # взагалі не задавався (NULL) АБО дорівнює нулю без жодної
+                # знижки — це старий запис без збереженої суми. Якщо
+                # total_amount = 0 через ПОВНУ знижку (проживання
+                # безкоштовне) — це ЗАКОННИЙ нуль, його не можна перекривати
+                # назад повною ціною, інакше знову з'являється борг.
+                _raw_total_ci = b.get('total_amount')
+                if _raw_total_ci is None or (float(_raw_total_ci or 0) == 0 and discount_total == 0):
+                    total = price_night * nights
+                else:
+                    total = float(_raw_total_ci)
                 # ── Прострочення: гість досі заселений (status='checkedin'),
                 # але планова дата виїзду вже минула. Раніше борг рахувався
                 # лише від заброньованої суми (total_amount), тому прострочені
@@ -13674,10 +13739,11 @@ class CheckedinFrame(tk.Frame):
                         _cin_display = (_txt_ci[:10] + '\n' + _txt_ci[11:16]) if len(_txt_ci) >= 16 and ' ' in _txt_ci else str(b.get('check_in',''))[:10]
                 except Exception:
                     _cin_display = str(b.get('check_in',''))[:10]
+                discount_str = f"{discount_total:.0f}₴" if discount_total > 0 else "—"
                 rows.append({
                     'vals': (b['id'], b['room_number'], b.get('guest_name', ''),
                              b.get('guest_phone', ''), _cin_display, b['check_out'],
-                             nights_str, f"{price_night:.0f}₴", adv_str, dopla_str, dep_str,
+                             nights_str, f"{price_night:.0f}₴", discount_str, adv_str, dopla_str, dep_str,
                              f"{splacheno:.0f}₴", f"{debt:.0f}₴",
                              (b.get('cat_name') or b.get('room_category') or ''),
                              (b.get('notes') or '')[:200],
@@ -13821,8 +13887,70 @@ class CheckedinFrame(tk.Frame):
                 self.tree.insert('', 'end', iid=r['vals'][0],
                                   tags=('debt',) if r['debt'] else ('nodebt',),
                                   values=r['vals'])
+        self._autosize_columns()
         try: self.tree.after(10, lambda: self.tree.yview_moveto(0))
         except Exception: pass
+
+    def _autosize_columns(self):
+        """Підганяє ширину кожної показаної колонки під найдовший вміст
+        (заголовок або значення в поточних рядках), а висоту рядка — під
+        найбільшу кількість рядків тексту в комірці (наприклад, дата+час
+        у "Заїзд / час"), щоб текст не обрізався і не наповзав на сусідні
+        колонки/рядки. Викликається після кожного оновлення даних і
+        перекриває вручну задану в "Налаштувати таблицю" ширину — саме
+        для цього авто-розмір і вмикається."""
+        try:
+            import tkinter.font as _tkfont_ci
+            _f_body = _tkfont_ci.Font(family='Segoe UI', size=10)
+            _f_head = _tkfont_ci.Font(family='Segoe UI', size=10, weight='bold')
+        except Exception:
+            return
+        try:
+            disp_cols = list(self.tree.cget('displaycolumns'))
+            if disp_cols == ['#all']:
+                disp_cols = list(self.tree['columns'])
+        except Exception:
+            return
+        label_map = {k: l for k, l, _w in self._all_fields}
+        children = [iid for iid in self.tree.get_children('')
+                    if not str(iid).startswith('__hdr_')]
+        max_lines = 1
+        for col in disp_cols:
+            header_txt = label_map.get(col, col)
+            try:
+                best = _f_head.measure(header_txt)
+            except Exception:
+                best = 60
+            for iid in children:
+                try:
+                    val = str(self.tree.set(iid, col) or '')
+                except Exception:
+                    continue
+                for line in val.split('\n'):
+                    try:
+                        w = _f_body.measure(line)
+                    except Exception:
+                        w = 0
+                    if w > best:
+                        best = w
+                _n_lines = val.count('\n') + 1
+                if _n_lines > max_lines:
+                    max_lines = _n_lines
+            new_w = min(max(best + 24, 36), 420)
+            try:
+                # stretch=False — інакше Treeview сам "розтягує" колонки, щоб
+                # заповнити видиму ширину, і це заважає прокрутці вправо: коли
+                # реального вмісту більше, ніж влазить у вікно, скролбар
+                # впирається, ніби далі нема нічого.
+                self.tree.column(col, width=new_w, minwidth=min(new_w, 36), stretch=False)
+            except Exception:
+                pass
+        try:
+            _line_h = _f_body.metrics('linespace')
+            row_h = min(max(30, _line_h * max_lines + 14), 80)
+            ttk.Style().configure('H2.Treeview', rowheight=row_h)
+        except Exception:
+            pass
 
     def _sel(self):
         s=self.tree.selection()
@@ -14449,15 +14577,19 @@ class BookingsFrame(tk.Frame):
                         cout_disp = _co.strftime('%d.%m %H:%M')
                     else:
                         cout_disp = str(_co)
-                    total = float(b['total_amount'] or 0)
-                    if total == 0:
+                    _raw_total_bk = b.get('total_amount')
+                    if _raw_total_bk is None:
                         total = float(b.get('price_per_day') or 0) * max(_diff_h, 1)
+                    else:
+                        total = float(_raw_total_bk)
                 else:
                     n_disp = (b['check_out'] - b['check_in']).days
                     cout_disp = b['check_out']
-                    total = float(b['total_amount'] or 0)
-                    if total == 0:
+                    _raw_total_bk = b.get('total_amount')
+                    if _raw_total_bk is None:
                         total = float(b.get('price_per_day') or 0) * max(n_disp, 1)
+                    else:
+                        total = float(_raw_total_bk)
                 # ── Дата + час зверху/знизу в комірці (як у «Заселені»/«Виселені») ──
                 import datetime as _dt_bkfmt
                 def _fmt_dt2(v):
@@ -14959,8 +15091,9 @@ class BookingDlg(ctk.CTkToplevel):
                                       (rid, gid), fetch='one')
                     _use_bid_d = _last_d['id'] if _last_d else None
                 if _use_bid_d:
+                    # Знижка за добу × кількість ночей — на весь період проживання
                     _qdisc("UPDATE bookings SET total_amount=GREATEST(COALESCE(total_amount,0)-%s,0) WHERE id=%s",
-                           (discount, _use_bid_d), fetch=None)
+                           (discount * _nights, _use_bid_d), fetch=None)
             except Exception as _ed:
                 log_error("BookingDlg discount apply", _ed)
         # Позначка "Hotels" (джерело бронювання) — окремим UPDATE, оскільки
@@ -16148,7 +16281,11 @@ class BookingDetailDlg(ctk.CTkToplevel):
                 notes = (notes + ('  ' if notes else '') + f'Фактичне заселення: {_ci_actual_val}').strip()
 
             if discount > 0:
-                total = max(total - discount, 0)
+                # Знижка за добу діє на весь період проживання (ci_d/co_d вище),
+                # а не одноразово від суми — інакше при знижці == ціні/добу
+                # лишався б борг за решту ночей.
+                _nights_save = max((co_d - ci_d).days, 1)
+                total = max(total - discount * _nights_save, 0)
                 notes = _re_ci_edit.sub(r'Знижка:\s*[\d.,]+\s*₴\s*\([^)]*\)\s*', '', notes).strip()
                 notes = f"Знижка: {discount:.0f}₴ ({discount_comment})  " + notes
             else:
