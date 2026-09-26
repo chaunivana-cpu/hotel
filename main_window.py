@@ -117,7 +117,7 @@ import time as _time_mod
 import queue as _queue_mod
 import traceback as _tb_mod
 
-APP_VERSION = "1.0.9"  # Версія — змінюйте при кожному оновленні
+APP_VERSION = "1.0.10"  # Версія — змінюйте при кожному оновленні
 SYNC_INTERVAL = 60    # секунд між автосинхронізаціями
 
 # За рішенням: при збої зв'язку з сервером програма повинна показувати
@@ -13730,19 +13730,49 @@ class CheckedinFrame(tk.Frame):
                 _notes_ci = b.get('notes', '') or ''
                 _m_ci = _re_ci_display.search(r'Фактичне заселення:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})', _notes_ci)
                 _ci_raw = _m_ci.group(1) if _m_ci else b.get('created_at')
+                # Погодинні об'єкти (баня/сауна): у check_in/check_out БД
+                # зберігається лише ДАТА (час губиться, а виїзд ще й штучно
+                # зсунутий на наступний день, якщо баня в межах доби) —
+                # справжній час і тривалість беремо з нотатки
+                # "Баня: X.X год (ГГ:ХХ–ГГ:ХХ)", щоб і заїзд, і виїзд
+                # показували реальні дату/час.
+                _sauna_start_row = _sauna_end_row = None
+                _is_hourly_row = (any(k in (b.get('cat_name') or '').lower() for k in ('баня','бані','sauna'))
+                                  or 'баня:' in _notes_ci.lower())
+                if _is_hourly_row:
+                    try:
+                        import datetime as _dt_row
+                        _m_sauna_row = _re_ci_display.search(
+                            r'Баня:\s*([\d.,]+)\s*год\s*\((\d{2}:\d{2})', _notes_ci)
+                        if _m_sauna_row:
+                            _h_row = float(_m_sauna_row.group(1).replace(',', '.'))
+                            _start_hhmm_row = _m_sauna_row.group(2)
+                            _ci_date_only = b.get('check_in')
+                            if isinstance(_ci_date_only, str):
+                                _ci_date_only = _dt_row.date.fromisoformat(str(_ci_date_only)[:10])
+                            elif hasattr(_ci_date_only, 'date') and not isinstance(_ci_date_only, _dt_row.date):
+                                _ci_date_only = _ci_date_only.date()
+                            _sauna_start_row = _dt_row.datetime.combine(
+                                _ci_date_only, _dt_row.datetime.strptime(_start_hhmm_row, '%H:%M').time())
+                            _sauna_end_row = _sauna_start_row + _dt_row.timedelta(hours=_h_row)
+                    except Exception:
+                        _sauna_start_row = _sauna_end_row = None
                 try:
                     _ci_dt = _ci_raw
                     if hasattr(_ci_dt, 'strftime'):
                         _cin_display = _ci_dt.strftime('%d.%m.%Y\n%H:%M')
+                    elif _sauna_start_row is not None:
+                        _cin_display = _sauna_start_row.strftime('%d.%m.%Y\n%H:%M')
                     else:
                         _txt_ci = str(_ci_raw or b.get('check_in',''))
                         _cin_display = (_txt_ci[:10] + '\n' + _txt_ci[11:16]) if len(_txt_ci) >= 16 and ' ' in _txt_ci else str(b.get('check_in',''))[:10]
                 except Exception:
                     _cin_display = str(b.get('check_in',''))[:10]
+                _cout_display = _sauna_end_row.strftime('%d.%m.%Y\n%H:%M') if _sauna_end_row is not None else b['check_out']
                 discount_str = f"{discount_total:.0f}₴" if discount_total > 0 else "—"
                 rows.append({
                     'vals': (b['id'], b['room_number'], b.get('guest_name', ''),
-                             b.get('guest_phone', ''), _cin_display, b['check_out'],
+                             b.get('guest_phone', ''), _cin_display, _cout_display,
                              nights_str, f"{price_night:.0f}₴", discount_str, adv_str, dopla_str, dep_str,
                              f"{splacheno:.0f}₴", f"{debt:.0f}₴",
                              (b.get('cat_name') or b.get('room_category') or ''),
@@ -15984,6 +16014,12 @@ class BookingDetailDlg(ctk.CTkToplevel):
         # ── Фактична дата/час заселення (коли реально заселили гостя) ──
         import re as _re_ci_edit
         _notes_raw0 = str(b.get('notes','') or '')
+        # Погодинні об'єкти (баня/сауна) рахуються по годинах, а не по добах —
+        # ціна в price_per_day тут насправді "ціна за годину", і знижка та
+        # сума проживання повинні множитись саме на кількість годин.
+        _is_hourly_edit = (
+            any(k in str(b.get('cat_name') or '').lower() for k in ('баня', 'бані', 'sauna'))
+            or 'баня:' in _notes_raw0.lower() or 'год (' in _notes_raw0.lower())
         _m_ci_edit = _re_ci_edit.search(r'Фактичне заселення:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})', _notes_raw0)
         _ci_actual_default = _m_ci_edit.group(1) if _m_ci_edit else ''
         # Якщо в нотатках позначки нема (буває у старих/імпортованих
@@ -16052,9 +16088,11 @@ class BookingDetailDlg(ctk.CTkToplevel):
         e_doc_number = ent(docf, "123456", w=160); e_doc_number.grid(row=2,column=1,padx=8,pady=3,sticky='w')
         if _number_default: e_doc_number.insert(0, _number_default)
 
-        # Дати проживання
+        # Дати проживання (для бані/сауни — фактично дата+час початку й кінця,
+        # оскільки рахуються години, а не доби)
         d_card = card(sc); d_card.pack(fill='x', padx=12, pady=5)
-        lbl(d_card, "📅  Дати проживання", 13, True).pack(anchor='w', padx=12, pady=(10,5))
+        lbl(d_card, "🕓  Дата й час бронювання (погодинно)" if _is_hourly_edit else "📅  Дати проживання",
+            13, True).pack(anchor='w', padx=12, pady=(10,5))
         df = tk.Frame(d_card, bg=C['card']); df.pack(fill='x', padx=12, pady=(0,10))
         import datetime as _dt_editb
         def _split_date_time(v, default_time):
@@ -16073,6 +16111,26 @@ class BookingDetailDlg(ctk.CTkToplevel):
             return s[:10], default_time
         _ci_date_def, _ci_time_def = _split_date_time(b.get('check_in'), '14:00')
         _co_date_def, _co_time_def = _split_date_time(b.get('check_out'), '12:00')
+        if _is_hourly_edit:
+            # У БД check_in/check_out для бані зберігаються тільки ДАТОЮ (час
+            # губиться), а виїзд може бути штучно зсунутий на наступний день,
+            # якщо баня в межах однієї доби (щоб виїзд > заїзду). Реальний
+            # час і тривалість є в нотатці "Баня: X.X год (ГГ:ХХ–ГГ:ХХ)" —
+            # витягуємо їх звідти, щоб показати справжні дату й час.
+            try:
+                import re as _re_sauna_edit
+                _m_sauna_edit = _re_sauna_edit.search(
+                    r'Баня:\s*([\d.,]+)\s*год\s*\((\d{2}:\d{2})', _notes_raw0)
+                if _m_sauna_edit:
+                    _h_sauna_edit = float(_m_sauna_edit.group(1).replace(',', '.'))
+                    _ci_time_def = _m_sauna_edit.group(2)
+                    _start_dt_sauna_edit = _dt_editb.datetime.strptime(
+                        f"{_ci_date_def} {_ci_time_def}", '%Y-%m-%d %H:%M')
+                    _end_dt_sauna_edit = _start_dt_sauna_edit + _dt_editb.timedelta(hours=_h_sauna_edit)
+                    _co_date_def = _end_dt_sauna_edit.strftime('%Y-%m-%d')
+                    _co_time_def = _end_dt_sauna_edit.strftime('%H:%M')
+            except Exception:
+                pass
         lbl(df,"Заїзд (РРРР-ММ-ДД):",11,color=C['text2']).grid(row=0,column=0,sticky='w',pady=3)
         e_ci = ent(df, w=150); e_ci.grid(row=0,column=1,padx=8,pady=3,sticky='w')
         e_ci.insert(0, _ci_date_def)
@@ -16085,15 +16143,42 @@ class BookingDetailDlg(ctk.CTkToplevel):
         lbl(df,"Час виїзду (ГГ:ХХ):",11,color=C['text2']).grid(row=1,column=2,sticky='w',pady=3,padx=(14,0))
         e_co_time = ent(df, w=90); e_co_time.grid(row=1,column=3,padx=8,pady=3,sticky='w')
         e_co_time.insert(0, _co_time_def)
-        lbl(df,"Дорослих:",11,color=C['text2']).grid(row=2,column=0,sticky='w',pady=3)
-        e_ad = ent(df, w=80); e_ad.grid(row=2,column=1,padx=8,pady=3,sticky='w')
-        e_ad.insert(0, str(b.get('adults','') or ''))
+        if _is_hourly_edit:
+            # Погодинний об'єкт (баня) — додаємо швидкий вибір тривалості,
+            # як у картці бронювання бані: клік по кнопці сам підставляє
+            # дату/час виїзду, не треба рахувати вручну.
+            lbl(df,"Годин (швидкий вибір):",11,color=C['text2']).grid(row=2,column=0,sticky='w',pady=3)
+            hqf = tk.Frame(df, bg=C['card']); hqf.grid(row=2,column=1,columnspan=3,sticky='w',pady=3,padx=8)
+            _hq_btns_edit = []
+            def _apply_hours_edit(hv):
+                try:
+                    _d0 = _dt_editb.date.fromisoformat(e_ci.get().strip())
+                    _t0 = _dt_editb.datetime.strptime(e_ci_time.get().strip() or '14:00', '%H:%M').time()
+                    _start_e = _dt_editb.datetime.combine(_d0, _t0)
+                    _end_e = _start_e + _dt_editb.timedelta(hours=hv)
+                    e_co.delete(0, 'end'); e_co.insert(0, _end_e.strftime('%Y-%m-%d'))
+                    e_co_time.delete(0, 'end'); e_co_time.insert(0, _end_e.strftime('%H:%M'))
+                except Exception:
+                    pass
+                for _hb in _hq_btns_edit:
+                    _hb.configure(fg_color=C['accent'] if getattr(_hb, '_val', None) == hv else C['card2'])
+            for _hv in (1, 2, 3, 4, 5, 6):
+                _hb = ctk.CTkButton(hqf, text=str(_hv), width=34, height=26,
+                                     fg_color=C['card2'], command=lambda v=_hv: _apply_hours_edit(v))
+                _hb.pack(side='left', padx=2); _hb._val = _hv; _hq_btns_edit.append(_hb)
+            lbl(df,"Дорослих:",11,color=C['text2']).grid(row=3,column=0,sticky='w',pady=3)
+            e_ad = ent(df, w=80); e_ad.grid(row=3,column=1,padx=8,pady=3,sticky='w')
+            e_ad.insert(0, str(b.get('adults','') or ''))
+        else:
+            lbl(df,"Дорослих:",11,color=C['text2']).grid(row=2,column=0,sticky='w',pady=3)
+            e_ad = ent(df, w=80); e_ad.grid(row=2,column=1,padx=8,pady=3,sticky='w')
+            e_ad.insert(0, str(b.get('adults','') or ''))
 
         # Розрахунок
         p_card = card(sc); p_card.pack(fill='x', padx=12, pady=5)
         lbl(p_card, "💰  Розрахунок", 13, True).pack(anchor='w', padx=12, pady=(10,5))
         pf = tk.Frame(p_card, bg=C['card']); pf.pack(fill='x', padx=12, pady=(0,10))
-        lbl(pf,"Ціна/добу:",11,color=C['text2']).grid(row=0,column=0,sticky='w',pady=3)
+        lbl(pf,"Ціна/год:" if _is_hourly_edit else "Ціна/добу:",11,color=C['text2']).grid(row=0,column=0,sticky='w',pady=3)
         e_price = ent(pf, w=150); e_price.grid(row=0,column=1,padx=8,pady=3,sticky='w')
         e_price.insert(0, str(b.get('price_per_day','') or ''))
         lbl(pf,"Сума всього:",11,color=C['text2']).grid(row=1,column=0,sticky='w',pady=3)
@@ -16120,18 +16205,38 @@ class BookingDetailDlg(ctk.CTkToplevel):
             except Exception as _e_pay:
                 log_error(f"_edit_booking_dlg: не вдалось порахувати оплати #{self.bid}", _e_pay)
             # 2) Якщо оплат теж нема (чи вже була знижка) — ціна × ночі
+            # (для погодинних об'єктів — баня/сауна — ціна × годин, а не діб)
             if not _total_val or _prior_discount > 0:
                 try:
-                    _ci_calc = b.get('check_in'); _co_calc = b.get('check_out')
-                    if isinstance(_ci_calc, str):
-                        import datetime as _dtci
-                        _ci_calc = _dtci.date.fromisoformat(_ci_calc[:10])
-                    if isinstance(_co_calc, str):
-                        import datetime as _dtco
-                        _co_calc = _dtco.date.fromisoformat(_co_calc[:10])
-                    _nights_calc = max((_co_calc - _ci_calc).days, 1) if _ci_calc and _co_calc else 1
                     _price_calc = float(b.get('price_per_day') or 0)
-                    _calc_total = _price_calc * _nights_calc
+                    if _is_hourly_edit:
+                        import datetime as _dth_calc
+                        def _to_dt_calc(v):
+                            if isinstance(v, _dth_calc.datetime):
+                                return v
+                            if isinstance(v, _dth_calc.date):
+                                return _dth_calc.datetime(v.year, v.month, v.day)
+                            s = str(v or '')[:19]
+                            for _fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y-%m-%d'):
+                                try:
+                                    return _dth_calc.datetime.strptime(s, _fmt)
+                                except Exception:
+                                    continue
+                            return None
+                        _ci_h_calc = _to_dt_calc(b.get('check_in'))
+                        _co_h_calc = _to_dt_calc(b.get('check_out'))
+                        _units_calc = (max((_co_h_calc - _ci_h_calc).total_seconds() / 3600.0, 1)
+                                       if _ci_h_calc and _co_h_calc else 1)
+                    else:
+                        _ci_calc = b.get('check_in'); _co_calc = b.get('check_out')
+                        if isinstance(_ci_calc, str):
+                            import datetime as _dtci
+                            _ci_calc = _dtci.date.fromisoformat(_ci_calc[:10])
+                        if isinstance(_co_calc, str):
+                            import datetime as _dtco
+                            _co_calc = _dtco.date.fromisoformat(_co_calc[:10])
+                        _units_calc = max((_co_calc - _ci_calc).days, 1) if _ci_calc and _co_calc else 1
+                    _calc_total = _price_calc * _units_calc
                     if _calc_total > _total_val:
                         _total_val = _calc_total
                 except Exception as _e_calc:
@@ -16281,11 +16386,15 @@ class BookingDetailDlg(ctk.CTkToplevel):
                 notes = (notes + ('  ' if notes else '') + f'Фактичне заселення: {_ci_actual_val}').strip()
 
             if discount > 0:
-                # Знижка за добу діє на весь період проживання (ci_d/co_d вище),
-                # а не одноразово від суми — інакше при знижці == ціні/добу
-                # лишався б борг за решту ночей.
-                _nights_save = max((co_d - ci_d).days, 1)
-                total = max(total - discount * _nights_save, 0)
+                # Знижка діє на весь період — за добу для звичайних номерів,
+                # але за ГОДИНУ для погодинних об'єктів (баня/сауна), інакше
+                # при короткому бронюванні в межах однієї доби знижка
+                # множилась би лише на 1, а не на реальну кількість годин.
+                if _is_hourly_edit:
+                    _units_save = max((co - ci).total_seconds() / 3600.0, 1)
+                else:
+                    _units_save = max((co_d - ci_d).days, 1)
+                total = max(total - discount * _units_save, 0)
                 notes = _re_ci_edit.sub(r'Знижка:\s*[\d.,]+\s*₴\s*\([^)]*\)\s*', '', notes).strip()
                 notes = f"Знижка: {discount:.0f}₴ ({discount_comment})  " + notes
             else:
