@@ -20272,7 +20272,7 @@ class RestaurantFrame(tk.Frame):
                                 except Exception:
                                     items_raw = []
 
-                                # Агрегат «Що продано» по позиціях
+                                # Агрегат «Що продано» по позиціях (загалом)
                                 sold_agg = {}
                                 for it in items_raw:
                                     _, nm, qty3, price3, tot3 = it
@@ -20299,10 +20299,54 @@ class RestaurantFrame(tk.Frame):
                                 _meth_ua   = {'cash':'💵 Готівка','card':'💳 Картка',
                                               'transfer':'🏦 Переказ','online':'🌐 Онлайн'}
 
-                                # ── Секція 1: ЩО ПРОДАНО (агрегат) ──────────────
+                                # ── Яка зміна рецепціоніста обслуговувала кожне
+                                # замовлення — по таблиці shifts (та сама логіка,
+                                # що й у "Заселені гості" / журналі прибирань).
+                                try:
+                                    _cur_rr.execute(
+                                        "SELECT id, full_name, username, opened_at FROM shifts ORDER BY opened_at DESC")
+                                    _shifts_raw_rr = _cur_rr.fetchall()
+                                except Exception:
+                                    _shifts_raw_rr = []
+                                _all_shifts_rr = []
+                                for _sid, _fn, _un, _oa in _shifts_raw_rr:
+                                    if isinstance(_oa, str):
+                                        for _fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M'):
+                                            try:
+                                                _oa = _dtr.datetime.strptime(_oa, _fmt); break
+                                            except Exception:
+                                                continue
+                                    if hasattr(_oa, 'tzinfo') and _oa.tzinfo is not None:
+                                        _oa = _oa.replace(tzinfo=None)
+                                    _all_shifts_rr.append({'id': _sid, 'name': _fn or _un or '—',
+                                                            'opened_at': _oa if hasattr(_oa, 'year') else None})
+
+                                def _shift_for_order(ca_val):
+                                    _ca_n = ca_val
+                                    if hasattr(_ca_n, 'tzinfo') and _ca_n.tzinfo is not None:
+                                        _ca_n = _ca_n.replace(tzinfo=None)
+                                    best = None
+                                    for sh in _all_shifts_rr:
+                                        oa = sh.get('opened_at')
+                                        if oa and _ca_n and oa <= _ca_n and (best is None or oa > best['opened_at']):
+                                            best = sh
+                                    return best
+
+                                shift_groups = {}  # shift_id_or_None -> {'shift':..,'orders':[...]}
+                                for o in orders:
+                                    sh = _shift_for_order(o[4])
+                                    key = sh['id'] if sh else None
+                                    shift_groups.setdefault(key, {'shift': sh, 'orders': []})
+                                    shift_groups[key]['orders'].append(o)
+
+                                def _sg_sort_key(item):
+                                    sh = item[1]['shift']
+                                    return sh['opened_at'] if sh and sh.get('opened_at') else _dtr.datetime.min
+
+                                # ── Секція 1: ЩО ПРОДАНО ЗАГАЛОМ (усі зміни) ────
                                 if sold_agg:
                                     rows.append({'order_id':'','ts':'',
-                                                 'name':'\u2501\u2501\u2501  ЩО ПРОДАНО СЬОГОДНІ  \u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501',
+                                                 'name':'\u2501\u2501\u2501  ЩО ПРОДАНО СЬОГОДНІ — ВСЬОГО  \u2501\u2501\u2501\u2501\u2501\u2501',
                                                  'qty':'К-сть','price':'Ціна','total':'Сума',
                                                  'status':'','method':'','_tag':'hdr_row'})
                                     for nm_s, ag in sorted(sold_agg.items(), key=lambda x: -float(x[1]['total'] or 0)):
@@ -20319,30 +20363,65 @@ class RestaurantFrame(tk.Frame):
                                                  'total': f"{sum(float(a['total'] or 0) for a in sold_agg.values()):.0f}\u20b4",
                                                  'status':'','method':'','_tag':'hdr_row'})
 
-                                # ── Секція 2: деталі по замовленнях ──────────────
-                                rows.append({'order_id':'','ts':'',
-                                             'name':'\u2501\u2501\u2501  ЗАМОВЛЕННЯ  \u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501',
-                                             'qty':'','price':'','total':'','status':'','method':'','_tag':'hdr_row'})
-                                for o in orders:
-                                    oid2, status2, total2, meth2, ca2 = o
-                                    od = order_dict[oid2]
-                                    st_ua   = _status_ua.get(status2, status2)
-                                    meth_ua = _meth_ua.get(od['method'], od['method'])
-                                    rows.append({'order_id': f'#{oid2}', 'ts': od['ts'],
-                                                 'name': f'\u2500\u2500 Замовлення #{oid2}  ({st_ua})',
-                                                 'qty': '', 'price': '',
-                                                 'total': f"{float(od['total'] or 0):.0f}\u20b4",
-                                                 'status': st_ua, 'method': meth_ua, '_tag': 'hdr_row'})
-                                    for it in items_by_order.get(oid2, []):
-                                        _, nm, qty3, price3, tot3 = it
-                                        q3 = float(qty3 or 1)
+                                # ── Секція 2: розбивка по датах/змінах рецепціоністів —
+                                # хто чергував і що саме продав ──────────────────
+                                for key, grp in sorted(shift_groups.items(), key=_sg_sort_key, reverse=True):
+                                    sh = grp['shift']
+                                    _sh_name = sh['name'] if sh else '—'
+                                    _sh_date = (sh['opened_at'].strftime('%d.%m.%Y') if sh and sh.get('opened_at')
+                                                else today.strftime('%d.%m.%Y'))
+                                    _grp_orders = grp['orders']
+                                    _grp_total = sum(float(o[2] or 0) for o in _grp_orders if o[1] in ('closed', 'paid'))
+
+                                    rows.append({'order_id':'','ts':'',
+                                                 'name': f'\u2501\u2501\u2501  📅 {_sh_date}  ·  Зміна: {_sh_name}  \u2501\u2501\u2501',
+                                                 'qty':'','price':'', 'total': f"{_grp_total:.0f}\u20b4",
+                                                 'status':'','method':'','_tag':'hdr_row'})
+
+                                    _grp_agg = {}
+                                    for o in _grp_orders:
+                                        for it in items_by_order.get(o[0], []):
+                                            _, nm, qty3, price3, tot3 = it
+                                            nm = str(nm or '—')
+                                            q3 = float(qty3 or 1); t3 = float(tot3 or 0)
+                                            if nm not in _grp_agg:
+                                                _grp_agg[nm] = {'qty': 0.0, 'price': float(price3 or 0), 'total': 0.0}
+                                            _grp_agg[nm]['qty'] += q3
+                                            _grp_agg[nm]['total'] += t3
+                                    if _grp_agg:
                                         rows.append({'order_id':'','ts':'',
-                                                     'name': f'  {nm}',
-                                                     'qty': int(q3) if q3 == int(q3) else q3,
-                                                     'price': f"{float(price3 or 0):.0f}\u20b4",
-                                                     'total': f"{float(tot3 or 0):.0f}\u20b4",
-                                                     'status':'','method':'',
-                                                     '_tag': 'closed_row' if status2 in ('closed','paid') else 'open_row'})
+                                                     'name':'    Що продано цією зміною:',
+                                                     'qty':'К-сть','price':'Ціна','total':'Сума',
+                                                     'status':'','method':'','_tag':'hdr_row'})
+                                        for nm_s, ag in sorted(_grp_agg.items(), key=lambda x: -float(x[1]['total'] or 0)):
+                                            q_s = float(ag['qty'] or 0)
+                                            rows.append({'order_id':'','ts':'',
+                                                         'name': '    ' + nm_s,
+                                                         'qty': int(q_s) if q_s == int(q_s) else round(q_s, 2),
+                                                         'price': f"{float(ag['price'] or 0):.0f}\u20b4",
+                                                         'total': f"{float(ag['total'] or 0):.0f}\u20b4",
+                                                         'status':'','method':'','_tag':'closed_row'})
+
+                                    for o in _grp_orders:
+                                        oid2, status2, total2, meth2, ca2 = o
+                                        od = order_dict[oid2]
+                                        st_ua   = _status_ua.get(status2, status2)
+                                        meth_ua = _meth_ua.get(od['method'], od['method'])
+                                        rows.append({'order_id': f'#{oid2}', 'ts': od['ts'],
+                                                     'name': f'\u2500\u2500 Замовлення #{oid2}  ({st_ua})',
+                                                     'qty': '', 'price': '',
+                                                     'total': f"{float(od['total'] or 0):.0f}\u20b4",
+                                                     'status': st_ua, 'method': meth_ua, '_tag': 'hdr_row'})
+                                        for it in items_by_order.get(oid2, []):
+                                            _, nm, qty3, price3, tot3 = it
+                                            q3 = float(qty3 or 1)
+                                            rows.append({'order_id':'','ts':'',
+                                                         'name': f'  {nm}',
+                                                         'qty': int(q3) if q3 == int(q3) else q3,
+                                                         'price': f"{float(price3 or 0):.0f}\u20b4",
+                                                         'total': f"{float(tot3 or 0):.0f}\u20b4",
+                                                         'status':'','method':'',
+                                                         '_tag': 'closed_row' if status2 in ('closed','paid') else 'open_row'})
                 except Exception as _err:
                     log_error("_restaurant_report bg", _err)
                     win.after(0, lambda: status_lbl.configure(text=f"❌ Помилка: {_err}", text_color=C['red']))
