@@ -117,7 +117,7 @@ import time as _time_mod
 import queue as _queue_mod
 import traceback as _tb_mod
 
-APP_VERSION = "1.0.10"  # Версія — змінюйте при кожному оновленні
+APP_VERSION = "1.0.9"  # Версія — змінюйте при кожному оновленні
 SYNC_INTERVAL = 60    # секунд між автосинхронізаціями
 
 # За рішенням: при збої зв'язку з сервером програма повинна показувати
@@ -699,6 +699,59 @@ def _cl_update(idx_in_list: int, all_entries: list, updated: dict):
     except Exception:
         pass
     return False
+
+def _cl_finish_room(entry: dict):
+    """Фіксує прибирання кімнати як ОКРЕМИЙ запис із чіткими датами.
+    Якщо для кімнати є відкритий запис (авто-запис при виселенні, без часу
+    закінчення) — закриваємо саме його (а не додаємо дублікат, що лишав би
+    "висяче" прибирання). Старіші відкриті записи цієї ж кімнати (кімнату
+    встигли заселити/виселити знову, а прибирання не зафіксували) закриваємо
+    окремо, щоб кожне прибирання мало свою дату й свій закритий запис."""
+    room = str(entry.get('room', ''))
+    try:
+        log = _cl_load()
+        open_idx = [i for i, e in enumerate(log)
+                    if str(e.get('room', '')) == room and not str(e.get('finished', '')).strip()]
+    except Exception:
+        log, open_idx = [], []
+    if not open_idx:
+        _cl_append(entry)
+        return
+    changed = []
+    # Старіші відкриті — закриваємо без прибиральниці, з поясненням
+    for i in open_idx[:-1]:
+        old = dict(log[i])
+        old['finished'] = old.get('started', '') or entry.get('started', '')
+        old['new_status'] = 'free'
+        old['note'] = (str(old.get('note', '')) + ' · закрито автоматично (кімнату прибрано пізнішим записом)').strip(' ·')
+        log[i] = old
+        changed.append(i)
+    # Найновіший відкритий — це і є поточне прибирання
+    last = open_idx[-1]
+    cur = dict(log[last])
+    cur['cleaner'] = entry.get('cleaner', cur.get('cleaner', ''))
+    cur['started'] = entry.get('started', '') or cur.get('started', '')
+    cur['finished'] = entry.get('finished', '')
+    cur['new_status'] = entry.get('new_status', cur.get('new_status', ''))
+    cur['note'] = entry.get('note', '') or cur.get('note', '')
+    log[last] = cur
+    changed.append(last)
+    ok = True
+    for i in changed:
+        if not _cl_update(i, log, log[i]):
+            ok = False
+            break
+    if not ok:
+        if not _cl_save_all(log):
+            # остання підстраховка — JSON
+            try:
+                import json as _j, os as _o
+                fp = _o.path.join(get_data_dir(), 'cleaning_log.json')
+                with open(fp, 'w', encoding='utf-8') as f:
+                    _j.dump(log, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
 
 def _cl_clear():
     """Очищає весь журнал."""
@@ -5295,10 +5348,33 @@ try:
 except Exception as _ct_e:
     _logger.warning(f"click-through guard не активовано: {_ct_e}")
 
+def _add_exit_bar(win, command=None):
+    """Кнопка "Вийти" знизу вікна (щоб не цілитись у хрестик). Пакується
+    першою з side='bottom' — резервує смугу знизу, решта вмісту займає
+    простір над нею."""
+    try:
+        bar = tk.Frame(win, bg=C['bg'])
+        bar.pack(side='bottom', fill='x')
+        ctk.CTkButton(bar, text="🚪 Вийти", command=command or win.destroy,
+                      fg_color=C['card2'], hover_color=C['red'],
+                      height=34, width=140).pack(pady=(4, 8))
+    except Exception:
+        pass
+
+
 def dlg_win(parent, title, size="500x400", modal=True):
     w = ctk.CTkToplevel(parent)
     w.title(title)
     w.configure(fg_color=C['bg'])
+    # Кнопка "Вийти" знизу — закриває вікно, щоб не цілитись у маленький
+    # хрестик. Пакується ПЕРШОЮ і з side='bottom', тому резервує собі смугу
+    # знизу ще до того, як виклик-власник додасть свій вміст — решта вмісту
+    # (яку б caller не спакував пізніше вище) займе простір над нею.
+    _exit_bar = tk.Frame(w, bg=C['bg'])
+    _exit_bar.pack(side='bottom', fill='x')
+    ctk.CTkButton(_exit_bar, text="🚪 Вийти", command=w.destroy,
+                  fg_color=C['card2'], hover_color=C['red'], height=34, width=140
+                  ).pack(pady=(4,8))
     # Ключ кешу — очищений заголовок (без емодзі та спецсимволів для надійності)
     _cache_key = title.strip()
     try:
@@ -9289,20 +9365,61 @@ class CleaningFrame(tk.Frame):
         self._log=log
         self._load_log()
 
+    @staticmethod
+    def _cl_date_key(e):
+        """Дата прибирання (дд.мм.рррр) — за початком, інакше за logged_at."""
+        import re as _re_dk
+        for fld in ('started', 'logged_at'):
+            m = _re_dk.match(r'\s*(\d{2}\.\d{2}\.\d{4})', str(e.get(fld, '') or ''))
+            if m:
+                return m.group(1)
+        return '—'
+
     def _load_log(self):
         if not hasattr(self,'clean_t'): return
+        import datetime as _dt_lg
         self.clean_t.delete(*self.clean_t.get_children())
         fv=self._filter_var.get() if hasattr(self,'_filter_var') else 'Всі'
         today_prefix=date.today().strftime('%d.%m.%Y')
         status_map={'free':'✅ Вільний','cleaning':'🧹 Прибирання',
                     'repair':'🔧 Ремонт','blocked':'🔒 Заблокований'}
-        for e in reversed(self._log):
-            ns=e.get('new_status','')
-            if fv=='Сьогодні' and not e.get('logged_at','').startswith(today_prefix): continue
+        self.clean_t.tag_configure('day_header', background=C['card2'], foreground=C['yellow'])
+        # Відбір записів з ЗБЕРЕЖЕННЯМ індексу в self._log (потрібен для редагування)
+        picked = []
+        for idx in range(len(self._log) - 1, -1, -1):
+            e = self._log[idx]
+            ns = e.get('new_status', '')
+            if fv=='Сьогодні' and self._cl_date_key(e) != today_prefix: continue
             if fv=='Вільний' and ns!='free': continue
             if fv=='Прибирання' and ns!='cleaning': continue
             if fv=='Ремонт' and ns!='repair': continue
-            self.clean_t.insert('','end',values=(
+            picked.append((idx, e))
+
+        def _sort_key(item):
+            idx, e = item
+            d = self._cl_date_key(e)
+            try:
+                dd = _dt_lg.datetime.strptime(d, '%d.%m.%Y')
+            except Exception:
+                dd = _dt_lg.datetime.min
+            t = str(e.get('started', '') or '')[11:16]
+            return (dd, t, idx)
+        picked.sort(key=_sort_key, reverse=True)
+
+        # Кількість прибирань по днях — для заголовка
+        counts = {}
+        for _idx, e in picked:
+            counts[self._cl_date_key(e)] = counts.get(self._cl_date_key(e), 0) + 1
+
+        last_day = None
+        for idx, e in picked:
+            day = self._cl_date_key(e)
+            if day != last_day:
+                last_day = day
+                self.clean_t.insert('', 'end', iid=f'__day_{day}', tags=('day_header',),
+                                    values=('📅 ' + day, f'Прибирань: {counts.get(day, 0)}', '', '', '', ''))
+            ns = e.get('new_status', '')
+            self.clean_t.insert('','end', iid=str(idx), values=(
                 e.get('room',''), e.get('cleaner',''),
                 e.get('started',''), e.get('finished',''),
                 status_map.get(ns,ns), e.get('note','')))
@@ -9550,8 +9667,9 @@ class CleaningFrame(tk.Frame):
             except Exception as ex:
                 messagebox.showerror("Помилка БД", str(ex)); return
 
-            # Зберегти в журнал
-            _cl_append({
+            # Зберегти в журнал: закриваємо відкритий запис кімнати (якщо є),
+            # інакше додаємо новий — кожне прибирання лишається окремим записом.
+            _cl_finish_room({
                 'room':    str(room['number']),
                 'cleaner': cleaner,
                 'started': e_start.get().strip(),
@@ -9574,18 +9692,22 @@ class CleaningFrame(tk.Frame):
         """Редагування запису прибирання: прибиральниця, час кінця, статус після."""
         sel = self.clean_t.selection()
         if not sel: return
+        if str(sel[0]).startswith('__day_'):
+            return  # клік по заголовку дати — нічого редагувати
         vals = self.clean_t.item(sel[0], 'values')
         # vals: (room, cleaner, started, finished, status_ua, note)
         room_num = vals[0] if vals else ''
 
-        # Знайти запис в self._log
-        status_map_rev = {'✅ Вільний':'free','🧹 Прибирання':'cleaning',
-                          '🔧 Ремонт':'repair','🔒 Заблокований':'blocked'}
-        # find matching log entry index
+        # Запис беремо ТОЧНО за клікнутим рядком (iid = індекс у self._log),
+        # а не "останній запис цієї кімнати" — інакше при кількох прибираннях
+        # однієї кімнати редагувався б не той запис.
         log_idx = None
-        for i, e in enumerate(reversed(self._log)):
-            if str(e.get('room','')) == str(room_num):
-                log_idx = len(self._log)-1-i; break
+        try:
+            _i = int(sel[0])
+            if 0 <= _i < len(self._log):
+                log_idx = _i
+        except (ValueError, TypeError):
+            log_idx = None
         entry = self._log[log_idx] if log_idx is not None else {}
 
         import json as _je, datetime as _dte
@@ -14942,6 +15064,7 @@ class BookingDlg(ctk.CTkToplevel):
         self.update_idletasks()
         _center_window(self, 640, 680, parent)
         # (grab вимкнено — Windows сумісність)
+        _add_exit_bar(self)
         self._build()
 
     def _build(self):
@@ -15199,6 +15322,7 @@ class BookingDetailDlg(ctk.CTkToplevel):
         self.lift(); self.focus_force()
         self.bind('<Configure>', lambda e, _w=self: _dlg_save_geom(_w, _key))
         self.protocol("WM_DELETE_WINDOW", self._close)
+        _add_exit_bar(self, self._close)
         self._content = tk.Frame(self, bg=C['bg'])
         self._content.pack(fill='both', expand=True)
         self._build()
@@ -16611,6 +16735,7 @@ class PaymentDlg(ctk.CTkToplevel):
         _center_window(self, 440, 520, parent)
         self.lift(); self.focus_force()
         self.after(300, lambda: self._safe_remove_topmost())
+        _add_exit_bar(self)
         self._build()
 
     def _safe_remove_topmost(self):
