@@ -117,7 +117,7 @@ import time as _time_mod
 import queue as _queue_mod
 import traceback as _tb_mod
 
-APP_VERSION = "1.0.9"  # Версія — змінюйте при кожному оновленні
+APP_VERSION = "1.0.10"  # Версія — змінюйте при кожному оновленні
 SYNC_INTERVAL = 60    # секунд між автосинхронізаціями
 
 # За рішенням: при збої зв'язку з сервером програма повинна показувати
@@ -4734,7 +4734,7 @@ def _make_qr_ascii(url, width=36):
         return f"  QR: {url}"
 
 
-def print_text(title, lines, qr_url=None, on_close=None):
+def print_text(title, lines, qr_url=None, on_close=None, auto_print=False):
     """Завжди показує вікно-перегляд чеку з кнопками Роздрукувати / Відміна.
     on_close (опційно) — викликається ПІСЛЯ закриття цього вікна (і через
     друк, і через відміну, і через хрестик) — щоб наступні модальні вікна
@@ -4778,6 +4778,38 @@ def print_text(title, lines, qr_url=None, on_close=None):
         f"receipt_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
     with open(fname, 'w', encoding='utf-8') as f:
         f.write(text)
+
+    # ── Автодрук (закриття зміни): друкуємо ОДРАЗУ, без вікна перегляду, ──
+    # а потім викликаємо on_close (вікно підсумків/авторизації). Якщо друк
+    # не вдався — падаємо назад на звичайне вікно перегляду з кнопкою
+    # «Роздрукувати», щоб чек не загубився.
+    if auto_print:
+        _auto_ok = False
+        try:
+            if _POS_SETTINGS.get('enabled'):
+                def _pos_auto_thread(_t=text):
+                    try:
+                        _print_pos(_t)
+                    except Exception as ex:
+                        import tkinter as _tkr
+                        root = _tkr._default_root
+                        try:
+                            if root is not None and root.winfo_exists():
+                                root.after(0, lambda msg=str(ex): messagebox.showerror(
+                                    "🖨 POS помилка", f"Не вдалося надрукувати:\n{msg}"))
+                        except Exception: pass
+                threading.Thread(target=_pos_auto_thread, daemon=True).start()
+            else:
+                _win_print_file(fname, text)
+            _auto_ok = True
+        except Exception as _e_ap:
+            try: log_error("print_text auto_print", _e_ap)
+            except Exception: pass
+        if _auto_ok:
+            if on_close:
+                try: on_close()
+                except Exception: pass
+            return
 
     # ── Вікно перегляду чеку — завжди показується ──
     import tkinter as _tk_root_ref
@@ -5611,6 +5643,14 @@ class SetupWindow(ctk.CTk):
             except Exception: pass
         self.minsize(400, 480)
         self.protocol("WM_DELETE_WINDOW", self._on_setup_close)
+        self._geom_save_job = None
+        def _on_cfg(e):
+            if e.widget is not self: return
+            try:
+                if self._geom_save_job: self.after_cancel(self._geom_save_job)
+                self._geom_save_job = self.after(400, self._save_setup_geom)
+            except Exception: pass
+        self.bind('<Configure>', _on_cfg)
         try:
             log_info(f"[STARTUP] SetupWindow.__init__: вікно входу намальоване за "
                      f"{(_time_mod.monotonic()-_setup_t0)*1000:.0f}мс — очікую дію користувача")
@@ -13744,12 +13784,12 @@ class CheckedinFrame(tk.Frame):
         self.e_srch.bind('<Return>',lambda e:self._load())
 
         cols=('id','room','guest','phone','cin','cout','n','price','discount','adv','dopla','dep','sплачено','debt',
-              'category','notes','email','booked_at')
-        widths=[38,90,160,95,85,85,40,82,78,68,78,68,82,70,120,220,160,130]
+              'category','notes','email','booked_at','ext')
+        widths=[38,90,160,95,85,85,40,82,78,68,78,68,82,70,120,220,160,130,270]
         ff,self.tree=mktree(self,cols,20,widths)
         self.tree.configure(style="H2.Treeview")  # 2-рядкові комірки (дата+час) — вищий рядок
         _labels=['#','Кімн.','Гість','Тел.','Заїзд / час','Виїзд','Діб','Ціна/ніч','Знижка','Аванс','Доплата','Залог','Сплачено','Борг',
-                 'Категорія','Нотатка','Email','Заброньовано']
+                 'Категорія','Нотатка','Email','Заброньовано','Коментар']
         self._all_fields = list(zip(cols, _labels, widths))
         for c,h in zip(cols,_labels):
             self.tree.heading(c,text=h)
@@ -13764,7 +13804,7 @@ class CheckedinFrame(tk.Frame):
             try:
                 self.tree.configure(displaycolumns=(
                     'id','room','guest','phone','cin','cout','n','price','discount',
-                    'adv','dopla','dep','sплачено','debt'))
+                    'adv','dopla','dep','sплачено','debt','ext'))
             except Exception:
                 pass
         else:
@@ -13777,6 +13817,13 @@ class CheckedinFrame(tk.Frame):
                 if 'discount' not in _cur_cols:
                     _idx = _cur_cols.index('price') + 1 if 'price' in _cur_cols else len(_cur_cols)
                     _cur_cols.insert(_idx, 'discount')
+                    self.tree.configure(displaycolumns=tuple(_cur_cols))
+            except Exception:
+                pass
+            try:
+                _cur_cols = list(self.tree.cget('displaycolumns'))
+                if _cur_cols != ['#all'] and 'ext' not in _cur_cols:
+                    _cur_cols.append('ext')
                     self.tree.configure(displaycolumns=tuple(_cur_cols))
             except Exception:
                 pass
@@ -13859,6 +13906,58 @@ class CheckedinFrame(tk.Frame):
                             if 'Залог' in (p.get('note','') or ''))
                         adv_map[bid_k]  = sum(float(p['amount'] or 0) for p in pays
                             if 'Аванс' in (p.get('note','') or ''))
+            def _to_naive_dt(v):
+                """Приводить значення до naive datetime: знімає tzinfo (щоб
+                порівняння naive/aware не падало) і парсить рядки — деякі
+                джерела (офлайн-кеш/SQLite fallback) повертають дату/час
+                як текст, а не datetime, через що '<=' з datetime падав."""
+                import datetime as _dtp_ci
+                if v is None:
+                    return None
+                if isinstance(v, _dtp_ci.datetime):
+                    try:
+                        return v.replace(tzinfo=None) if v.tzinfo is not None else v
+                    except Exception:
+                        return v
+                if isinstance(v, _dtp_ci.date):
+                    return _dtp_ci.datetime(v.year, v.month, v.day)
+                s = str(v).strip()
+                if not s:
+                    return None
+                s = s.replace('T', ' ')
+                import re as _re_tz_ci
+                s = _re_tz_ci.sub(r'(Z|[+-]\d{2}:?\d{2})$', '', s).strip()
+                for _fmt in ('%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S',
+                             '%Y-%m-%d %H:%M', '%Y-%m-%d'):
+                    try:
+                        return _dtp_ci.datetime.strptime(s, _fmt)
+                    except Exception:
+                        continue
+                return None
+
+            # ── Останнє продовження проживання по кожній броні: воно ж визначає,
+            # у групі ЯКОЇ зміни показувати заселення (та зміна, де продовжили),
+            # і дає текст у колонці «Коментар». ──
+            ext_map = {}
+            if data:
+                try:
+                    import re as _re_ext
+                    for _pr in (_qCI(
+                            "SELECT booking_id, amount, note, created_at FROM payments"
+                            " WHERE booking_id IN (" + ph + ")"
+                            " AND note LIKE 'Продовження проживання%%' AND amount>0"
+                            " ORDER BY created_at",
+                            ids_int, fetch='all') or []):
+                        _k = int(_pr['booking_id'])
+                        _mp = _re_ext.search(r'\(([^)]*)\)', _pr.get('note') or '')
+                        ext_map[_k] = {
+                            'amount': float(_pr.get('amount') or 0),
+                            'period': _mp.group(1) if _mp else '',
+                            'at': _pr.get('created_at'),
+                        }
+                except Exception as _e_ext:
+                    log_error("CheckedinFrame ext payments", _e_ext)
+                    ext_map = {}
             rows = []
             for b in data:
                 bid_int = int(b['id'])
@@ -13968,6 +14067,21 @@ class CheckedinFrame(tk.Frame):
                     _cin_display = str(b.get('check_in',''))[:10]
                 _cout_display = _sauna_end_row.strftime('%d.%m.%Y\n%H:%M') if _sauna_end_row is not None else b['check_out']
                 discount_str = f"{discount_total:.0f}₴" if discount_total > 0 else "—"
+                _ext = ext_map.get(bid_int)
+                _ext_txt = ''
+                _group_ts = b.get('created_at')
+                if _ext:
+                    _at = _to_naive_dt(_ext['at'])
+                    _at_s = _at.strftime('%d.%m %H:%M') if _at else ''
+                    _ext_txt = f"🔄 Продовжено проживання +{_ext['amount']:.0f}₴"
+                    if _ext['period']:
+                        _ext_txt += f" ({_ext['period']})"
+                    if _at_s:
+                        _ext_txt += f" · {_at_s}"
+                    # групуємо за часом продовження, якщо воно пізніше за заселення
+                    _c0 = _to_naive_dt(b.get('created_at'))
+                    if _at and (not _c0 or _at > _c0):
+                        _group_ts = _at
                 rows.append({
                     'vals': (b['id'], b['room_number'], b.get('guest_name', ''),
                              b.get('guest_phone', ''), _cin_display, _cout_display,
@@ -13976,10 +14090,11 @@ class CheckedinFrame(tk.Frame):
                              (b.get('cat_name') or b.get('room_category') or ''),
                              (b.get('notes') or '')[:200],
                              (b.get('guest_email') or b.get('email') or ''),
-                             str(b.get('created_at') or '')[:16]),
+                             str(b.get('created_at') or '')[:16],
+                             _ext_txt),
                     'debt': debt > 0,
                     'room_number': b['room_number'],
-                    'created_at': b.get('created_at'),
+                    'created_at': _group_ts,
                 })
 
             # ── Групування: свіжі заселення поточної зміни — завжди зверху,
@@ -13996,35 +14111,6 @@ class CheckedinFrame(tk.Frame):
                 else: cat = 3
                 m = _re_rn.match(r'\s*(\d+)', s)
                 return (cat, int(m.group(1)) if m else 10**9, s)
-
-            def _to_naive_dt(v):
-                """Приводить значення до naive datetime: знімає tzinfo (щоб
-                порівняння naive/aware не падало) і парсить рядки — деякі
-                джерела (офлайн-кеш/SQLite fallback) повертають дату/час
-                як текст, а не datetime, через що '<=' з datetime падав."""
-                import datetime as _dtp_ci
-                if v is None:
-                    return None
-                if isinstance(v, _dtp_ci.datetime):
-                    try:
-                        return v.replace(tzinfo=None) if v.tzinfo is not None else v
-                    except Exception:
-                        return v
-                if isinstance(v, _dtp_ci.date):
-                    return _dtp_ci.datetime(v.year, v.month, v.day)
-                s = str(v).strip()
-                if not s:
-                    return None
-                s = s.replace('T', ' ')
-                import re as _re_tz_ci
-                s = _re_tz_ci.sub(r'(Z|[+-]\d{2}:?\d{2})$', '', s).strip()
-                for _fmt in ('%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S',
-                             '%Y-%m-%d %H:%M', '%Y-%m-%d'):
-                    try:
-                        return _dtp_ci.datetime.strptime(s, _fmt)
-                    except Exception:
-                        continue
-                return None
 
             groups = []
             try:
@@ -22002,8 +22088,67 @@ def _open_extend_sauna_dlg(parent, bid, room, on_save=None):
     btn(bf, "✖ Скасувати", win.destroy, C['red'], 110, height=44).pack(side='left')
 
 
+def _pick_date_popup(anchor, current, on_pick):
+    """Невеликий календар-попап: вибір дати мишею. on_pick(date) викликається при кліку на день."""
+    import datetime as _dt
+    import calendar as _cal
+    cur = current if isinstance(current, _dt.date) else _dt.date.today()
+    state = {'y': cur.year, 'm': cur.month}
+    pop = ctk.CTkToplevel(anchor)
+    pop.title("Вибір дати")
+    pop.configure(fg_color=C['bg'])
+    pop.resizable(False, False)
+    try:
+        pop.transient(anchor.winfo_toplevel())
+        pop.geometry(f"+{anchor.winfo_rootx()}+{anchor.winfo_rooty() + 34}")
+        pop.after(50, pop.grab_set)
+    except Exception:
+        pass
+    _MONTHS = ['Січень','Лютий','Березень','Квітень','Травень','Червень',
+               'Липень','Серпень','Вересень','Жовтень','Листопад','Грудень']
+    top = tk.Frame(pop, bg=C['bg']); top.pack(fill='x', padx=8, pady=(8, 4))
+    title_l = lbl(top, "", 13, True); 
+    body = tk.Frame(pop, bg=C['bg']); body.pack(padx=8, pady=(0, 8))
+
+    def _shift(d):
+        m = state['m'] + d
+        y = state['y']
+        if m < 1: m, y = 12, y - 1
+        if m > 12: m, y = 1, y + 1
+        state['m'], state['y'] = m, y
+        _draw()
+
+    ctk.CTkButton(top, text="◀", width=30, height=28, fg_color=C['card2'],
+                  command=lambda: _shift(-1)).pack(side='left')
+    title_l.pack(side='left', expand=True)
+    ctk.CTkButton(top, text="▶", width=30, height=28, fg_color=C['card2'],
+                  command=lambda: _shift(1)).pack(side='right')
+
+    def _choose(d):
+        pop.destroy()
+        on_pick(d)
+
+    def _draw():
+        for w in body.winfo_children(): w.destroy()
+        title_l.configure(text=f"{_MONTHS[state['m']-1]} {state['y']}")
+        for i, n in enumerate(['Пн','Вт','Ср','Чт','Пт','Сб','Нд']):
+            lbl(body, n, 10, color=C['text2']).grid(row=0, column=i, padx=1, pady=2)
+        for r, week in enumerate(_cal.Calendar(firstweekday=0).monthdatescalendar(state['y'], state['m']), start=1):
+            for c, d in enumerate(week):
+                in_m = (d.month == state['m'])
+                is_sel = (d == cur)
+                is_today = (d == _dt.date.today())
+                fg = C['accent'] if is_sel else (C['card2'] if in_m else C['bg'])
+                tc = C['text'] if in_m else C['text2']
+                ctk.CTkButton(body, text=str(d.day), width=34, height=28, fg_color=fg,
+                              text_color=tc, border_width=1 if is_today else 0,
+                              border_color=C['green'],
+                              command=lambda dd=d: _choose(dd)).grid(row=r, column=c, padx=1, pady=1)
+    _draw()
+
+
 def _open_extend_room_dlg(parent, bid, on_save=None):
-    """Продовження номера готелю: додати ночі і оплатити одразу."""
+    """Продовження номера готелю: додати ночі (або вибрати дати з-по) і оплатити одразу."""
     from app.utils.db import query
     from app.modules.logic import get_booking
     import datetime as _dt
@@ -22012,7 +22157,11 @@ def _open_extend_room_dlg(parent, bid, on_save=None):
     if not b: return
     price = float(b.get('price_per_day') or 0)
 
-    win = dlg_win(parent, "📅 Продовжити проживання", "400x310")
+    _co0 = b['check_out']
+    if isinstance(_co0, _dt.datetime): _co0 = _co0.date()
+    _FMT = '%d.%m.%Y'
+
+    win = dlg_win(parent, "📅 Продовжити проживання", "420x420")
     sc = tk.Frame(win, bg=C['bg']); sc.pack(fill='both', expand=True, padx=20, pady=15)
 
     hdr = card(sc); hdr.pack(fill='x', pady=(0,10))
@@ -22026,46 +22175,118 @@ def _open_extend_room_dlg(parent, bid, on_save=None):
     quick_f = tk.Frame(pf, bg=C['card']); quick_f.grid(row=0, column=1, sticky='w', padx=10)
     e_nights = ent(pf, "1", w=70)
 
-    lbl_sum = lbl(pf, "", 13, True, C['green']); lbl_sum.grid(row=2, column=1, sticky='w', padx=10, pady=4)
+    # ── Дати: з — по ──
+    lbl(pf, "Дати:", 12).grid(row=2, column=0, sticky='w', pady=6)
+    df = tk.Frame(pf, bg=C['card']); df.grid(row=2, column=1, sticky='w', padx=10, pady=4)
+    lbl(df, "з", 11, color=C['text2']).pack(side='left', padx=(0,3))
+    e_from = ent(df, "дд.мм.рррр", w=95); e_from.pack(side='left')
+    btn_from = ctk.CTkButton(df, text="📅", width=30, height=28, fg_color=C['card2'])
+    btn_from.pack(side='left', padx=(2,8))
+    lbl(df, "по", 11, color=C['text2']).pack(side='left', padx=(0,3))
+    e_to = ent(df, "дд.мм.рррр", w=95); e_to.pack(side='left')
+    btn_to = ctk.CTkButton(df, text="📅", width=30, height=28, fg_color=C['card2'])
+    btn_to.pack(side='left', padx=(2,0))
 
-    def _upd(*a):
-        try: n = float(e_nights.get() or 0)
-        except: n = 0
+    lbl_sum = lbl(pf, "", 13, True, C['green']); lbl_sum.grid(row=3, column=1, sticky='w', padx=10, pady=4)
+
+    _busy = {'v': False}
+
+    def _parse(s):
+        try: return _dt.datetime.strptime(s.strip(), _FMT).date()
+        except Exception: return None
+
+    def _put(entry, text):
+        entry.delete(0, 'end'); entry.insert(0, text)
+
+    def _sum(n):
+        n = max(n, 0)
         lbl_sum.configure(text=f"{price*n:.0f}₴  ({n:.0f}н × {price:.0f}₴)")
+
+    def _hl_quick(n):
+        for b_ in qbtns:
+            b_.configure(fg_color=C['accent'] if b_._val == n else C['card2'])
+
+    def _from_nights(*a):
+        """Змінили кількість ночей → перерахувати дату «по»."""
+        if _busy['v']: return
+        d1 = _parse(e_from.get())
+        try: n = int(float(e_nights.get() or 0))
+        except Exception: n = 0
+        if d1 and n > 0:
+            _busy['v'] = True; _put(e_to, (d1 + _dt.timedelta(days=n)).strftime(_FMT)); _busy['v'] = False
+        _sum(n); _hl_quick(n)
+
+    def _from_dates(*a):
+        """Змінили дати з/по → перерахувати кількість ночей."""
+        if _busy['v']: return
+        d1, d2 = _parse(e_from.get()), _parse(e_to.get())
+        if d1 and d2 and d2 > d1:
+            n = (d2 - d1).days
+            _busy['v'] = True; _put(e_nights, str(n)); _busy['v'] = False
+            _sum(n); _hl_quick(n)
+        else:
+            _sum(0); _hl_quick(-1)
 
     qbtns = []
     for n in [1, 2, 3, 5, 7, 14]:
         def _set(v=n):
-            e_nights.delete(0,'end'); e_nights.insert(0, str(v)); _upd()
-            for b_ in qbtns:
-                b_.configure(fg_color=C['accent'] if b_._val==v else C['card2'])
+            _put(e_nights, str(v)); _from_nights()
         b_ = ctk.CTkButton(quick_f, text=str(n), width=38, height=28,
                            fg_color=C['accent'] if n==1 else C['card2'], command=_set)
         b_.pack(side='left', padx=2); b_._val = n; qbtns.append(b_)
 
     lbl(pf, "Або вручну:", 11, color=C['text2']).grid(row=1, column=0, sticky='w', pady=4)
     e_nights.grid(row=1, column=1, sticky='w', padx=10, pady=4)
-    e_nights.bind('<KeyRelease>', _upd); _upd()
+    e_nights.bind('<KeyRelease>', _from_nights)
+    e_from.bind('<KeyRelease>', _from_dates)
+    e_to.bind('<KeyRelease>', _from_dates)
 
-    lbl(pf, "Оплата:", 12).grid(row=3, column=0, sticky='w', pady=6)
+    def _pick_from():
+        def _cb(d):
+            _put(e_from, d.strftime(_FMT))
+            # зберігаємо кількість ночей: зсуваємо «по»
+            _from_nights()
+        _pick_date_popup(btn_from, _parse(e_from.get()) or _co0, _cb)
+
+    def _pick_to():
+        def _cb(d):
+            _put(e_to, d.strftime(_FMT)); _from_dates()
+        _pick_date_popup(btn_to, _parse(e_to.get()) or _co0, _cb)
+
+    btn_from.configure(command=_pick_from)
+    btn_to.configure(command=_pick_to)
+
+    _put(e_from, _co0.strftime(_FMT)); _from_nights()
+
+    lbl(pf, "Оплата:", 12).grid(row=4, column=0, sticky='w', pady=6)
     meth_var = ctk.StringVar(value='cash')
-    mf = tk.Frame(pf, bg=C['card']); mf.grid(row=3, column=1, sticky='w', padx=10)
+    mf = tk.Frame(pf, bg=C['card']); mf.grid(row=4, column=1, sticky='w', padx=10)
     for val, lbl_t, clr in [('cash','💵 Готівка',C['green']),('card','💳 Картка',C['accent']),('transfer','🏦 Переказ','#9b59b6')]:
         ctk.CTkRadioButton(mf, text=lbl_t, variable=meth_var, value=val,
                            fg_color=clr, text_color=C['text'], font=('Segoe UI',11)).pack(side='left', padx=5)
 
     def do_extend():
-        try:
-            n = int(e_nights.get() or 0)
-            if n <= 0: raise ValueError
-        except: messagebox.showerror("", "Введіть кількість ночей"); return
+        d1, d2 = _parse(e_from.get()), _parse(e_to.get())
+        if not d1 or not d2:
+            messagebox.showerror("", "Невірний формат дати. Використовуйте дд.мм.рррр"); return
+        n = (d2 - d1).days
+        if n <= 0:
+            messagebox.showerror("", "Дата «по» має бути пізніше за дату «з»"); return
+        if d1 != _co0:
+            if not messagebox.askyesno(
+                    "Дата початку відрізняється",
+                    f"Поточний виїзд: {_co0.strftime(_FMT)}, а ви вибрали початок {d1.strftime(_FMT)}.\n"
+                    f"Виїзд буде змінено на {d2.strftime(_FMT)}, оплата — за {n} ноч.\n\nПродовжити?"):
+                return
         amount = price * n
-        new_co = b['check_out'] + _dt.timedelta(days=n)
+        new_co = d2
         query("UPDATE bookings SET check_out=%s, total_amount=COALESCE(total_amount,0)+%s WHERE id=%s",
               (new_co, amount, bid), fetch=None)
         query("""INSERT INTO payments(booking_id,amount,method,note,shift_id,created_at)
-                  VALUES(%s,%s,%s,'Продовження проживання',%s,NOW())""",
-              (bid, amount, meth_var.get(), get_current_shift_id()), fetch=None)
+                  VALUES(%s,%s,%s,%s,%s,NOW())""",
+              (bid, amount, meth_var.get(),
+               f"Продовження проживання ({d1.strftime(_FMT)}–{d2.strftime(_FMT)})",
+               get_current_shift_id()), fetch=None)
         messagebox.showinfo("✅", f"Продовжено на {n} ніч. Оплачено {amount:.0f}₴. Новий виїзд: {new_co}")
         win.destroy()
         if on_save: on_save()
@@ -23557,7 +23778,7 @@ class ReportsFrame(tk.Frame):
                                 fiscal_status=_fiscal_status)
 
             try:
-                self._do_print_report_fn(on_close=_after_shift_receipt_closed2)
+                self._do_print_report_fn(on_close=_after_shift_receipt_closed2, auto_print=True)
             except TypeError:
                 # Стара сигнатура _do_print_report_fn без on_close — друкуємо
                 # як раніше і одразу показуємо підсумок (без затримки).
@@ -24423,7 +24644,7 @@ class ReportsFrame(tk.Frame):
             _ln("Отримано в касу (без залогів)", "—", f"{grand_total:.2f}₴", grand=True)
 
             # ── Друк і Excel-вигрузка саме ЦІЄЇ зміни ──
-            def _do_print_shift_table():
+            def _do_print_shift_table(on_close=None, auto_print=False):
                 lines = [f"  ВІДОМІСТЬ ПО ЗМІНІ", f"  {shift_info}", f"{'─'*78}",
                          f"  {'Позиція':<46}{'К-сть':>14}{'Сума':>16}", f"{'─'*78}"]
                 for kind, label, qty, amount in _flat_rows:
@@ -24431,7 +24652,7 @@ class ReportsFrame(tk.Frame):
                         lines.append(f"{'─'*78}"); lines.append(f"  {label}")
                     else:
                         lines.append(f"  {label:<46}{str(qty):>14}{str(amount):>16}")
-                print_text("Відомість по зміні", lines)
+                print_text("Відомість по зміні", lines, on_close=on_close, auto_print=auto_print)
 
             def _do_export_shift_table_excel():
                 import os, datetime as _dte
@@ -25484,7 +25705,7 @@ class ReportsFrame(tk.Frame):
         act = ctk.CTkFrame(self.result, fg_color='transparent')
         act.pack(fill='x', padx=5, pady=8)
 
-        def do_print_report(on_close=None):
+        def do_print_report(on_close=None, auto_print=False):
             lines = [
                 f"  {'Z-ЗВІТ (ЗАКРИВАЮЧИЙ)' if is_z else 'X-ЗВІТ (ПРОМІЖНИЙ)'}",
                 f"  Дата: {today.strftime('%d.%m.%Y')}",
@@ -25532,7 +25753,8 @@ class ReportsFrame(tk.Frame):
                     lines.append(f"  {str(_sd.get('name',''))[:28]:<28} {float(_sd.get('qty') or 0):>3.0f} шт  {float(_sd.get('total') or 0):>8.2f}₴")
             if is_z:
                 lines += [f"{'─'*52}", "  *** ЗМІНУ ЗАКРИТО ***"]
-            print_text(f"{'Z-звіт' if is_z else 'X-звіт'} {today.strftime('%d.%m.%Y')}", lines, on_close=on_close)
+            print_text(f"{'Z-звіт' if is_z else 'X-звіт'} {today.strftime('%d.%m.%Y')}", lines,
+                       on_close=on_close, auto_print=auto_print)
 
         self._do_print_report_fn = do_print_report
         btn(act, "🖨  Роздрукувати звіт", do_print_report, C['accent'], 200).pack(side='left', padx=4)
@@ -25841,7 +26063,7 @@ class ReportsFrame(tk.Frame):
                         ShiftClosedDlg(self, today, cash_total, card_total, transfer_total, grand_total, tx_count,
                                         fiscal_status=_fiscal_status)
 
-                    do_print_report(on_close=_after_shift_receipt_closed)
+                    do_print_report(on_close=_after_shift_receipt_closed, auto_print=True)
 
                 btn(act, "🔴  Закрити зміну", close_shift, C['red'], 180).pack(side='left', padx=4)
                 warn = card(self.result); warn.pack(fill='x', padx=5, pady=5)
@@ -25861,7 +26083,18 @@ class ShiftClosedDlg(ctk.CTkToplevel):
         self.configure(fg_color=C['bg'])
         self.lift(); self.focus_force()
         self.update_idletasks()
-        _center_window(self, 480, 420, parent)
+        _sc_key = "ShiftClosedDlg"
+        try:
+            _sc_w, _sc_h = (int(v) for v in _DLG_GEOM_CACHE.get(_sc_key, "480x420").split('x'))
+            _sc_w = max(400, min(_sc_w, self.winfo_screenwidth() - 40))
+            _sc_h = max(360, min(_sc_h, self.winfo_screenheight() - 80))
+        except Exception:
+            _sc_w, _sc_h = 480, 420
+        # Головне вікно тут уже сховано (withdraw) — центруємо по екрану
+        _center_window(self, _sc_w, _sc_h, None)
+        self.minsize(400, 360)
+        # Запам'ятовувати виставлений розмір при кожній зміні
+        self.bind('<Configure>', lambda e, _k=_sc_key, _w=self: _dlg_save_geom(_w, _k) if e.widget is _w else None)
         # (grab вимкнено — Windows сумісність)
         # Блокуємо закриття хрестиком — тільки через кнопку "Авторизуватись"
         self.protocol("WM_DELETE_WINDOW", lambda: None)
@@ -26577,34 +26810,73 @@ class GuestDatabaseFrame(tk.Frame):
         _btn_row = tk.Frame(win, bg=C['bg']); _btn_row.pack(pady=(0,10))
 
         def _edit_guest():
-            """Діалог редагування ПІБ і телефону гостя."""
+            """Діалог редагування ПІБ, телефону та документа гостя."""
             edit_win = ctk.CTkToplevel(win)
             edit_win.title("Редагувати гостя")
-            edit_win.geometry("420x230")
+            edit_win.geometry("460x360")
             edit_win.configure(fg_color=C['bg'])
             edit_win.grab_set(); edit_win.lift()
-            ctk.CTkFrame(edit_win, fg_color=C['card'], corner_radius=10, height=2).pack(fill='x', padx=14, pady=(14,6))
-            lbl(edit_win, "✏️  Редагувати гостя", 15, True).pack(anchor='w', padx=20, pady=(12,4))
+            lbl(edit_win, "✏️  Редагувати гостя", 15, True).pack(anchor='w', padx=20, pady=(14,4))
             _f = tk.Frame(edit_win, bg=C['bg']); _f.pack(fill='x', padx=20, pady=6)
             lbl(_f, "ПІБ:", 11, color=C['text2']).grid(row=0, column=0, sticky='w', pady=4)
-            _name_e = ent(_f, row['name'], w=260); _name_e.grid(row=0, column=1, padx=(8,0), pady=4)
+            _name_e = ent(_f, '', w=270); _name_e.insert(0, row['name'] or ''); _name_e.grid(row=0, column=1, padx=(8,0), pady=4)
             lbl(_f, "Телефон:", 11, color=C['text2']).grid(row=1, column=0, sticky='w', pady=4)
             _ph_val = row['phone'] if row['phone'] != '—' else ''
-            _phone_e = ent(_f, _ph_val, w=260); _phone_e.grid(row=1, column=1, padx=(8,0), pady=4)
+            _phone_e = ent(_f, '', w=270); _phone_e.insert(0, _ph_val); _phone_e.grid(row=1, column=1, padx=(8,0), pady=4)
+
+            # ── Документ (зберігається в notes бронювань як «Паспорт: ...») ──
+            _old_doc = row.get('passport') or ''
+            _old_doc = '' if _old_doc == '—' else _old_doc
+            _dt0, _ser0, _num0 = _parse_doc_info(_old_doc)
+            lbl(_f, "Документ:", 11, color=C['text2']).grid(row=2, column=0, sticky='w', pady=4)
+            _dtype_var = ctk.StringVar(value=_dt0)
+            ctk.CTkOptionMenu(_f, values=['Паспорт', 'Військовий квиток', 'Водійське посвідчення'],
+                              variable=_dtype_var, width=270).grid(row=2, column=1, padx=(8,0), pady=4, sticky='w')
+            lbl(_f, "Серія:", 11, color=C['text2']).grid(row=3, column=0, sticky='w', pady=4)
+            _ser_e = ent(_f, '', w=270); _ser_e.insert(0, _ser0); _ser_e.grid(row=3, column=1, padx=(8,0), pady=4)
+            lbl(_f, "Номер:", 11, color=C['text2']).grid(row=4, column=0, sticky='w', pady=4)
+            _num_e = ent(_f, '', w=270); _num_e.insert(0, _num0); _num_e.grid(row=4, column=1, padx=(8,0), pady=4)
             _err = lbl(edit_win, '', 10, color='#e74c3c'); _err.pack()
             def _save():
+                import re as _re_doc
                 new_name  = _name_e.get().strip()
                 new_phone = _phone_e.get().strip()
+                new_doc   = _format_doc_info(_dtype_var.get(), _ser_e.get(), _num_e.get())
                 if not new_name:
                     _err.configure(text="ПІБ не може бути порожнім"); return
                 try:
                     from app.utils.db import get_conn as _ec
+                    _pat = _re_doc.compile(r'Паспорт: .*?(?=  |\n|$)')
                     with _ec() as _conn_e:
                         with _conn_e.cursor() as _cur_e:
                             for gid_e in row['all_ids']:
                                 _cur_e.execute(
                                     "UPDATE guests SET name=%s, phone=%s WHERE id=%s",
                                     (new_name, new_phone or None, gid_e))
+                            # Оновлюємо документ лише якщо він змінився
+                            if new_doc != _old_doc.strip():
+                                ids_ph = ','.join(['%s'] * len(row['all_ids']))
+                                _cur_e.execute(
+                                    f"SELECT id, COALESCE(notes,'') FROM bookings "
+                                    f"WHERE guest_id IN ({ids_ph}) ORDER BY check_in DESC",
+                                    tuple(row['all_ids']))
+                                _bks = _cur_e.fetchall() or []
+                                _found = False
+                                for _bk in _bks:
+                                    _bid, _nt = _bk[0], _bk[1]
+                                    if 'Паспорт:' not in _nt:
+                                        continue
+                                    _found = True
+                                    _rep = f"Паспорт: {new_doc}" if new_doc else ''
+                                    _nt2 = _pat.sub(lambda m: _rep, _nt).strip()
+                                    _cur_e.execute("UPDATE bookings SET notes=%s WHERE id=%s",
+                                                   (_nt2, _bid))
+                                # Документа раніше не було — кладемо в останнє бронювання
+                                if not _found and new_doc and _bks:
+                                    _bid, _nt = _bks[0][0], _bks[0][1]
+                                    _nt2 = f"Паспорт: {new_doc}" + (f"  {_nt}" if _nt else '')
+                                    _cur_e.execute("UPDATE bookings SET notes=%s WHERE id=%s",
+                                                   (_nt2, _bid))
                         _conn_e.commit()
                     edit_win.destroy()
                     win.destroy()
