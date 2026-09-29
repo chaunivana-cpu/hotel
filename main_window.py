@@ -9406,18 +9406,68 @@ class CleaningFrame(tk.Frame):
             return (dd, t, idx)
         picked.sort(key=_sort_key, reverse=True)
 
+        # Яка зміна рецепціоніста діяла на момент запису — по таблиці shifts
+        # (та сама логіка, що й групування у "Заселені гості").
+        try:
+            from app.utils.db import query as _qSh_cl
+            _all_shifts_cl = _qSh_cl(
+                "SELECT id, full_name, username, opened_at FROM shifts ORDER BY opened_at DESC") or []
+            for _sh in _all_shifts_cl:
+                _oa = _sh.get('opened_at')
+                if isinstance(_oa, str):
+                    for _fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%d.%m.%Y %H:%M:%S', '%d.%m.%Y %H:%M'):
+                        try:
+                            _oa = _dt_lg.datetime.strptime(_oa, _fmt); break
+                        except Exception:
+                            continue
+                    if isinstance(_oa, str):
+                        _oa = None
+                _sh['opened_at'] = _oa
+        except Exception:
+            _all_shifts_cl = []
+
+        def _entry_dt(e):
+            for fld in ('started', 'logged_at'):
+                s = str(e.get(fld, '') or '').strip()
+                for _fmt in ('%d.%m.%Y %H:%M:%S', '%d.%m.%Y %H:%M'):
+                    try:
+                        return _dt_lg.datetime.strptime(s, _fmt)
+                    except Exception:
+                        continue
+            return None
+
+        def _shift_name_for(e):
+            ts = _entry_dt(e)
+            if not ts:
+                return None
+            best = None
+            for sh in _all_shifts_cl:
+                oa = sh.get('opened_at')
+                if oa and oa <= ts and (best is None or oa > best.get('opened_at')):
+                    best = sh
+            if not best:
+                return None
+            return best.get('full_name') or best.get('username') or None
+
         # Кількість прибирань по днях — для заголовка
         counts = {}
         for _idx, e in picked:
             counts[self._cl_date_key(e)] = counts.get(self._cl_date_key(e), 0) + 1
 
         last_day = None
+        last_shift = '__unset__'
         for idx, e in picked:
             day = self._cl_date_key(e)
-            if day != last_day:
+            shift_name = _shift_name_for(e)
+            # Новий заголовок — при зміні дня АБО зміні рецепціоніста в межах
+            # того самого дня (напр. денна/нічна зміна) — щоб було видно,
+            # хто саме чергував під час кожного прибирання.
+            if day != last_day or shift_name != last_shift:
                 last_day = day
-                self.clean_t.insert('', 'end', iid=f'__day_{day}', tags=('day_header',),
-                                    values=('📅 ' + day, f'Прибирань: {counts.get(day, 0)}', '', '', '', ''))
+                last_shift = shift_name
+                _shift_txt = f"Зміна: {shift_name}" if shift_name else "Зміна: —"
+                self.clean_t.insert('', 'end', iid=f'__day_{day}_{id(e)}', tags=('day_header',),
+                                    values=('📅 ' + day, _shift_txt, f'Прибирань: {counts.get(day, 0)}', '', '', ''))
             ns = e.get('new_status', '')
             self.clean_t.insert('','end', iid=str(idx), values=(
                 e.get('room',''), e.get('cleaner',''),
