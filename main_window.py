@@ -6794,6 +6794,27 @@ class NavButton(tk.Frame):
             w.bind('<Button-1>', lambda e: self._command())
             w.bind('<Enter>', self._on_enter)
             w.bind('<Leave>', self._on_leave)
+        self._name = name
+        self._fit_size = 12
+        self.text_lbl.bind('<Configure>', self._fit_text, add='+')
+
+    def _fit_text(self, e=None):
+        """Автопідбір: якщо назва пункту не вміщується по ширині — зменшуємо шрифт
+        (12 → 9), щоб текст не обрізався (наприклад «Налаштування» при вузькому меню)."""
+        try:
+            import tkinter.font as _tkf
+            avail = self.text_lbl.winfo_width() - 6
+            if avail <= 20: return
+            size = 12
+            while size > 9:
+                if _tkf.Font(family='Segoe UI', size=size, weight='bold').measure(self._name) <= avail:
+                    break
+                size -= 1
+            if size != self._fit_size:
+                self._fit_size = size
+                self.text_lbl.configure(font=('Segoe UI', size, 'bold'))
+        except Exception:
+            pass
 
     def _on_enter(self, e=None):
         if self._fg_color == 'transparent':
@@ -9315,9 +9336,12 @@ class DashboardFrame(tk.Frame):
             self._rf_win_id = self._grid_canvas.create_window((0,0), window=self._rf, anchor='nw')
 
             self._tile_refs = {}
-            # Налаштовуємо рівну вагу всіх колонок — плитки розтягуються рівномірно
-            for ci in range(COLS):
-                self._rf.columnconfigure(ci, weight=1, minsize=90)
+            self._tile_order = []          # порядок плиток для перекладки сітки
+            self._tile_cols = None         # скидаємо кеш розкладки при (пере)побудові сітки
+            # Мінімальна ширина плитки (px) — можна змінити в app-settings: dash_tile_min_w
+            try: _MINW = int(_load_app_settings().get('dash_tile_min_w', 128))
+            except Exception: _MINW = 128
+            _MINW = max(80, min(260, _MINW))
             # Словник: room_number → overdue info для швидкого пошуку
             _overdue_by_room = {str(b.get('room_number','')): b for b in self._overdue_list}
             for i, r in enumerate(rooms):
@@ -9333,6 +9357,7 @@ class DashboardFrame(tk.Frame):
                          font=('Segoe UI',8), padx=4, pady=2)
                 st_l.pack()
                 self._tile_refs[rid] = (cell, num_l, st_l)
+                self._tile_order.append(rid)
                 # ── Бейдж прострочення прямо на плитці ──
                 _ov_info = _overdue_by_room.get(str(r.get('number','')))
                 # Не показуємо бейдж якщо кімната вже вільна або прибирається —
@@ -9354,9 +9379,36 @@ class DashboardFrame(tk.Frame):
                     except Exception: pass
             self._rf.bind('<Configure>', _on_rf_configure)
 
+            def _relayout_tiles(width):
+                """Автопідбір: кількість колонок залежить від ширини вікна, колонки
+                однакової ширини (uniform), довгі назви номерів переносяться на 2-й рядок —
+                нічого не обрізається і не наїжджає на бейдж прострочення."""
+                try:
+                    cols = max(1, min(COLS, int(width) // _MINW))
+                    tile_w = max(60, int(width) // cols - 8)
+                    if getattr(self, '_tile_cols', None) == (cols, tile_w):
+                        return
+                    self._tile_cols = (cols, tile_w)
+                    for ci in range(COLS + 12):
+                        if ci < cols:
+                            self._rf.columnconfigure(ci, weight=1, minsize=0, uniform='tile')
+                        else:
+                            self._rf.columnconfigure(ci, weight=0, minsize=0, uniform='')
+                    for idx, rid_ in enumerate(self._tile_order):
+                        ref = self._tile_refs.get(rid_)
+                        if not ref: continue
+                        cell_, num_, st_ = ref
+                        cell_.grid(row=idx // cols, column=idx % cols, padx=3, pady=3, sticky='nsew')
+                        # місце під бейдж «!+4д» праворуч зверху — тому віднімаємо запас
+                        num_.configure(wraplength=max(40, tile_w - 34), justify='center')
+                except Exception as _e_rl:
+                    log_error("Dashboard._relayout_tiles", _e_rl)
+            self._relayout_tiles = _relayout_tiles
+
             def _on_canvas_resize(e):
-                # Розтягуємо _rf на повну ширину canvas
+                # Розтягуємо _rf на повну ширину canvas і перекладаємо плитки під нову ширину
                 self._grid_canvas.itemconfig(self._rf_win_id, width=e.width)
+                _relayout_tiles(e.width)
             self._grid_canvas.bind('<Configure>', _on_canvas_resize)
 
             # ── Overlay-банер над сіткою плиток (після побудови _rf) ────────
