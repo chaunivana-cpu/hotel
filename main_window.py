@@ -117,7 +117,7 @@ import time as _time_mod
 import queue as _queue_mod
 import traceback as _tb_mod
 
-APP_VERSION = "1.0.10"  # Версія — змінюйте при кожному оновленні
+APP_VERSION = "1.0.9"  # Версія — змінюйте при кожному оновленні
 SYNC_INTERVAL = 60    # секунд між автосинхронізаціями
 
 # За рішенням: при збої зв'язку з сервером програма повинна показувати
@@ -2148,6 +2148,149 @@ def mktree(parent, cols, h=8, widths=None):
     return f, t
 
 
+
+# ══ РОЗБИВКА ЗВІТІВ ПО ЗМІНАХ (спільні хелпери) ═══════════════════════════════
+def _load_shifts_kyiv():
+    """Усі зміни: [{'id','name','opened','closed'}] (час — київський, naive), за зростанням opened."""
+    from app.utils.db import query as _qsk
+    out = []
+    try:
+        rows = _qsk("SELECT id, full_name, username, opened_at, closed_at FROM shifts ORDER BY opened_at") or []
+    except Exception as _e:
+        log_error("_load_shifts_kyiv", _e); rows = []
+    def _n(v):
+        if v is None: return None
+        try:
+            if hasattr(v, 'tzinfo') and v.tzinfo is not None:
+                return v.astimezone(_kyiv_tz()).replace(tzinfo=None)
+        except Exception: pass
+        return v
+    for s in rows:
+        out.append({'id': s.get('id'),
+                    'name': (s.get('full_name') or s.get('username') or '—'),
+                    'opened': _n(s.get('opened_at')), 'closed': _n(s.get('closed_at'))})
+    return out
+
+def _shift_for_ts(shifts, ts):
+    """Зміна, що була відкрита в момент ts (naive київський або aware)."""
+    if ts is None: return None
+    try:
+        if hasattr(ts, 'tzinfo') and ts.tzinfo is not None:
+            ts = ts.astimezone(_kyiv_tz()).replace(tzinfo=None)
+        best = None
+        for s in shifts:
+            if s['opened'] and s['opened'] <= ts and (s['closed'] is None or ts <= s['closed']):
+                best = s
+        return best
+    except Exception:
+        return None
+
+def _shift_title(name, sid):
+    return f"👤 {name}" + (f" · зміна #{sid}" if sid is not None else "")
+
+def _group_generic_by_shift(rows, cols, headers, widths, rt):
+    """Додає до рядків звіту (dict) зміну, сортує групами (нові зміни зверху) і
+    додає першу колонку «Зміна». Повертає (rows, cols, headers, widths, sum_col, agg)."""
+    import datetime as _d, re as _re
+    shifts = _load_shifts_kyiv()
+    by_id = {s['id']: s for s in shifts}
+    def _evt(r, ev):
+        m = _re.search(r'Фактичне ' + ev + r': \[?(\d{4}-\d{2}-\d{2} \d{2}:\d{2})', str(r.get('notes') or ''))
+        if m:
+            try: return _d.datetime.strptime(m.group(1), '%Y-%m-%d %H:%M')
+            except Exception: pass
+        return None
+    for r in rows:
+        s = None
+        if r.get('shift_id') is not None:
+            s = by_id.get(r['shift_id'])
+        elif rt == 'Заїзди':
+            s = _shift_for_ts(shifts, _evt(r, 'заселення') or r.get('b_created'))
+        elif rt == 'Виїзди':
+            s = _shift_for_ts(shifts, _evt(r, 'виселення'))
+        r['_sid'] = s['id'] if s else None
+        r['_sname'] = s['name'] if s else 'Без зміни'
+        r['shift'] = r['_sname']
+    order = {s['id']: i for i, s in enumerate(shifts)}
+    rows = sorted(rows, key=lambda r: (r['_sid'] is None, -order.get(r['_sid'], -1)))
+    sum_col = 'revenue' if rt in ('Ресторан', 'Послуги') else 'total'
+    agg = {}
+    for r in rows:
+        a = agg.setdefault(r['_sid'], {'n': 0, 'sum': 0.0})
+        a['n'] += 1
+        try: a['sum'] += float(r.get(sum_col) or 0)
+        except Exception: pass
+    return (rows, ['shift'] + list(cols), ['Зміна'] + list(headers), [170] + list(widths), sum_col, agg)
+
+def _shift_hdr_rows(cols, r, agg, sum_col):
+    """Заголовок групи-зміни у ДВА рядки: зверху ім'я касира, під ним «зміна #N»."""
+    a = agg.get(r.get('_sid'), {'n': 0, 'sum': 0.0})
+    v1 = {c: '' for c in cols}
+    v1['shift'] = f"👤 {r.get('_sname')}"
+    for c in ('guest_name', 'name'):
+        if c in v1:
+            v1[c] = f"{a['n']} записів"; break
+    if sum_col in v1:
+        v1[sum_col] = f"{a['sum']:.0f}₴"
+    rows = [[v1[c] for c in cols]]
+    if r.get('_sid') is not None:
+        v2 = {c: '' for c in cols}
+        v2['shift'] = f"     зміна #{r.get('_sid')}"
+        rows.append([v2[c] for c in cols])
+    return rows
+
+def _tv_autofit_scroll(tree, cols, heads, frame, wide_col=None, hdr_tag='shift_hdr'):
+    """Автопідбір ширини колонок + горизонтальна прокрутка (Shift+колесо, ←/→)."""
+    def _fit():
+        try:
+            import tkinter.font as _tkf
+            fn = _tkf.Font(family='Segoe UI', size=10)
+            fb = _tkf.Font(family='Segoe UI', size=10, weight='bold')
+            w = {c: fb.measure(heads[i]) + 28 for i, c in enumerate(cols)}
+            for iid in tree.get_children(''):
+                f = fb if hdr_tag in tree.item(iid, 'tags') else fn
+                vals = tree.item(iid, 'values')
+                for i, c in enumerate(cols):
+                    if i < len(vals):
+                        m = f.measure(str(vals[i])) + 28
+                        if m > w[c]: w[c] = m
+            for c in cols:
+                tree.column(c, width=min(w[c], 900 if c == wide_col else 420), stretch=False)
+            frame.update_idletasks()
+            avail = frame.winfo_width() - 24
+            tot = sum(int(tree.column(c, 'width')) for c in cols)
+            if wide_col and avail > tot:
+                tree.column(wide_col, width=int(tree.column(wide_col, 'width')) + (avail - tot))
+        except Exception:
+            pass
+    for c in cols:
+        try: tree.column(c, stretch=False)
+        except Exception: pass
+    def _hs(e):
+        try: tree.xview_scroll(int(-1 * (e.delta / 120)) * 4, 'units')
+        except Exception: pass
+        return 'break'
+    def _vs(e):
+        try: tree.yview_scroll(int(-1 * (e.delta / 120)) * 3, 'units')
+        except Exception: pass
+        return 'break'
+    tree.bind('<Shift-MouseWheel>', _hs)
+    tree.bind('<MouseWheel>', _vs)
+    tree.bind('<Left>',  lambda e: (tree.xview_scroll(-4, 'units'), 'break')[1])
+    tree.bind('<Right>', lambda e: (tree.xview_scroll(4, 'units'), 'break')[1])
+    tree.bind('<Button-1>', lambda e: tree.focus_set(), add='+')
+    tree.bind('<Double-Button-1>',
+              lambda e: _fit() if tree.identify_region(e.x, e.y) == 'separator' else None, add='+')
+    frame.after(60, _fit)
+
+def _parse_cl_dt(s):
+    import datetime as _d
+    s = str(s or '').strip()
+    for fmt in ('%d.%m.%Y %H:%M:%S', '%d.%m.%Y %H:%M', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%d.%m.%Y', '%Y-%m-%d'):
+        try: return _d.datetime.strptime(s[:19] if fmt.endswith('%S') else s[:16], fmt)
+        except Exception: continue
+    return None
+
 def make_sortable_filterable(tree, headings_map, get_row_key=None):
     """Додає до вже створеного Treeview (з mktree) сортування по кліку на
     заголовок колонки та можливість фільтрувати рядки текстовим пошуком.
@@ -2181,6 +2324,25 @@ def make_sortable_filterable(tree, headings_map, get_row_key=None):
             state['reverse'] = False
         _refresh_headings()
         items = list(tree.get_children(''))
+        if any('shift_hdr' in tree.item(i, 'tags') for i in items):
+            # Є рядки-заголовки змін: сортуємо ВСЕРЕДИНІ кожної групи, групи лишаємо на місці
+            groups, cur = [], [[], []]
+            for iid in items:
+                if 'shift_hdr' in tree.item(iid, 'tags'):
+                    if cur[1]:
+                        groups.append(cur); cur = [[], []]
+                    cur[0].append(iid)
+                else:
+                    cur[1].append(iid)
+            groups.append(cur)
+            idx = 0
+            for hs, rs in groups:
+                rs.sort(key=lambda iid: _key_fn(col, tree.set(iid, col)), reverse=state['reverse'])
+                for h in hs:
+                    tree.move(h, '', idx); idx += 1
+                for r_ in rs:
+                    tree.move(r_, '', idx); idx += 1
+            return
         items.sort(key=lambda iid: _key_fn(col, tree.set(iid, col)), reverse=state['reverse'])
         for idx, iid in enumerate(items):
             tree.move(iid, '', idx)
@@ -2199,7 +2361,32 @@ def make_sortable_filterable(tree, headings_map, get_row_key=None):
         # тому ж порядку, в якому вони зберігались у списку all-elements.
         if not hasattr(tree, '_all_iids_cache'):
             return
-        for iid in tree._all_iids_cache:
+        _cache = tree._all_iids_cache
+        _has_hdr = any('shift_hdr' in tree.item(i, 'tags') for i in _cache)
+        if _has_hdr and state['filter']:
+            # Групи: заголовок показуємо, якщо він сам збігається (тоді вся група)
+            # або збігається хоч один рядок групи.
+            _groups, _cur = [], [[], []]
+            for iid in _cache:
+                if 'shift_hdr' in tree.item(iid, 'tags'):
+                    if _cur[1]:
+                        _groups.append(_cur); _cur = [[], []]
+                    _cur[0].append(iid)
+                else:
+                    _cur[1].append(iid)
+            _groups.append(_cur)
+            def _m(i): return any(state['filter'] in str(v).lower() for v in tree.item(i, 'values'))
+            for hs, rs in _groups:
+                h_match = any(_m(h) for h in hs)
+                keep = [r_ for r_ in rs if h_match or _m(r_)]
+                for h in hs:
+                    if keep: tree.reattach(h, '', 'end')
+                    else: tree.detach(h)
+                for r_ in rs:
+                    if r_ in keep: tree.reattach(r_, '', 'end')
+                    else: tree.detach(r_)
+            return
+        for iid in _cache:
             if not state['filter']:
                 tree.reattach(iid, '', 'end')
                 continue
@@ -22529,7 +22716,7 @@ class ReportsFrame(tk.Frame):
                                    COALESCE((SELECT SUM(p.amount) FROM payments p
                                              WHERE p.booking_id = b.id AND p.amount > 0
                                                AND COALESCE(p.note,'') NOT LIKE 'Залог%%'), 0) AS paid,
-                                   b.status
+                                   b.status, b.notes AS notes
                             FROM bookings b
                             JOIN rooms r ON b.room_id = r.id
                             LEFT JOIN guests g ON b.guest_id = g.id
@@ -22717,12 +22904,20 @@ class ReportsFrame(tk.Frame):
                                 COALESCE(cat.name, '—')      AS category,
                                 p.amount,
                                 p.method,
-                                p.note
+                                p.note,
+                                s.id                         AS shift_id,
+                                COALESCE(NULLIF(s.full_name,''), s.username) AS shift_name,
+                                s.opened_at                  AS shift_opened
                             FROM payments p
                             LEFT JOIN bookings b  ON p.booking_id = b.id
                             LEFT JOIN guests g    ON b.guest_id   = g.id
                             LEFT JOIN rooms r     ON b.room_id    = r.id
                             LEFT JOIN room_categories cat ON r.category_id = cat.id
+                            LEFT JOIN shifts s ON s.id = COALESCE(p.shift_id, (
+                                SELECT s3.id FROM shifts s3
+                                WHERE s3.opened_at <= p.created_at
+                                  AND (s3.closed_at IS NULL OR s3.closed_at >= p.created_at)
+                                ORDER BY s3.opened_at DESC LIMIT 1))
                             WHERE p.created_at::date BETWEEN %s AND %s
                               AND p.amount > 0
                               AND COALESCE(p.note,'') NOT LIKE 'Повернення залогу%%'
@@ -22822,17 +23017,17 @@ class ReportsFrame(tk.Frame):
             _tf.pack(fill='both', expand=True, padx=4, pady=(0,4))
             _tf.rowconfigure(0, weight=1)
             _tf.columnconfigure(0, weight=1)
-            _vsb_r = tk.Scrollbar(_tf, orient='vertical')
-            _hsb_r = tk.Scrollbar(_tf, orient='horizontal')
+            _vsb_r = tk.Scrollbar(_tf, orient='vertical', width=16)
+            _hsb_r = tk.Scrollbar(_tf, orient='horizontal', width=18)
             _sty_r = _ttk_rev.Style()
             _sty_r.configure('Rev.Treeview', background=C['card'], foreground=C['text'],
                  fieldbackground=C['card'], rowheight=25, font=('Segoe UI', 10))
             _sty_r.configure('Rev.Treeview.Heading', background=C['card2'],
                  foreground=C['accent'], font=('Segoe UI', 10, 'bold'))
             _sty_r.map('Rev.Treeview', background=[('selected', C['accent'])])
-            _rev_cols = ('dt','room','guest','category','amount','method','note')
-            _rev_hdrs = ('Дата/час','Кімн.','Гість','Категорія','Сума','Метод','Призначення')
-            _rev_ws   = (115, 80, 140, 120, 80, 90, 200)
+            _rev_cols = ('dt','room','guest','category','amount','method','shift','note')
+            _rev_hdrs = ('Дата/час','Кімн.','Гість','Категорія','Сума','Метод','Зміна (хто)','Призначення')
+            _rev_ws   = (115, 80, 140, 120, 80, 90, 130, 200)
             _tree_r = _ttk_rev.Treeview(_tf, columns=_rev_cols, show='headings',
                  style='Rev.Treeview', yscrollcommand=_vsb_r.set, xscrollcommand=_hsb_r.set)
             _vsb_r.config(command=_tree_r.yview)
@@ -22843,13 +23038,56 @@ class ReportsFrame(tk.Frame):
             _tree_r.grid(row=0, column=0, sticky='nsew')
             for i_col, (col, head, w) in enumerate(zip(_rev_cols, _rev_hdrs, _rev_ws)):
                  _tree_r.heading(col, text=head)
-                 stretch = (i_col == len(_rev_cols)-1)
+                 stretch = False   # без стиснення: загальна ширина = сума колонок → працює горизонтальна прокрутка
                  _tree_r.column(col, width=w, stretch=stretch,
                      anchor='center' if col in ('amount','method','dt') else 'w', minwidth=60)
             _tree_r.tag_configure('room_row', background='#1a3a2a', foreground='white')
             _tree_r.tag_configure('rest_row', background='#2d1f0e', foreground='white')
             _tree_r.tag_configure('other_row', background=C['card'])
+            _tree_r.tag_configure('shift_hdr', background='#22315a', foreground='#ffd166',
+                                  font=('Segoe UI', 10, 'bold'))
+
+            # ── Розбивка за змінами: підсумки по кожній зміні ──
+            def _rev_shift_key(r):
+                return r.get('shift_id')
+
+            def _rev_shift_name(r):
+                return str(r.get('shift_name') or ('—' if r.get('shift_id') is None else '?'))
+
+            def _rev_shift_opened(r):
+                _o = r.get('shift_opened')
+                try:
+                    if hasattr(_o, 'tzinfo') and _o.tzinfo is not None:
+                        _o = _o.astimezone(_kyiv_tz()).replace(tzinfo=None)
+                    return _o.strftime('%d.%m %H:%M')
+                except Exception:
+                    return ''
+
+            _shift_tot = {}
             for r in _pay_rows:
+                _k = _rev_shift_key(r)
+                _t = _shift_tot.setdefault(_k, {'n': 0, 'sum': 0.0, 'cash': 0.0, 'card': 0.0, 'transfer': 0.0})
+                _a = float(r.get('amount') or 0)
+                _t['n'] += 1; _t['sum'] += _a
+                _m = str(r.get('method') or '')
+                if _m in _t: _t[_m] += _a
+
+            def _rev_hdr_values(r):
+                _k = _rev_shift_key(r)
+                _t = _shift_tot.get(_k, {})
+                _title = f"Зміна #{_k}" if _k is not None else "Без зміни"
+                _op = _rev_shift_opened(r)
+                _det = (f"{_t.get('n',0)} платежів · готівка {_t.get('cash',0):.0f}₴ · "
+                        f"картка {_t.get('card',0):.0f}₴ · переказ {_t.get('transfer',0):.0f}₴")
+                return (f"👤 {_title}", '', _rev_shift_name(r), (f"з {_op}" if _op else ''),
+                        f"{_t.get('sum',0):.0f}₴", '', _rev_shift_name(r), _det)
+
+            _last_shift = object()
+            for r in _pay_rows:
+                 _sk = _rev_shift_key(r)
+                 if _sk != _last_shift:
+                     _last_shift = _sk
+                     _tree_r.insert('', 'end', tags=('shift_hdr',), values=_rev_hdr_values(r))
                  try:
                      dt_str = r['dt'].strftime('%d.%m %H:%M') if hasattr(r['dt'],'strftime') else str(r['dt'])[:16]
                  except Exception: dt_str = '—'
@@ -22861,12 +23099,71 @@ class ReportsFrame(tk.Frame):
                  tag = 'rest_row' if is_rest else ('room_row' if is_room else 'other_row')
                  _tree_r.insert('', 'end', tags=(tag,), values=(
                      dt_str, str(r.get('room') or '—'), str(r.get('guest') or '—'),
-                     str(r.get('category') or '—'), f'{amt:.0f}₴', meth_ua, note[:80],
+                     str(r.get('category') or '—'), f'{amt:.0f}₴', meth_ua,
+                     _rev_shift_name(r), note[:80],
                  ))
+            # ── Автопідбір ширини колонок під вміст (щоб усе влазило) ──
+            def _autofit_rev_cols(_tree=_tree_r, _cols=_rev_cols, _heads=_rev_hdrs, _frame=_tf):
+                try:
+                    import tkinter.font as _tkf
+                    _f_n = _tkf.Font(family='Segoe UI', size=10)
+                    _f_b = _tkf.Font(family='Segoe UI', size=10, weight='bold')
+                    _pad = 28
+                    _caps = {'note': 900}
+                    _widths = {}
+                    for _i, _c in enumerate(_cols):
+                        _widths[_c] = _f_b.measure(_heads[_i]) + _pad
+                    for _iid in _tree.get_children(''):
+                        _bold = 'shift_hdr' in _tree.item(_iid, 'tags')
+                        _fnt = _f_b if _bold else _f_n
+                        _vals = _tree.item(_iid, 'values')
+                        for _i, _c in enumerate(_cols):
+                            if _i >= len(_vals): continue
+                            _w = _fnt.measure(str(_vals[_i])) + _pad
+                            if _w > _widths[_c]: _widths[_c] = _w
+                    for _c in _cols:
+                        _tree.column(_c, width=min(_widths[_c], _caps.get(_c, 420)))
+                    # Якщо разом вужче за вікно — «Призначення» забирає залишок
+                    _frame.update_idletasks()
+                    _avail = _frame.winfo_width() - 24
+                    _sum = sum(int(_tree.column(_c, 'width')) for _c in _cols)
+                    if _avail > _sum:
+                        _tree.column('note', width=int(_tree.column('note', 'width')) + (_avail - _sum))
+                except Exception:
+                    pass
+            # ── Горизонтальна/вертикальна прокрутка: Shift+колесо, ←/→, перетягування ──
+            def _rev_hscroll(e):
+                try:
+                    _tree_r.xview_scroll(int(-1 * (e.delta / 120)) * 4, 'units')
+                except Exception: pass
+                return 'break'
+            def _rev_vscroll(e):
+                try:
+                    _tree_r.yview_scroll(int(-1 * (e.delta / 120)) * 3, 'units')
+                except Exception: pass
+                return 'break'
+            _tree_r.bind('<Shift-MouseWheel>', _rev_hscroll)
+            _tree_r.bind('<MouseWheel>', _rev_vscroll)
+            _tree_r.bind('<Left>',  lambda e: (_tree_r.xview_scroll(-4, 'units'), 'break')[1])
+            _tree_r.bind('<Right>', lambda e: (_tree_r.xview_scroll(4, 'units'), 'break')[1])
+            _tree_r.bind('<Button-1>', lambda e: _tree_r.focus_set(), add='+')
+            _tf.after(60, _autofit_rev_cols)
+            _tf.bind('<Double-Button-3>', lambda e: _autofit_rev_cols())
+            # Подвійний клік по роздільнику заголовка — теж автопідбір
+            _tree_r.bind('<Double-Button-1>',
+                         lambda e: _autofit_rev_cols() if _tree_r.identify_region(e.x, e.y) == 'separator' else None,
+                         add='+')
+
             # Після рендеру — розтягуємо canvas на повну висоту через after
             def _print_income_report():
                 _rows_pr = []
+                _last_pr = object()
                 for r in _pay_rows:
+                    _skp = _rev_shift_key(r)
+                    if _skp != _last_pr:
+                        _last_pr = _skp
+                        _hv = _rev_hdr_values(r)
+                        _rows_pr.append([_hv[0], '', '', _hv[3], _hv[4], '', _hv[6], _hv[7]])
                     try:
                         _dts = r['dt'].strftime('%d.%m.%Y %H:%M') if hasattr(r['dt'], 'strftime') else str(r['dt'])[:16]
                     except Exception:
@@ -22875,8 +23172,9 @@ class ReportsFrame(tk.Frame):
                     _rows_pr.append([_dts, str(r.get('room') or '—'), str(r.get('guest') or '—'),
                                       str(r.get('category') or '—'), f'{_amt:.0f}₴',
                                       _METH_UA.get(str(r.get('method','')), '—'),
+                                      _rev_shift_name(r),
                                       str(r.get('note') or '—')])
-                _totals_pr = ['РАЗОМ', '', '', '', f'{_total:.0f}₴', '', f'{len(_pay_rows)} записів']
+                _totals_pr = ['РАЗОМ', '', '', '', f'{_total:.0f}₴', '', '', f'{len(_pay_rows)} записів']
                 _open_report_print(
                     "Звіт — Дохід",
                     f"{df.strftime('%d.%m.%Y')} — {dt.strftime('%d.%m.%Y')}  |  Дохід всього: {_total:.0f}₴  |  "
@@ -22974,7 +23272,35 @@ class ReportsFrame(tk.Frame):
             headers = ['Номер','Категорія','Статус','Заїздів','Ночей','Дохід','Гість зараз','Виїзд']
             widths = [80, 150, 110, 70, 70, 100, 180, 100]
         elif rt=='Послуги':
-            rows=report_services(df,dt) or []
+            rows = []
+            try:
+                from app.utils.db import get_conn as _gc_svc
+                with _gc_svc() as _c_svc:
+                    with _c_svc.cursor() as _cur_svc:
+                        _cur_svc.execute("""
+                            SELECT
+                                COALESCE(NULLIF(TRIM(REGEXP_REPLACE(p.note, '^Послуга: *', '')), ''), '—') AS name,
+                                '—'          AS category,
+                                COUNT(*)     AS orders,
+                                COUNT(*)     AS qty,
+                                COALESCE(SUM(p.amount), 0) AS revenue,
+                                COALESCE(p.shift_id, (
+                                    SELECT s3.id FROM shifts s3
+                                    WHERE s3.opened_at <= p.created_at
+                                      AND (s3.closed_at IS NULL OR s3.closed_at >= p.created_at)
+                                    ORDER BY s3.opened_at DESC LIMIT 1)) AS shift_id
+                            FROM payments p
+                            WHERE p.created_at::date BETWEEN %s AND %s
+                              AND p.amount > 0
+                              AND COALESCE(p.note,'') LIKE 'Послуга:%%'
+                            GROUP BY 1, 6
+                            ORDER BY revenue DESC
+                        """, (df, dt))
+                        _rc_svc = [d[0] for d in _cur_svc.description]
+                        rows = [dict(zip(_rc_svc, r)) for r in _cur_svc.fetchall()]
+            except Exception as _esv:
+                log_error("report_services_by_shift", _esv)
+                rows = report_services(df,dt) or []
             cols=['name','category','orders','qty','revenue']
             headers=['Послуга','Категорія','Замовлень','К-сть','Дохід']
             widths=[220,120,90,70,110]
@@ -23004,13 +23330,17 @@ class ReportsFrame(tk.Frame):
                                 COALESCE(s.category,'—')           AS category,
                                 COUNT(DISTINCT ro.id)              AS orders,
                                 COALESCE(SUM(roi.{_rqcol}),0)     AS qty,
-                                COALESCE(SUM(roi.{_rqcol} * roi.{_rpcol}),0) AS revenue
+                                COALESCE(SUM(roi.{_rqcol} * roi.{_rpcol}),0) AS revenue,
+                                (SELECT s3.id FROM shifts s3
+                                  WHERE s3.opened_at <= ro.created_at
+                                    AND (s3.closed_at IS NULL OR s3.closed_at >= ro.created_at)
+                                  ORDER BY s3.opened_at DESC LIMIT 1) AS shift_id
                             FROM restaurant_orders ro
                             JOIN restaurant_order_items roi ON roi.order_id=ro.id
                             LEFT JOIN services s ON roi.service_id=s.id
                             WHERE ro.status IN ('closed','paid','done','completed','finished')
                               AND ro.created_at::date BETWEEN %s AND %s
-                            GROUP BY COALESCE(s.name,'—'), COALESCE(s.category,'—')
+                            GROUP BY COALESCE(s.name,'—'), COALESCE(s.category,'—'), 6
                             ORDER BY revenue DESC
                         """, (df, dt))
                         _rc = [d[0] for d in _cur_rst.description]
@@ -23045,11 +23375,19 @@ class ReportsFrame(tk.Frame):
                                     WHEN 'transfer' THEN 'Переказ'
                                     ELSE COALESCE(p.method,'—') END AS method_ua,
                                 p.amount,
-                                COALESCE(p.note,'—')         AS note
+                                COALESCE(p.note,'—')         AS note,
+                                s.id                         AS shift_id,
+                                COALESCE(NULLIF(s.full_name,''), s.username) AS shift_name,
+                                s.opened_at                  AS shift_opened
                             FROM payments p
                             LEFT JOIN bookings b  ON p.booking_id = b.id
                             LEFT JOIN guests g    ON b.guest_id   = g.id
                             LEFT JOIN rooms r     ON b.room_id    = r.id
+                            LEFT JOIN shifts s ON s.id = COALESCE(p.shift_id, (
+                                SELECT s3.id FROM shifts s3
+                                WHERE s3.opened_at <= p.created_at
+                                  AND (s3.closed_at IS NULL OR s3.closed_at >= p.created_at)
+                                ORDER BY s3.opened_at DESC LIMIT 1))
                             WHERE p.created_at::date BETWEEN %s AND %s
                             ORDER BY p.created_at DESC
                         """, (df, dt))
@@ -23116,7 +23454,7 @@ class ReportsFrame(tk.Frame):
             _sty_pay.configure('Pay.Treeview.Heading', background=C['card2'],
                 foreground=C['accent'], font=('Segoe UI', 10, 'bold'))
             _sty_pay.map('Pay.Treeview', background=[('selected', C['accent'])])
-            _pay_cols = ('dt','room','guest','method_ua','amount','note')
+            _pay_cols = ('dt','room','guest','method_ua','amount','shift','note')
             _pay_tv = _ttk_pay.Treeview(_tf_pay, columns=_pay_cols, show='headings',
                 style='Pay.Treeview', yscrollcommand=_vsb_pay.set, xscrollcommand=_hsb_pay.set)
             _vsb_pay.config(command=_pay_tv.yview)
@@ -23126,8 +23464,8 @@ class ReportsFrame(tk.Frame):
             _hsb_pay.grid(row=1, column=0, sticky='ew')
 
             for _col, _hd, _w in zip(_pay_cols,
-                ['Дата/час','Кімната','Гість','Метод','Сума','Призначення'],
-                [130, 90, 180, 90, 90, 320]):
+                ['Дата/час','Кімната','Гість','Метод','Сума','Зміна (хто)','Призначення'],
+                [130, 90, 180, 90, 90, 140, 320]):
                 _pay_tv.heading(_col, text=_hd)
                 _pay_tv.column(_col, width=_w, minwidth=60)
 
@@ -23136,7 +23474,38 @@ class ReportsFrame(tk.Frame):
             _pay_tv.tag_configure('refund', background='#2a1010')
             _pay_tv.tag_configure('deposit', background='#1a2a10')
 
+            _pay_tv.tag_configure('shift_hdr', background='#22315a', foreground='#ffd166',
+                                  font=('Segoe UI', 10, 'bold'))
+            # Підсумки по змінах
+            _ptot = {}
+            for _rp in _all_pay:
+                _t = _ptot.setdefault(_rp.get('shift_id'), {'n': 0, 'net': 0.0, 'in': 0.0, 'ref': 0.0})
+                _a = float(_rp.get('amount') or 0)
+                _t['n'] += 1; _t['net'] += _a
+                if _a >= 0: _t['in'] += _a
+                else: _t['ref'] += abs(_a)
+            def _pay_hdr_vals(_rp):
+                _k = _rp.get('shift_id'); _t = _ptot.get(_k, {})
+                _nm = str(_rp.get('shift_name') or ('—' if _k is None else '?'))
+                _o = _rp.get('shift_opened')
+                try:
+                    if hasattr(_o, 'tzinfo') and _o.tzinfo is not None:
+                        _o = _o.astimezone(_kyiv_tz()).replace(tzinfo=None)
+                    _os = 'з ' + _o.strftime('%d.%m %H:%M')
+                except Exception:
+                    _os = ''
+                _l1 = [f"👤 {_nm}" if _k is not None else '👤 Без зміни', '', '', '',
+                       f"{_t.get('net',0):.0f}₴", _nm,
+                       f"{_t.get('n',0)} платежів · надійшло {_t.get('in',0):.0f}₴ · повернень {_t.get('ref',0):.0f}₴"]
+                if _k is None:
+                    return [_l1]
+                return [_l1, [f"     зміна #{_k}", '', _os, '', '', '', '']]
+            _last_pk = object()
             for _i, _rp in enumerate(_all_pay):
+                if _rp.get('shift_id') != _last_pk:
+                    _last_pk = _rp.get('shift_id')
+                    for _hv in _pay_hdr_vals(_rp):
+                        _pay_tv.insert('', 'end', tags=('shift_hdr',), values=_hv)
                 _amt = float(_rp.get('amount') or 0)
                 _note = str(_rp.get('note') or '—')
                 _is_dep = any(x in _note.lower() for x in ('залог','deposit'))
@@ -23157,19 +23526,28 @@ class ReportsFrame(tk.Frame):
                     _rp.get('guest','—'),
                     _rp.get('method_ua','—'),
                     _amt_str,
+                    str(_rp.get('shift_name') or '—'),
                     _note[:60],
                 ])
+            _tv_autofit_scroll(_pay_tv, _pay_cols,
+                ['Дата/час','Кімната','Гість','Метод','Сума','Зміна (хто)','Призначення'],
+                _tf_pay, wide_col='note')
             rows = []; cols = []; headers = []; widths = []  # вже відрендерили вручну
             def _print_payments_report():
                 _rows_pr = []
+                _last_pp = object()
                 for _rp in _all_pay:
+                    if _rp.get('shift_id') != _last_pp:
+                        _last_pp = _rp.get('shift_id')
+                        _rows_pr.extend(_pay_hdr_vals(_rp))
                     _amt = float(_rp.get('amount') or 0)
                     _rows_pr.append([str(_rp.get('dt') or '—')[:16], _rp.get('room','—'), _rp.get('guest','—'),
-                                      _rp.get('method_ua','—'), f"{_amt:.0f}₴", str(_rp.get('note') or '—')])
+                                      _rp.get('method_ua','—'), f"{_amt:.0f}₴",
+                                      str(_rp.get('shift_name') or '—'), str(_rp.get('note') or '—')])
                 _open_report_print(
                     "Звіт — Платежі",
                     f"{df.strftime('%d.%m.%Y')} — {dt.strftime('%d.%m.%Y')}  |  Надійшло: {_total_in:.0f}₴  |  Повернено: {_total_ref:.0f}₴",
-                    ['Дата/час','Кімната','Гість','Метод','Сума','Призначення'], _rows_pr)
+                    ['Дата/час','Кімната','Гість','Метод','Сума','Зміна (хто)','Призначення'], _rows_pr)
             self._do_print_report_fn = _print_payments_report
             return
         elif rt=='Заїзди':
@@ -23183,7 +23561,8 @@ class ReportsFrame(tk.Frame):
                                    COALESCE(g.phone, '—') AS phone,
                                    b.check_in, b.check_out,
                                    (b.check_out - b.check_in) AS nights,
-                                   COALESCE(b.total_amount, 0) AS total
+                                   COALESCE(b.total_amount, 0) AS total,
+                                   b.notes AS notes, b.created_at AS b_created
                             FROM bookings b
                             JOIN rooms r ON b.room_id = r.id
                             LEFT JOIN guests g ON b.guest_id = g.id
@@ -23223,7 +23602,7 @@ class ReportsFrame(tk.Frame):
                                               AND COALESCE(p2.note,'') NOT LIKE 'Залог%%'), 0
                                        )
                                    ) AS debt,
-                                   b.status
+                                   b.status, b.notes AS notes
                             FROM bookings b
                             JOIN rooms r ON b.room_id = r.id
                             LEFT JOIN guests g ON b.guest_id = g.id
@@ -23259,6 +23638,22 @@ class ReportsFrame(tk.Frame):
                     return df <= d_e <= dt
                 except Exception: return False
             _clog2_filt = [e for e in _clog2 if _in_range(e)]
+            # Зміна для кожного запису журналу (за часом початку/кінця/запису)
+            _cl_shifts = _load_shifts_kyiv()
+            _cl_sh_of = {}
+            for _e in _clog2_filt:
+                _ts = (_parse_cl_dt(_e.get('started')) if len(str(_e.get('started') or '')) >= 10 else None) \
+                      or (_parse_cl_dt(_e.get('finished')) if len(str(_e.get('finished') or '')) >= 10 else None) \
+                      or _parse_cl_dt(_e.get('logged_at'))
+                _sh = _shift_for_ts(_cl_shifts, _ts)
+                _cl_sh_of[id(_e)] = (_sh['id'], _sh['name']) if _sh else (None, 'Без зміни')
+            _cl_cnt = {}
+            for _e in _clog2_filt:
+                _k = _cl_sh_of[id(_e)][0]; _cl_cnt[_k] = _cl_cnt.get(_k, 0) + 1
+            _cl_order = {s['id']: i for i, s in enumerate(_cl_shifts)}
+            # Нові зміни зверху; всередині зміни — від новіших записів до старіших
+            _clog2_grp = sorted(reversed(_clog2_filt),
+                                key=lambda e: (_cl_sh_of[id(e)][0] is None, -_cl_order.get(_cl_sh_of[id(e)][0], -1)))
             # Stat cards
             st_f = tk.Frame(self.result, bg=C['bg']); st_f.pack(fill='x',padx=10,pady=8)
             for i,(lbl_t,val,clr) in enumerate([
@@ -23286,33 +23681,70 @@ class ReportsFrame(tk.Frame):
             if _clog2_filt:
                 log_f=card(self.result); log_f.pack(fill='x',padx=10,pady=4)
                 lbl(log_f,"📋 Журнал прибирань:",12,True).pack(anchor='w',padx=12,pady=(8,4))
-                ff_cl,cl_t=mktree(log_f,('room','cleaner','started','finished','status','note'),
-                                  16,[70,150,120,120,110,180])
-                for c,h in zip(('room','cleaner','started','finished','status','note'),
-                               ['Кімн.','Прибиральник','Початок','Кінець','Статус','Нотатка']):
+                _cl_cols = ('shift','room','cleaner','started','finished','status','note')
+                ff_cl,cl_t=mktree(log_f,_cl_cols,16,[170,70,150,120,120,110,180])
+                for c,h in zip(_cl_cols,
+                               ['Зміна','Кімн.','Прибиральник','Початок','Кінець','Статус','Нотатка']):
                     cl_t.heading(c,text=h)
+                cl_t.tag_configure('shift_hdr', background='#22315a', foreground='#ffd166')
                 status_map2={'free':'✅ Вільний','cleaning':'🧹 Прибирання','repair':'🔧 Ремонт','blocked':'🔒 Заблокований'}
-                for e in reversed(_clog2_filt):
-                    cl_t.insert('','end',values=(e.get('room',''),e.get('cleaner',''),
+                _last_cl = object()
+                for e in _clog2_grp:
+                    _sid_c, _snm_c = _cl_sh_of[id(e)]
+                    if _sid_c != _last_cl:
+                        _last_cl = _sid_c
+                        cl_t.insert('','end',tags=('shift_hdr',),values=(
+                            f"👤 {_snm_c}" if _sid_c is not None else '👤 Без зміни',
+                            '', '', '', '', '', f"{_cl_cnt.get(_sid_c,0)} записів"))
+                        if _sid_c is not None:
+                            cl_t.insert('','end',tags=('shift_hdr',),values=(
+                                f"     зміна #{_sid_c}", '', '', '', '', '', ''))
+                    cl_t.insert('','end',values=(_snm_c,e.get('room',''),e.get('cleaner',''),
                         e.get('started',''),e.get('finished',''),
                         status_map2.get(e.get('new_status',''),e.get('new_status','')),
                         e.get('note','')))
                 ff_cl.pack(fill='both',expand=True,padx=10,pady=(0,10))
+                try:
+                    _tv_autofit_scroll(cl_t, list(_cl_cols),
+                        ['Зміна','Кімн.','Прибиральник','Початок','Кінець','Статус','Нотатка'],
+                        ff_cl, wide_col='note')
+                except Exception as _e_fit2:
+                    log_error('cleaning autofit', _e_fit2)
             else:
                 lbl(self.result,"Немає записів за вказаний період",13,color=C['text2']).pack(pady=20)
             def _print_cleaning_report():
                 _status_map = {'free':'✅ Вільний','cleaning':'🧹 Прибирання','repair':'🔧 Ремонт','blocked':'🔒 Заблокований'}
-                _rows_pr = [[e.get('room',''), e.get('cleaner',''), e.get('started',''), e.get('finished',''),
-                             _status_map.get(e.get('new_status',''), e.get('new_status','')), e.get('note','')]
-                            for e in reversed(_clog2_filt)]
+                _rows_pr = []
+                _last_cp = object()
+                for e in _clog2_grp:
+                    _sid_c, _snm_c = _cl_sh_of[id(e)]
+                    if _sid_c != _last_cp:
+                        _last_cp = _sid_c
+                        _rows_pr.append([f"👤 {_snm_c}" if _sid_c is not None else '👤 Без зміни',
+                                         '', '', '', '', '', f"{_cl_cnt.get(_sid_c,0)} записів"])
+                        if _sid_c is not None:
+                            _rows_pr.append([f"     зміна #{_sid_c}", '', '', '', '', '', ''])
+                    _rows_pr.append([_snm_c, e.get('room',''), e.get('cleaner',''), e.get('started',''), e.get('finished',''),
+                                     _status_map.get(e.get('new_status',''), e.get('new_status','')), e.get('note','')])
                 _open_report_print(
                     "Звіт — Прибирання",
                     f"{df.strftime('%d.%m.%Y')} — {dt.strftime('%d.%m.%Y')}  |  Записів: {len(_clog2_filt)}",
-                    ['Кімн.','Прибиральник','Початок','Кінець','Статус','Нотатка'], _rows_pr)
+                    ['Зміна','Кімн.','Прибиральник','Початок','Кінець','Статус','Нотатка'], _rows_pr)
             self._do_print_report_fn = _print_cleaning_report
             return
         else:
             rows=[]; cols=[]; headers=[]; widths=[]
+
+        # ── Розбивка по змінах (Заїзди / Виїзди / Ресторан / Послуги) ──
+        _grouped = False; _agg_g = {}; _sum_col_g = ''
+        if rt in ('Заїзди', 'Виїзди', 'Ресторан', 'Послуги') and rows:
+            try:
+                rows, cols, headers, widths, _sum_col_g, _agg_g = _group_generic_by_shift(
+                    list(rows), cols, headers, widths, rt)
+                _grouped = True
+            except Exception as _eg:
+                log_error("group_generic_by_shift", _eg)
+                _grouped = False
 
         # Заголовок
         hdr=card(self.result); hdr.pack(fill='x',padx=15,pady=(5,3))
@@ -23348,7 +23780,13 @@ class ReportsFrame(tk.Frame):
             tree.tag_configure(_tname, background=_tbg)
         tree.tag_configure('odd',  background=C['card'])
         tree.tag_configure('even', background=C['card2'])
+        tree.tag_configure('shift_hdr', background='#22315a', foreground='#ffd166')
+        _last_sid_g = object()
         for i, r in enumerate(rows):
+            if _grouped and r.get('_sid') != _last_sid_g:
+                _last_sid_g = r.get('_sid')
+                for _hv in _shift_hdr_rows(cols, r, _agg_g, _sum_col_g):
+                    tree.insert('', 'end', values=_hv, tags=('shift_hdr',))
             vals=[]
             for c in cols:
                 v=r.get(c,'') if isinstance(r,dict) else ''
@@ -23364,6 +23802,10 @@ class ReportsFrame(tk.Frame):
                 _row_tag = 'odd' if i % 2 == 0 else 'even'
             tree.insert('','end',values=vals,tags=(_row_tag,))
         ff.pack(fill='both',expand=True)
+        try:
+            _tv_autofit_scroll(tree, list(cols), list(headers), ff, wide_col=list(cols)[-1])
+        except Exception as _e_fit:
+            log_error('generic report autofit', _e_fit)
 
         # Клік по шапці сортує колонку; поле пошуку працює по всіх видимих полях.
         try:
@@ -23385,7 +23827,11 @@ class ReportsFrame(tk.Frame):
         # ── Друк цього звіту (та сама таблиця, вирівняним текстом) ──
         def _print_this_generic():
             plain_rows = []
+            _last_pg = object()
             for r in rows:
+                if _grouped and r.get('_sid') != _last_pg:
+                    _last_pg = r.get('_sid')
+                    plain_rows.extend(_shift_hdr_rows(cols, r, _agg_g, _sum_col_g))
                 cells = []
                 for c in cols:
                     v = r.get(c,'') if isinstance(r, dict) else ''
@@ -23478,6 +23924,10 @@ class ReportsFrame(tk.Frame):
             f"{gt_total:.0f}₴", f"{gt_rest:.0f}₴", ''), tags=('total_row',))
         tree_sh.tag_configure('total_row', background=C['card2'], foreground=C['green'])
         ff_sh.pack(fill='both', expand=True, padx=8, pady=8)
+        try:
+            _tv_autofit_scroll(tree_sh, list(cols), list(headers), ff_sh, wide_col='deposits', hdr_tag='total_row')
+        except Exception as _e_fit3:
+            log_error('shifts list autofit', _e_fit3)
 
         def _selected_shifts():
             return [self._shifts_row_map[iid] for iid in tree_sh.selection() if iid in self._shifts_row_map]
@@ -26810,73 +27260,34 @@ class GuestDatabaseFrame(tk.Frame):
         _btn_row = tk.Frame(win, bg=C['bg']); _btn_row.pack(pady=(0,10))
 
         def _edit_guest():
-            """Діалог редагування ПІБ, телефону та документа гостя."""
+            """Діалог редагування ПІБ і телефону гостя."""
             edit_win = ctk.CTkToplevel(win)
             edit_win.title("Редагувати гостя")
-            edit_win.geometry("460x360")
+            edit_win.geometry("420x230")
             edit_win.configure(fg_color=C['bg'])
             edit_win.grab_set(); edit_win.lift()
-            lbl(edit_win, "✏️  Редагувати гостя", 15, True).pack(anchor='w', padx=20, pady=(14,4))
+            ctk.CTkFrame(edit_win, fg_color=C['card'], corner_radius=10, height=2).pack(fill='x', padx=14, pady=(14,6))
+            lbl(edit_win, "✏️  Редагувати гостя", 15, True).pack(anchor='w', padx=20, pady=(12,4))
             _f = tk.Frame(edit_win, bg=C['bg']); _f.pack(fill='x', padx=20, pady=6)
             lbl(_f, "ПІБ:", 11, color=C['text2']).grid(row=0, column=0, sticky='w', pady=4)
-            _name_e = ent(_f, '', w=270); _name_e.insert(0, row['name'] or ''); _name_e.grid(row=0, column=1, padx=(8,0), pady=4)
+            _name_e = ent(_f, row['name'], w=260); _name_e.grid(row=0, column=1, padx=(8,0), pady=4)
             lbl(_f, "Телефон:", 11, color=C['text2']).grid(row=1, column=0, sticky='w', pady=4)
             _ph_val = row['phone'] if row['phone'] != '—' else ''
-            _phone_e = ent(_f, '', w=270); _phone_e.insert(0, _ph_val); _phone_e.grid(row=1, column=1, padx=(8,0), pady=4)
-
-            # ── Документ (зберігається в notes бронювань як «Паспорт: ...») ──
-            _old_doc = row.get('passport') or ''
-            _old_doc = '' if _old_doc == '—' else _old_doc
-            _dt0, _ser0, _num0 = _parse_doc_info(_old_doc)
-            lbl(_f, "Документ:", 11, color=C['text2']).grid(row=2, column=0, sticky='w', pady=4)
-            _dtype_var = ctk.StringVar(value=_dt0)
-            ctk.CTkOptionMenu(_f, values=['Паспорт', 'Військовий квиток', 'Водійське посвідчення'],
-                              variable=_dtype_var, width=270).grid(row=2, column=1, padx=(8,0), pady=4, sticky='w')
-            lbl(_f, "Серія:", 11, color=C['text2']).grid(row=3, column=0, sticky='w', pady=4)
-            _ser_e = ent(_f, '', w=270); _ser_e.insert(0, _ser0); _ser_e.grid(row=3, column=1, padx=(8,0), pady=4)
-            lbl(_f, "Номер:", 11, color=C['text2']).grid(row=4, column=0, sticky='w', pady=4)
-            _num_e = ent(_f, '', w=270); _num_e.insert(0, _num0); _num_e.grid(row=4, column=1, padx=(8,0), pady=4)
+            _phone_e = ent(_f, _ph_val, w=260); _phone_e.grid(row=1, column=1, padx=(8,0), pady=4)
             _err = lbl(edit_win, '', 10, color='#e74c3c'); _err.pack()
             def _save():
-                import re as _re_doc
                 new_name  = _name_e.get().strip()
                 new_phone = _phone_e.get().strip()
-                new_doc   = _format_doc_info(_dtype_var.get(), _ser_e.get(), _num_e.get())
                 if not new_name:
                     _err.configure(text="ПІБ не може бути порожнім"); return
                 try:
                     from app.utils.db import get_conn as _ec
-                    _pat = _re_doc.compile(r'Паспорт: .*?(?=  |\n|$)')
                     with _ec() as _conn_e:
                         with _conn_e.cursor() as _cur_e:
                             for gid_e in row['all_ids']:
                                 _cur_e.execute(
                                     "UPDATE guests SET name=%s, phone=%s WHERE id=%s",
                                     (new_name, new_phone or None, gid_e))
-                            # Оновлюємо документ лише якщо він змінився
-                            if new_doc != _old_doc.strip():
-                                ids_ph = ','.join(['%s'] * len(row['all_ids']))
-                                _cur_e.execute(
-                                    f"SELECT id, COALESCE(notes,'') FROM bookings "
-                                    f"WHERE guest_id IN ({ids_ph}) ORDER BY check_in DESC",
-                                    tuple(row['all_ids']))
-                                _bks = _cur_e.fetchall() or []
-                                _found = False
-                                for _bk in _bks:
-                                    _bid, _nt = _bk[0], _bk[1]
-                                    if 'Паспорт:' not in _nt:
-                                        continue
-                                    _found = True
-                                    _rep = f"Паспорт: {new_doc}" if new_doc else ''
-                                    _nt2 = _pat.sub(lambda m: _rep, _nt).strip()
-                                    _cur_e.execute("UPDATE bookings SET notes=%s WHERE id=%s",
-                                                   (_nt2, _bid))
-                                # Документа раніше не було — кладемо в останнє бронювання
-                                if not _found and new_doc and _bks:
-                                    _bid, _nt = _bks[0][0], _bks[0][1]
-                                    _nt2 = f"Паспорт: {new_doc}" + (f"  {_nt}" if _nt else '')
-                                    _cur_e.execute("UPDATE bookings SET notes=%s WHERE id=%s",
-                                                   (_nt2, _bid))
                         _conn_e.commit()
                     edit_win.destroy()
                     win.destroy()
