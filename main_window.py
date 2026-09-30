@@ -3629,6 +3629,96 @@ def _restaurant_stock_print_data(items, cat_label, date_str):
             ['Назва', 'Од.', 'Ціна', 'Залишок', 'Факт (вручну)'],
             rows, None, cls, [40, 9, 12, 14, 25])
 
+def _save_stock_report_xlsx(fpath, title, subtitle, headers, rows, cls, cw, now, sheet_title="Залишки"):
+    """Записує звіт «Залишки/Прайс» у xlsx у тому самому вигляді, що й друк А4:
+    заголовок, підзаголовок, групи-категорії, червоним залишок ≤ 5, колонка «Факт (вручну)»."""
+    ncol = len(headers)
+    last_col = get_column_letter(ncol)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = sheet_title
+    thin = Side(style='thin', color='999999')
+    brd = Border(left=thin, right=thin, top=thin, bottom=thin)
+    FONT = 'Segoe UI'
+
+    ws.merge_cells(f'A1:{last_col}1')
+    ws['A1'] = title
+    ws['A1'].font = Font(name=FONT, bold=True, size=16, color='000000')
+    ws['A1'].alignment = Alignment(horizontal='left', vertical='center')
+    ws.row_dimensions[1].height = 26
+    ws.merge_cells(f'A2:{last_col}2')
+    ws['A2'] = subtitle
+    ws['A2'].font = Font(name=FONT, size=10, color='444444')
+    ws['A2'].alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+    ws.row_dimensions[2].height = 30
+    ws.merge_cells(f'A3:{last_col}3')
+    ws['A3'] = f"Сформовано: {now.strftime('%d.%m.%Y %H:%M')}"
+    ws['A3'].font = Font(name=FONT, size=9, color='5D6D7E')
+    ws['A3'].alignment = Alignment(horizontal='right', vertical='center')
+
+    HR = 5
+    for ci, h in enumerate(headers, start=1):
+        c = ws.cell(row=HR, column=ci, value=h)
+        c.font = Font(name=FONT, bold=True, size=11, color='000000')
+        c.fill = PatternFill('solid', fgColor='EEEEEE')
+        c.alignment = Alignment(horizontal='center', vertical='center')
+        c.border = brd
+    ws.row_dimensions[HR].height = 22
+
+    def _num(txt):
+        t = str(txt).replace('\u20b4', '').replace(' ', '').replace(',', '.')
+        try:
+            v = float(t)
+            return int(v) if v == int(v) else v
+        except Exception:
+            return txt
+
+    r = HR
+    zebra = 0
+    for row, cl in zip(rows, cls):
+        r += 1
+        if cl == 'section':
+            ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=ncol)
+            c = ws.cell(row=r, column=1, value=row[0])
+            c.font = Font(name=FONT, bold=True, size=11, color='000000')
+            c.fill = PatternFill('solid', fgColor='D0D7E2')
+            c.alignment = Alignment(horizontal='center', vertical='center')
+            for ci in range(1, ncol + 1):
+                ws.cell(row=r, column=ci).border = brd
+                ws.cell(row=r, column=ci).fill = PatternFill('solid', fgColor='D0D7E2')
+            ws.row_dimensions[r].height = 20
+            zebra = 0
+            continue
+        low = (cl == 'low')
+        bg = 'F7F7F7' if zebra % 2 else 'FFFFFF'
+        zebra += 1
+        for ci, val in enumerate(row, start=1):
+            v = _num(val) if ci in (3, 4) else val
+            c = ws.cell(row=r, column=ci, value=v)
+            c.border = brd
+            c.fill = PatternFill('solid', fgColor=bg)
+            c.font = Font(name=FONT, size=10, bold=low, color='B03A2E' if low else '000000')
+            c.alignment = Alignment(horizontal='center' if ci in (2, 5) else 'left', vertical='center')
+            if ci == 3 and isinstance(v, (int, float)):
+                c.number_format = '0"\u20b4"'
+        ws.row_dimensions[r].height = 18
+
+    for ci, w in enumerate(cw, start=1):
+        ws.column_dimensions[get_column_letter(ci)].width = max(8, w * 1.05)
+    try:
+        ws.page_setup.orientation = 'portrait'
+        ws.page_setup.paperSize = ws.PAPERSIZE_A4
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 0
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+        ws.print_title_rows = f'{HR}:{HR}'
+        ws.page_margins.left = ws.page_margins.right = 0.5
+    except Exception:
+        pass
+    ws.freeze_panes = ws.cell(row=HR + 1, column=1)
+    ws.sheet_view.showGridLines = False
+    wb.save(fpath)
+
 def _update_invoice_record(invoice_id, inv):
     """Оновлює раніше збережений рахунок у БД. Повертає (True, None) при
     успіху або (False, повідомлення_помилки)."""
@@ -18652,6 +18742,7 @@ class RestaurantFrame(tk.Frame):
         self._order_status_lbl = lbl(tb, "", 11, color=C['text2'])
         self._order_status_lbl.pack(side='right', padx=(0,6))
         btn(tb, "🔄 Меню", self._reload_menu, C['card2'], 100).pack(side='right', padx=4, pady=10)
+        btn(tb, "📤 Імпорт з Excel", self._import_menu_excel, '#16a085', 130).pack(side='right', padx=4, pady=10)
         btn(tb, "📥 Excel залишки", self._export_stock_excel, '#27ae60', 140).pack(side='right', padx=4, pady=10)
         _print_btn = btn(tb, "🖨 Друк ▾", lambda: self._print_popup(_print_btn), '#2980b9', 110)
         _print_btn.pack(side='right', padx=4, pady=10)
@@ -19366,134 +19457,124 @@ class RestaurantFrame(tk.Frame):
 
 
     def _export_stock_excel(self):
-        """Вигрузка залишків продукції ресторану в Excel."""
+        """Вигрузка залишків ресторану/бару в Excel — у тому самому вигляді, що й
+        друк А4 («Залишки ресторану / бару»): групи-категорії, червоним залишок ≤ 5,
+        порожня колонка «Факт (вручну)» для звірки."""
         if not _OPENPYXL_OK:
             messagebox.showerror("Помилка", "Бібліотека openpyxl не знайдена.\nВстановіть: pip install openpyxl")
             return
         import os, datetime as _dte
         try:
-            from app.utils.db import get_conn as _gc_ex
-            with _gc_ex() as _c_ex:
-                with _c_ex.cursor() as _cur_ex:
-                    # Колонка qty в roi
-                    try:
-                        _cur_ex.execute("SELECT column_name FROM information_schema.columns "
-                            "WHERE table_name='restaurant_order_items' AND column_name IN ('quantity','qty') LIMIT 1")
-                        _rr = _cur_ex.fetchone(); _rqc = _rr[0] if _rr else 'quantity'
-                    except Exception: _rqc = 'quantity'
-
-                    _cur_ex.execute(f"""
-                        SELECT
-                            s.id,
-                            s.name                              AS name,
-                            COALESCE(s.category,'—')            AS category,
-                            COALESCE(s.unit,'шт')               AS unit,
-                            COALESCE(s.price, 0)                AS price,
-                            COALESCE(s.quantity, 0)             AS stock_now,
-                            COALESCE(
-                                (SELECT SUM(roi.{_rqc})
-                                 FROM restaurant_order_items roi
-                                 JOIN restaurant_orders ro ON ro.id = roi.order_id
-                                 WHERE roi.service_id = s.id
-                                   AND ro.status IN ('closed','paid')
-                                ), 0
-                            )                                   AS sold_total,
-                            COALESCE(
-                                (SELECT SUM(roi.{_rqc})
-                                 FROM restaurant_order_items roi
-                                 JOIN restaurant_orders ro ON ro.id = roi.order_id
-                                 WHERE roi.service_id = s.id
-                                   AND ro.status IN ('closed','paid')
-                                   AND ro.created_at::date = CURRENT_DATE
-                                ), 0
-                            )                                   AS sold_today
-                        FROM services s
-                        WHERE s.active = true
-                          AND COALESCE(s.category,'') NOT IN %s
-                        ORDER BY s.category, s.name
-                    """, (self._RESTAURANT_EXCL_CATS,))
-                    rows = _cur_ex.fetchall()
+            items = self._menu_items_fresh()
+            now = _dte.datetime.now()
+            title, subtitle, headers, rows, _tot, cls, cw = _restaurant_stock_print_data(
+                items, self._cat_label, now.strftime('%d.%m.%Y %H:%M'))
         except Exception as _e:
             log_error("_export_stock_excel", _e)
             messagebox.showerror("Помилка", str(_e))
             return
-
-        if not rows:
+        if not any(c != 'section' for c in cls):
             messagebox.showinfo("", "Немає даних для вигрузки")
             return
 
+        ncol = len(headers)
+        last_col = get_column_letter(ncol)
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "Залишки"
-        s_side = Side(style='thin', color='CCCCCC')
-        brd = Border(left=s_side, right=s_side, top=s_side, bottom=s_side)
-        now_str = _dte.datetime.now().strftime('%d.%m.%Y %H:%M')
+        thin = Side(style='thin', color='999999')
+        brd = Border(left=thin, right=thin, top=thin, bottom=thin)
+        FONT = 'Segoe UI'
 
-        # Шапка
-        ws.merge_cells('A1:H1')
-        ws['A1'] = f"Готель 'Королівська Бочка' — Звірка залишків ресторану"
-        ws['A1'].font = Font(bold=True, size=14, color='1A5276')
-        ws['A1'].alignment = Alignment(horizontal='center')
+        # Заголовок, підзаголовок, «Сформовано» — як на друкованій сторінці
+        ws.merge_cells(f'A1:{last_col}1')
+        ws['A1'] = title
+        ws['A1'].font = Font(name=FONT, bold=True, size=16, color='000000')
+        ws['A1'].alignment = Alignment(horizontal='left', vertical='center')
+        ws.row_dimensions[1].height = 26
 
-        ws.merge_cells('A2:H2')
-        ws['A2'] = f"Сформовано: {now_str}"
-        ws['A2'].font = Font(size=10, color='666666')
-        ws['A2'].alignment = Alignment(horizontal='center')
-        ws.append([])
+        ws.merge_cells(f'A2:{last_col}2')
+        ws['A2'] = subtitle
+        ws['A2'].font = Font(name=FONT, size=10, color='444444')
+        ws['A2'].alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+        ws.row_dimensions[2].height = 30
 
-        # Заголовки
-        headers = ['ID', 'Назва', 'Категорія', 'Од.', 'Ціна', 'Продано всього', 'Продано сьогодні', 'Залишок']
-        ws.append(headers)
-        hrow = ws.max_row
-        col_widths = [6, 35, 18, 8, 10, 16, 18, 12]
-        for ci, (cell, w) in enumerate(zip(ws[hrow], col_widths)):
-            cell.fill = PatternFill('solid', fgColor='2C3E50')
-            cell.font = Font(bold=True, color='FFFFFF', size=11)
-            cell.alignment = Alignment(horizontal='center', vertical='center')
-            cell.border = brd
-            ws.column_dimensions[get_column_letter(ci+1)].width = w
+        ws.merge_cells(f'A3:{last_col}3')
+        ws['A3'] = f"Сформовано: {now.strftime('%d.%m.%Y %H:%M')}"
+        ws['A3'].font = Font(name=FONT, size=9, color='5D6D7E')
+        ws['A3'].alignment = Alignment(horizontal='right', vertical='center')
 
-        # Дані
-        cat_colors = {}
-        _palette = ['EBF5FB','FEF9E7','EAFAF1','FDEDEC','F4ECF7','FDF2E9','E8F8F5','F9EBEA']
-        _ci_map = {}
-        for row in rows:
-            sid, name, cat, unit, price, stock, sold_total, sold_today = row
-            price = float(price or 0)
-            stock = float(stock or 0)
-            sold_total = float(sold_total or 0)
-            sold_today = float(sold_today or 0)
+        # Шапка таблиці
+        HR = 5
+        for ci, h in enumerate(headers, start=1):
+            c = ws.cell(row=HR, column=ci, value=h)
+            c.font = Font(name=FONT, bold=True, size=11, color='000000')
+            c.fill = PatternFill('solid', fgColor='EEEEEE')
+            c.alignment = Alignment(horizontal='center', vertical='center')
+            c.border = brd
+        ws.row_dimensions[HR].height = 22
 
-            if cat not in _ci_map:
-                _ci_map[cat] = _palette[len(_ci_map) % len(_palette)]
-            bg = _ci_map[cat]
+        def _num(txt):
+            t = str(txt).replace('\u20b4', '').replace(' ', '').replace(',', '.')
+            try:
+                v = float(t)
+                return int(v) if v == int(v) else v
+            except Exception:
+                return txt
 
-            ws.append([sid, name, cat, unit, f"{price:.0f}₴", f"{sold_total:.0f}", f"{sold_today:.0f}", f"{stock:.0f}"])
-            rn = ws.max_row
-            for ci2, cell in enumerate(ws[rn]):
-                cell.fill = PatternFill('solid', fgColor=bg)
-                cell.border = brd
-                cell.alignment = Alignment(horizontal='right' if ci2 > 1 else 'left', vertical='center')
-                # Червоний текст якщо залишок <= 2
-                if ci2 == 7 and stock <= 2:
-                    cell.font = Font(bold=True, color='C0392B')
-                elif ci2 == 7 and stock <= 5:
-                    cell.font = Font(bold=False, color='D35400')
+        r = HR
+        zebra = 0
+        for row, cl in zip(rows, cls):
+            r += 1
+            if cl == 'section':
+                ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=ncol)
+                c = ws.cell(row=r, column=1, value=row[0])
+                c.font = Font(name=FONT, bold=True, size=11, color='000000')
+                c.fill = PatternFill('solid', fgColor='D0D7E2')
+                c.alignment = Alignment(horizontal='center', vertical='center')
+                for ci in range(1, ncol + 1):
+                    ws.cell(row=r, column=ci).border = brd
+                    ws.cell(row=r, column=ci).fill = PatternFill('solid', fgColor='D0D7E2')
+                ws.row_dimensions[r].height = 20
+                zebra = 0
+                continue
+            low = (cl == 'low')
+            bg = 'F7F7F7' if zebra % 2 else 'FFFFFF'
+            zebra += 1
+            for ci, val in enumerate(row, start=1):
+                v = _num(val) if ci in (3, 4) else val
+                c = ws.cell(row=r, column=ci, value=v)
+                c.border = brd
+                c.fill = PatternFill('solid', fgColor=bg)
+                c.font = Font(name=FONT, size=10, bold=low, color='B03A2E' if low else '000000')
+                c.alignment = Alignment(horizontal='left' if ci == 1 else 'center' if ci in (2, 5) else 'left',
+                                        vertical='center')
+                if ci == 3 and isinstance(v, (int, float)):
+                    c.number_format = '0"\u20b4"'
+                    c.alignment = Alignment(horizontal='left', vertical='center')
+                if ci == 4:
+                    c.alignment = Alignment(horizontal='left', vertical='center')
+            ws.row_dimensions[r].height = 18
 
-        ws.row_dimensions[4].height = 20
+        # Ширина колонок — як у друкованій версії (у «символах»)
+        for ci, w in enumerate(cw, start=1):
+            ws.column_dimensions[get_column_letter(ci)].width = max(8, w * 1.05)
 
-        # Підсумок
-        ws.append([])
-        total_stock = sum(float(r[5] or 0) for r in rows)
-        total_sold = sum(float(r[6] or 0) for r in rows)
-        total_today = sum(float(r[7] or 0) for r in rows)
-        ws.append(['', 'РАЗОМ:', '', '', '', f"{total_sold:.0f}", f"{total_today:.0f}", f"{total_stock:.0f}"])
-        for cell in ws[ws.max_row]:
-            cell.font = Font(bold=True, color='27AE60')
-            cell.border = brd
+        # Друк: A4 портрет на всю ширину, шапка повторюється на кожній сторінці
+        try:
+            ws.page_setup.orientation = 'portrait'
+            ws.page_setup.paperSize = ws.PAPERSIZE_A4
+            ws.page_setup.fitToWidth = 1
+            ws.page_setup.fitToHeight = 0
+            ws.sheet_properties.pageSetUpPr.fitToPage = True
+            ws.print_title_rows = f'{HR}:{HR}'
+            ws.page_margins.left = ws.page_margins.right = 0.5
+        except Exception:
+            pass
+        ws.freeze_panes = ws.cell(row=HR + 1, column=1)
+        ws.sheet_view.showGridLines = False
 
-        # Зберегти
-        fname = f"Залишки_ресторан_{_dte.datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+        fname = f"Залишки_ресторан_{now.strftime('%Y%m%d_%H%M')}.xlsx"
         fpath = os.path.join(os.path.expanduser('~'), 'Desktop', fname)
         if not os.path.exists(os.path.dirname(fpath)):
             fpath = os.path.join(os.path.expanduser('~'), fname)
@@ -19501,9 +19582,12 @@ class RestaurantFrame(tk.Frame):
             wb.save(fpath)
             messagebox.showinfo("✅ Excel збережено", f"Файл збережено:\n{fpath}")
             try:
-                import subprocess
-                subprocess.Popen(['start', '', fpath], shell=True)
-            except Exception: pass
+                os.startfile(fpath)
+            except Exception:
+                try:
+                    import subprocess
+                    subprocess.Popen(['start', '', fpath], shell=True)
+                except Exception: pass
         except Exception as _es:
             messagebox.showerror("Помилка збереження", str(_es))
 
@@ -19565,6 +19649,27 @@ class RestaurantFrame(tk.Frame):
         except Exception as _ex:
             log_error("RestaurantFrame: друк залишків", _ex)
             messagebox.showerror("Помилка друку", str(_ex))
+
+    def _import_menu_excel(self):
+        """Імпорт меню з Excel просто зі сторінки «Ресторан» — той самий діалог,
+        що й у Налаштування → Меню (Імпорт XLS): приймає і звіт «Прайс готелю», і файл «XLS для імпорту»."""
+        import types
+        sf = SettingsFrame
+        self._read_xlsx = sf._read_xlsx
+        self._normalize_import_rows = sf._normalize_import_rows
+        self._dedup_services = types.MethodType(sf._dedup_services, self)
+        def _refresh(expand_cat=None):
+            try:
+                self._load_menu_data()
+                self._rebuild_cats_and_fill()
+            except Exception as _e:
+                log_error("RestaurantFrame: оновлення меню після імпорту", _e)
+        self._load_svcs = _refresh
+        try:
+            sf._menu_import_xls(self, on_done=_refresh)
+        except Exception as _ex:
+            log_error("RestaurantFrame._import_menu_excel", _ex)
+            messagebox.showerror("Помилка імпорту", str(_ex))
 
     def _reload_menu(self):
         """Оновлює список меню з БД."""
@@ -28755,7 +28860,9 @@ class SettingsFrame(tk.Frame):
         btn(tb,"🔖 Штрих-коди",lambda:self._barcode_quick_dlg(p),'#e67e22',130).pack(side='left',padx=4)
         refresh_btn(tb,lambda:self._load_svcs(),side='left',padx=4,pady=6)
         btn(tb,"📥 Імпорт XLS",lambda:self._menu_import_xls(),C['green'],130).pack(side='left',padx=4)
-        btn(tb,"📤 Експорт XLS",lambda:self._menu_export_xls(),'#9b59b6',130).pack(side='left',padx=4)
+        btn(tb,"📤 Експорт XLS",lambda:self._menu_export_report_xls(),'#9b59b6',130).pack(side='left',padx=4)
+        btn(tb,"📤 XLS для імпорту",lambda:self._menu_export_xls(),'#7d3c98',150).pack(side='left',padx=4)
+        btn(tb,"🖨 Друк / HTML",lambda:self._menu_print_html(),'#2980b9',130).pack(side='left',padx=4)
         btn(tb,"🔧 Кракозябри",lambda:self._menu_fix_mojibake(),'#e67e22',140).pack(side='left',padx=4)
         ff,self.svcs_t=mktree(p,('id','name','cat','price','unit','qty','stock','barcode','act'),14,[50,220,100,80,60,80,80,140,50])
         for c,h in zip(('id','name','cat','price','unit','qty','stock','barcode','act'),
@@ -28908,8 +29015,9 @@ class SettingsFrame(tk.Frame):
             if 'xl/sharedStrings.xml' in names:
                 root=ET.fromstring(zf.read('xl/sharedStrings.xml'))
                 for si in root.findall('{'+ns+'}si'):
-                    t=si.find('.//{'+ns+'}t')
-                    sst.append(t.text or '' if t is not None else '')
+                    # звичайний <t> та rich-text <r><t>; фонетичні підказки (<rPh>) ігноруємо
+                    _ts=si.findall('{'+ns+'}t')+si.findall('{'+ns+'}r/{'+ns+'}t')
+                    sst.append(''.join(x.text or '' for x in _ts))
             ws_name=next((n for n in names if n.startswith('xl/worksheets/sheet') and n.endswith('.xml')),None)
             if not ws_name: return []
             root=ET.fromstring(zf.read(ws_name)); rows=[]
@@ -28922,11 +29030,90 @@ class SettingsFrame(tk.Frame):
                     t=c.get('t',''); v_el=c.find('{'+ns+'}v')
                     val=v_el.text if v_el is not None else ''
                     if t=='s': val=sst[int(val)] if val and int(val)<len(sst) else ''
+                    elif t=='inlineStr':
+                        # openpyxl зберігає текст прямо в комірці: <c t="inlineStr"><is><t>…</t></is></c>
+                        _is=c.find('{'+ns+'}is')
+                        val=''.join(x.text or '' for x in _is.iter('{'+ns+'}t')) if _is is not None else ''
                     row_dict[col_idx]=val or ''
                 if row_dict:
                     max_col=max(row_dict.keys())
                     rows.append([row_dict.get(i,'') for i in range(max_col+1)])
         return rows
+
+    def _menu_report_data(self):
+        """Дані прайсу готелю у форматі звіту «Залишки»: (items→rows) або None при помилці."""
+        import datetime as _dtp
+        try:
+            from app.utils.db import get_conn as _gc_ph
+            with _gc_ph() as _c:
+                with _c.cursor() as _cur:
+                    _cur.execute("""
+                        SELECT s.name, s.category, s.price, s.unit,
+                               COALESCE(s.quantity,0) AS quantity,
+                               CASE WHEN COALESCE(s.quantity,0)=0 THEN NULL
+                                    ELSE GREATEST(0, COALESCE(s.quantity,0) - COALESCE(
+                                        (SELECT SUM(roi.quantity) FROM restaurant_order_items roi
+                                         JOIN restaurant_orders ro ON ro.id=roi.order_id
+                                         WHERE roi.service_id=s.id AND ro.status NOT IN ('cancelled')),0))
+                               END AS stock
+                        FROM services s
+                        WHERE s.name NOT LIKE '__cat_placeholder_%%'
+                          AND COALESCE(s.active, TRUE)
+                        ORDER BY s.category, s.name
+                    """)
+                    _cols = [d[0] for d in _cur.description]
+                    items = [dict(zip(_cols, r)) for r in _cur.fetchall()]
+        except Exception as _e:
+            log_error("SettingsFrame._menu_report_data", _e)
+            messagebox.showerror("Помилка", f"Не вдалось прочитати прайс:\n{_e}"); return None
+        if not items:
+            messagebox.showinfo("", "Прайс порожній"); return None
+        _CL = {'restaurant':'Ресторан','bar':'Бар','minibar':'Міні-бар','laundry':'Прання',
+               'transfer':'Трансфер','штрафи':'Штрафи','бані':'Бані','бесідки':'Бесідки',
+               'other':'Інше','до_кави':'До кави','до_пива':'До пива','до_чаю':'До чаю',
+               'кава-чай':'Кава/Чай','кухня':'Кухня','напої':'Напої','молочка':'Молочка'}
+        def _cat_label(c):
+            return _CL.get(c, str(c).replace('_', ' ').capitalize())
+        now = _dtp.datetime.now()
+        t, sub, hd, rows, tot, cls, cw = _restaurant_stock_print_data(
+            items, _cat_label, now.strftime('%d.%m.%Y %H:%M'))
+        if not any(c != 'section' for c in cls):
+            messagebox.showinfo("", "Немає позицій"); return None
+        return ("Прайс готелю", sub, hd, rows, tot, cls, cw, now)
+
+    def _menu_print_html(self):
+        """Прайс готелю — А4-сторінка (HTML) у вигляді «Залишки ресторану / бару»."""
+        try:
+            d = self._menu_report_data()
+            if not d: return
+            t, sub, hd, rows, tot, cls, cw, now = d
+            _open_report_print(t, sub, hd, rows, tot, row_classes=cls,
+                               landscape=False, col_widths=cw)
+        except Exception as _ex:
+            log_error("SettingsFrame._menu_print_html", _ex)
+            messagebox.showerror("Помилка друку", str(_ex))
+
+    def _menu_export_report_xls(self):
+        """Експорт прайсу готелю в Excel у тому самому вигляді, що й HTML-звіт."""
+        import os as _os
+        if not _OPENPYXL_OK:
+            messagebox.showerror("Помилка", "Бібліотека openpyxl не знайдена.\nВстановіть: pip install openpyxl"); return
+        try:
+            d = self._menu_report_data()
+            if not d: return
+            t, sub, hd, rows, tot, cls, cw, now = d
+            import tkinter.filedialog as fd
+            path = fd.asksaveasfilename(title="Зберегти прайс готелю", defaultextension=".xlsx",
+                filetypes=[("Excel файл", "*.xlsx"), ("Всі файли", "*.*")],
+                initialfile=f"Прайс_готелю_{now.strftime('%Y%m%d_%H%M')}.xlsx")
+            if not path: return
+            _save_stock_report_xlsx(path, t, sub, hd, rows, cls, cw, now, sheet_title="Прайс готелю")
+            messagebox.showinfo("✅ Excel збережено", f"Файл збережено:\n{path}")
+            try: _os.startfile(path)
+            except Exception: pass
+        except Exception as _ex:
+            log_error("SettingsFrame._menu_export_report_xls", _ex)
+            messagebox.showerror("Помилка", str(_ex))
 
     def _menu_export_xls(self):
         import tkinter.filedialog as fd
@@ -29016,7 +29203,79 @@ class SettingsFrame(tk.Frame):
             win.after(1200, win.destroy)
         btn(f, "✅ Виправити всі", do_apply, C['green'], 180).pack(anchor='w')
 
-    def _menu_import_xls(self):
+    @staticmethod
+    def _normalize_import_rows(rows):
+        """Якщо файл — звіт «Прайс готелю» (заголовок зверху, рядки-категорії, колонки
+        Назва | Од. | Ціна | Залишок | Факт), перетворює його на «плоский» вигляд імпорту:
+        [назва, код, ціна, категорія, од., к-сть, акт.]. Інакше повертає рядки без змін.
+        Кількість береться з «Факт», а якщо порожньо — із «Залишок» ("—" = без змін)."""
+        def _low(x): return str(x or '').strip().lower()
+        hidx = None
+        for i, r in enumerate(rows[:12]):
+            if r and _low(r[0]) in ('назва', 'найменування', 'name', 'наименование') \
+               and any(_low(c).startswith(('ціна', 'сума', 'цена', 'price')) for c in r[1:]):
+                hidx = i; break
+        if hidx is None:
+            return rows, False
+        hdr = [_low(c) for c in rows[hidx]]
+        is_report = any(h.startswith(('залишок', 'факт')) for h in hdr) or hidx > 0
+        if not is_report:
+            return rows, False
+        def _col(*prefixes):
+            for ci, h in enumerate(hdr):
+                if h.startswith(prefixes): return ci
+            return None
+        c_price = _col('ціна', 'сума', 'цена', 'price')
+        c_unit = _col('од', 'unit')
+        c_code = _col('код')
+        c_cat = _col('категор')
+        c_fact = _col('факт')
+        c_stock = _col('залишок')
+        # відповідність «підпис у звіті» → ключ категорії в БД
+        def _nk(x):
+            return str(x).strip().lower().replace('_', ' ').replace('-', ' ').replace('/', ' ')
+        _CL = {'ресторан':'restaurant','бар':'bar','міні бар':'minibar','мінібар':'minibar',
+               'прання':'laundry','пральня':'laundry','трансфер':'transfer','штрафи':'штрафи',
+               'бані':'бані','бесідки':'бесідки','інше':'other','до кави':'до_кави',
+               'до пива':'до_пива','до чаю':'до_чаю','кава чай':'кава-чай','кухня':'кухня',
+               'напої':'напої','молочка':'молочка'}
+        db_cats = {}
+        try:
+            from app.utils.db import get_conn as _gc_cat
+            with _gc_cat() as _c:
+                with _c.cursor() as _cur:
+                    _cur.execute("SELECT DISTINCT category FROM services WHERE category IS NOT NULL")
+                    for (_k,) in _cur.fetchall():
+                        db_cats[_nk(_k)] = str(_k)
+        except Exception:
+            pass
+        def _cat_key(label):
+            l = _nk(label)
+            if l in db_cats: return db_cats[l]      # категорія, що вже є в базі — найнадійніше
+            if l in _CL: return _CL[l]
+            return str(label).strip().lower().replace(' ', '_')
+        def _get(r, ci):
+            return str(r[ci]).strip() if ci is not None and ci < len(r) and r[ci] is not None else ''
+        out, cur_cat = [], ''
+        for r in rows[hidx + 1:]:
+            if not r or not str(r[0]).strip():
+                continue
+            name = str(r[0]).strip()
+            others = [str(x).strip() for x in r[1:] if x is not None and str(x).strip()]
+            if not others:                      # рядок-секція → поточна категорія
+                cur_cat = _cat_key(name); continue
+            _q = ''
+            for _ci in (c_fact, c_stock):          # «Факт» має пріоритет над «Залишок»
+                _v = _get(r, _ci).replace(',', '.')
+                try:
+                    float(_v); _q = _v; break
+                except Exception:
+                    continue                       # «—», порожньо → без обліку
+            out.append([name, _get(r, c_code), _get(r, c_price).replace('₴', '').strip() or '0',
+                        _get(r, c_cat) or cur_cat, _get(r, c_unit), _q, '✓'])
+        return out, True
+
+    def _menu_import_xls(self, on_done=None):
         from app.modules.logic import save_service
         import tkinter.filedialog as fd
         path=fd.askopenfilename(title="Відкрити прайс-лист",
@@ -29038,11 +29297,12 @@ class SettingsFrame(tk.Frame):
                     except Exception: rows=[]
                 if rows and len(rows[0])>=2: break
         if not rows: messagebox.showerror("Помилка","Не вдалося прочитати файл"); return
-        sr=1 if rows and rows[0] and any(str(rows[0][0]).strip().lower().startswith(x)
+        rows,_is_report=self._normalize_import_rows(rows)
+        sr=1 if (not _is_report) and rows and rows[0] and any(str(rows[0][0]).strip().lower().startswith(x)
             for x in ['найменування','назва','name','наименование']) else 0
         data_rows=[r for r in rows[sr:] if r and str(r[0]).strip()]
         if not data_rows: messagebox.showerror("","Дані не знайдено"); return
-        win=dlg_win(self,"📥 Імпорт меню","540x560")
+        win=dlg_win(self,"📥 Імпорт меню","560x640")
         f=tk.Frame(win,bg=C['bg']); f.pack(fill='both',expand=True,padx=15,pady=12)
         # Фільтруємо __cat_placeholder_* рядки (заголовки категорій) — не імпортуємо їх як позиції
         real_rows=[r for r in data_rows if not str(r[0]).strip().startswith('__cat_placeholder')]
@@ -29075,15 +29335,27 @@ class SettingsFrame(tk.Frame):
             fg_color=C['accent'],text_color=C['text']).pack(side='left',padx=(0,10))
         ctk.CTkRadioButton(mf,text="Замінити все меню",variable=mode_var,value='replace',
             fg_color=C['red'],text_color=C['text']).pack(side='left')
+        use_qty_var=ctk.BooleanVar(value=True)
+        if _is_report:
+            ctk.CTkCheckBox(f,text="Кількість: «Факт», якщо порожньо — «Залишок» («—» = не змінювати)",
+                variable=use_qty_var,fg_color=C['accent'],text_color=C['text'],
+                font=('Segoe UI',11)).pack(anchor='w',pady=(4,2))
         def do_import():
             from app.utils.db import get_conn as _gc_imp
             imported=updated=skipped=0
             mode=mode_var.get()
+            _prev_qty={}
             if mode=='replace':
                 if not messagebox.askyesno("Підтвердження","ЗАМІНИТИ ВСЕ МЕНЮ?\nВсі поточні позиції будуть видалені!"): return
                 try:
                     with _gc_imp() as _c:
                         with _c.cursor() as _cur:
+                            # запам'ятовуємо кількості, щоб вони не обнулились (0 = «без обліку», 999)
+                            try:
+                                _cur.execute("SELECT LOWER(TRIM(name)), COALESCE(quantity,0) FROM services")
+                                _prev_qty={str(a):float(b) for a,b in _cur.fetchall() if b}
+                            except Exception:
+                                _c.rollback()
                             _cur.execute("DELETE FROM restaurant_order_items WHERE service_id IN (SELECT id FROM services)")
                             _cur.execute("DELETE FROM service_orders")
                             _cur.execute("DELETE FROM services")
@@ -29123,6 +29395,9 @@ class SettingsFrame(tk.Frame):
                                 _qraw=str(r[5]).replace(',','.').strip() if len(r)>5 else ''
                                 qty_val=float(_qraw) if _qraw and _qraw not in ('✓','✗','') else None
                             except Exception: qty_val=None
+                            if _is_report and not use_qty_var.get(): qty_val=None
+                            if mode=='replace' and qty_val is None and _prev_qty.get(name.strip().lower()):
+                                qty_val=_prev_qty[name.strip().lower()]
                             # Пошук існуючого запису: спершу за КТ-кодом (якщо він вказаний
                             # у файлі — це надійніший, стабільний ідентифікатор), інакше за назвою
                             if mode in ('upsert','add'):
@@ -29137,6 +29412,13 @@ class SettingsFrame(tk.Frame):
                                     existing_id=_row[0] if _row else None
                             else:
                                 existing_id=None
+                            # У звіті «Залишок» = К-сть мінус продане → щоб після імпорту в списку
+                            # було саме це число, додаємо вже продане до збережуваної кількості
+                            if _is_report and qty_val is not None and existing_id:
+                                _cur.execute("""SELECT COALESCE(SUM(roi.quantity),0) FROM restaurant_order_items roi
+                                    JOIN restaurant_orders ro ON ro.id=roi.order_id
+                                    WHERE roi.service_id=%s AND ro.status NOT IN ('cancelled')""",(existing_id,))
+                                qty_val+=float(_cur.fetchone()[0] or 0)
                             if mode=='upsert':
                                 if existing_id:
                                     if qty_val is not None:
@@ -29173,7 +29455,7 @@ class SettingsFrame(tk.Frame):
                                 imported+=1
                     _c.commit()
             except Exception as e: messagebox.showerror("Помилка імпорту",str(e)); return
-            win.destroy(); self._load_svcs()
+            win.destroy(); (on_done or self._load_svcs)()
             parts=[f"Оновлено: {updated}"] if updated else []
             parts.append(f"Додано: {imported}")
             if skipped: parts.append(f"Пропущено: {skipped}")
