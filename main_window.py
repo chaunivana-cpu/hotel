@@ -1962,6 +1962,7 @@ class TableLayoutDlg(ctk.CTkToplevel):
         self.on_apply = on_apply
         self.title(f"⚙️ Налаштування таблиці")
         self.geometry("580x580")
+        _dlg_remember_size(self, "TableLayoutDlg")
         self.grab_set()
         self.configure(fg_color=C['bg'])
 
@@ -2517,6 +2518,95 @@ def ent(p, ph='', w=200, show=None):
 
 def card(p, **kw):
     return ctk.CTkFrame(p, fg_color=C['card'], corner_radius=12, **kw)
+
+
+def _df_parse(txt):
+    """ДД.ММ.РРРР або РРРР-ММ-ДД (і ще кілька варіантів) → date; інакше None."""
+    import datetime as _d
+    t = (txt or '').strip()
+    for f in ('%d.%m.%Y', '%Y-%m-%d', '%d.%m.%y', '%d-%m-%Y', '%d/%m/%Y'):
+        try: return _d.datetime.strptime(t, f).date()
+        except ValueError: continue
+    return None
+
+
+class DateField(tk.Frame):
+    """Поле дати з випадаючим календарем (клік по полю або по кнопці 📅).
+    Показує ДД.ММ.РРРР, а get() повертає РРРР-ММ-ДД — тож наявний код, що робить
+    date.fromisoformat(поле.get()), працює без змін. Підтримує get/insert/delete/bind,
+    як звичайне поле; обробники <FocusOut>/<KeyRelease> викликаються і після вибору в календарі."""
+    def __init__(self, parent, width=120, on_change=None):
+        try: _bg = parent.cget('bg')
+        except Exception: _bg = C['card']
+        super().__init__(parent, bg=_bg)
+        self._cbs = []
+        self._on_change = on_change
+        self.entry = ent(self, w=width); self.entry.pack(side='left')
+        ctk.CTkButton(self, text="📅", width=34, height=28, fg_color=C['card2'],
+                      hover_color=C['accent'], command=self._open).pack(side='left', padx=(3, 0))
+        self.entry.bind('<Button-1>', lambda e: self.after(10, self._open), add='+')
+        self.entry.bind('<FocusOut>', lambda e: self._normalize(), add='+')
+
+    # ── сумісність зі звичайним полем ──
+    def get(self):
+        d = _df_parse(self.entry.get())
+        return d.isoformat() if d else self.entry.get().strip()
+
+    def delete(self, a=0, b='end'):
+        self.entry.delete(0, 'end')
+
+    def insert(self, idx, text):
+        d = _df_parse(str(text))
+        self.entry.insert(0, d.strftime('%d.%m.%Y') if d else str(text))
+
+    def bind(self, seq=None, func=None, add=None):
+        if seq in ('<FocusOut>', '<KeyRelease>') and func is not None:
+            self._cbs.append(func)
+        return self.entry.bind(seq, func, add='+')
+
+    def focus_set(self):
+        self.entry.focus_set()
+
+    def date_value(self):
+        return _df_parse(self.entry.get())
+
+    def set_date(self, d):
+        self.entry.delete(0, 'end'); self.entry.insert(0, d.strftime('%d.%m.%Y'))
+
+    def _normalize(self):
+        d = _df_parse(self.entry.get())
+        if d:
+            self.set_date(d)
+
+    def _fire(self):
+        if self._on_change:
+            try: self._on_change()
+            except Exception: pass
+        for f in list(self._cbs):
+            try: f(None)
+            except Exception: pass
+
+    def _open(self):
+        try:
+            _pick_date_popup(self, self.date_value() or __import__('datetime').date.today(), self._picked)
+        except Exception as _e:
+            log_error("DateField._open", _e)
+
+    def _picked(self, d):
+        self.set_date(d)
+        self._fire()
+
+
+def _link_date_range(f_in, f_out):
+    """Якщо дата виїзду не пізніша за заїзд — автоматично ставить виїзд = заїзд + 1 день."""
+    import datetime as _d
+    def _chk():
+        di, do = f_in.date_value(), f_out.date_value()
+        if di and (not do or do <= di):
+            f_out.set_date(di + _d.timedelta(days=1))
+    f_in._on_change = _chk
+    f_in.bind('<FocusOut>', lambda e=None: _chk())
+
 
 
 def run_with_hourglass(win, btn_widget, status_lbl, work_fn, on_success,
@@ -5100,6 +5190,7 @@ def print_text(title, lines, qr_url=None, on_close=None, auto_print=False):
     except Exception:
         win.geometry('540x640')
     win.resizable(True, True)
+    _dlg_remember_size(win, _dlg_geom_key(title))
     if _root:
         win.transient(_root)   # прив'язати до головного вікна
     win.lift(); win.focus_force()
@@ -5671,6 +5762,46 @@ def _add_exit_bar(win, command=None):
         pass
 
 
+def _dlg_geom_key(title):
+    """Стабільний ключ для збереження розміру вікна.
+    У заголовках діалогів бувають змінні частини — номер, дата, #id («Номер №Баня №4 — 01.10.2026»,
+    «Бронювання #57»). Якщо брати заголовок як є, для кожного номера/дня виходить НОВИЙ ключ і
+    збережений розмір ніколи не знаходиться. Тому змінні частини прибираємо:
+    «Номер №Баня №4 — 01.10.2026» → «Номер»,  «🔥 Баня 5» → «🔥 Баня»."""
+    import re as _re_k
+    t = str(title or '').strip()
+    try:
+        t = _re_k.sub(r'\d{1,4}[./-]\d{1,2}[./-]\d{1,4}', '', t)        # дати
+        t = _re_k.sub(r'\d{1,2}:\d{2}(?::\d{2})?', '', t)                # час
+        t = _re_k.sub(r'№[^—–|:,()\[\]]*', '', t)                         # «№Баня №4», «№12 золотий»
+        t = _re_k.sub(r'#\s*\d+', '', t)                                   # «#57»
+        t = _re_k.sub(r'(?<![\w])\d+(?![\w])', '', t)                     # окремі числа («Баня 5»)
+        t = _re_k.sub(r'\s{2,}', ' ', t).strip(' \t—–-|:,')
+    except Exception:
+        return str(title or '').strip()
+    return t or str(title or '').strip()
+
+
+def _dlg_remember_size(win, key):
+    """Для вікон, що створюються НЕ через dlg_win: підставляє збережений розмір
+    (якщо він є, із запасом під екран) і запам'ятовує нові зміни розміру під ключем `key`.
+    Викликати ПІСЛЯ того, як вікну задано початкову geometry."""
+    try:
+        saved = _DLG_GEOM_CACHE.get(key)
+        if saved and 'x' in saved:
+            ww, wh = (int(v) for v in saved.split('x'))
+            ww = min(ww, win.winfo_screenwidth() - 40)
+            wh = min(wh, win.winfo_screenheight() - 80)
+            if ww > 100 and wh > 100:
+                win.geometry(f"{ww}x{wh}")
+        # зберігаємо тільки зміни розміру самого вікна (не дочірніх віджетів)
+        win.bind('<Configure>',
+                 lambda e, _w=win, _k=key: _dlg_save_geom(_w, _k) if e.widget is _w else None,
+                 add='+')
+    except Exception:
+        pass
+
+
 def dlg_win(parent, title, size="500x400", modal=True):
     w = ctk.CTkToplevel(parent)
     w.title(title)
@@ -5685,7 +5816,7 @@ def dlg_win(parent, title, size="500x400", modal=True):
                   fg_color=C['card2'], hover_color=C['red'], height=34, width=140
                   ).pack(pady=(4,8))
     # Ключ кешу — очищений заголовок (без емодзі та спецсимволів для надійності)
-    _cache_key = title.strip()
+    _cache_key = _dlg_geom_key(title)
     try:
         # Якщо є збережений розмір — використовуємо його
         saved = _DLG_GEOM_CACHE.get(_cache_key)
@@ -9049,7 +9180,47 @@ class DashboardFrame(tk.Frame):
             # ── Прострочені виїзди та виїзди сьогодні ──────────────────────
             overdue_bookings = []
             def _calc_days_late(rows):
+                import re as _re_ov
+                import datetime as _dt_ov
+                try:
+                    _now_ov = _dt_ov.datetime.now(_kyiv_tz()).replace(tzinfo=None)
+                except Exception:
+                    _now_ov = _dt_ov.datetime.now()
+                _kept = []
                 for _row in rows:
+                    # ── Погодинні бані: прострочка в ГОДИНАХ/ХВИЛИНАХ, а не в днях ──
+                    # Реальний час початку й тривалість — у нотатці «Баня: X год (ГГ:ХХ–ГГ:ХХ)»,
+                    # дата check_out для бань неточна (зсунута на наступний день).
+                    try:
+                        _m_h = _re_ov.search(r'Баня:\s*([\d.,]+)\s*год\s*\((\d{2}:\d{2})(?:\s*[–-]\s*(\d{2}:\d{2}))?',
+                                             str(_row.get('notes') or ''))
+                        if _m_h:
+                            _ci_h = _row.get('check_in')
+                            if isinstance(_ci_h, str):
+                                _ci_h = _dt_ov.date.fromisoformat(_ci_h[:10])
+                            elif hasattr(_ci_h, 'date') and not isinstance(_ci_h, _dt_ov.date):
+                                _ci_h = _ci_h.date()
+                            _start_h = _dt_ov.datetime.combine(
+                                _ci_h, _dt_ov.datetime.strptime(_m_h.group(2), '%H:%M').time())
+                            _end_h = _start_h + _dt_ov.timedelta(hours=float(_m_h.group(1).replace(',', '.')))
+                            if _m_h.group(3):       # точний час кінця з нотатки (години можуть бути округлені)
+                                _t3 = _dt_ov.datetime.strptime(_m_h.group(3), '%H:%M').time()
+                                _cand = _dt_ov.datetime.combine(_end_h.date(), _t3)
+                                if _cand - _end_h > _dt_ov.timedelta(hours=12): _cand -= _dt_ov.timedelta(days=1)
+                                elif _end_h - _cand > _dt_ov.timedelta(hours=12): _cand += _dt_ov.timedelta(days=1)
+                                _end_h = _cand
+                            _late_min = int((_now_ov - _end_h).total_seconds() // 60)
+                            if _late_min <= 0:
+                                continue            # час ще не вийшов — не прострочено
+                            _hh, _mm = divmod(_late_min, 60)
+                            _row['days_late'] = 1   # >0 → «прострочено» (червоний бейдж)
+                            _row['late_short'] = f"+{_hh}г" if _hh else f"+{_mm}хв"
+                            _row['late_long']  = (f"+{_hh} г {_mm} хв" if _hh and _mm
+                                                  else (f"+{_hh} г" if _hh else f"+{_mm} хв"))
+                            _kept.append(_row); continue
+                    except Exception:
+                        pass
+                    _kept.append(_row)
                     try:
                         _co = _row.get('check_out')
                         if _co is None: _row['days_late'] = 0; continue
@@ -9060,7 +9231,7 @@ class DashboardFrame(tk.Frame):
                         _row['days_late'] = (today - _co).days
                     except Exception:
                         _row['days_late'] = 0
-                return rows
+                return _kept
             try:
                 if _shared_conn is None:
                     raise RuntimeError("Немає з'єднання з БД")
@@ -9068,12 +9239,12 @@ class DashboardFrame(tk.Frame):
                     with _shared_conn.cursor() as _ovcur:
                         _ovcur.execute("""
                             SELECT b.id, r.number as room_number,
-                                   COALESCE(g.name, '') as guest_name, b.check_in, b.check_out
+                                   COALESCE(g.name, '') as guest_name, b.check_in, b.check_out, b.notes
                             FROM bookings b
                             JOIN rooms r ON r.id = b.room_id
                             LEFT JOIN guests g ON g.id = b.guest_id
                             WHERE b.status = 'checkedin'
-                              AND b.check_out <= %s
+                              AND (b.check_out <= %s OR b.notes ILIKE '%%баня:%%')
                             ORDER BY b.check_out ASC
                         """, (today,))
                         _cols_ov = [d[0] for d in _ovcur.description]
@@ -9351,10 +9522,10 @@ class DashboardFrame(tk.Frame):
                 cell = tk.Frame(self._rf, bg=color)
                 cell.grid(row=row_i, column=col_i, padx=3, pady=3, sticky='nsew')
                 num_l = tk.Label(cell, text=f"№{r['number']}", bg=color, fg='white',
-                         font=('Segoe UI',10,'bold'), padx=6, pady=6)
+                         font=('Segoe UI',12,'bold'), padx=6, pady=6)
                 num_l.pack()
                 st_l  = tk.Label(cell, text=STATUS_UA.get(r['status'],''), bg=color, fg='white',
-                         font=('Segoe UI',8), padx=4, pady=2)
+                         font=('Segoe UI',10,'bold'), padx=4, pady=3)
                 st_l.pack()
                 self._tile_refs[rid] = (cell, num_l, st_l)
                 self._tile_order.append(rid)
@@ -9366,10 +9537,12 @@ class DashboardFrame(tk.Frame):
                 if _ov_info and not _room_is_free:
                     _dl = _ov_info.get('days_late', 0)
                     _badge_bg = '#cc0000' if _dl > 0 else '#cc8800'
-                    _badge_txt = f"!+{_dl}д" if _dl > 0 else "!сьогодні"
+                    _badge_txt = (f"!{_ov_info['late_short']}" if _ov_info.get('late_short')
+                                  else (f"!+{_dl}д" if _dl > 0 else "!сьогодні"))
                     _badge = tk.Label(cell, text=_badge_txt, bg=_badge_bg, fg='white',
-                                      font=('Segoe UI', 7, 'bold'), padx=2)
-                    _badge.place(relx=1.0, rely=0.0, anchor='ne', x=-1, y=1)
+                                      font=('Segoe UI', 10, 'bold'), padx=5, pady=1)
+                    _badge._is_overdue_badge = True   # щоб оновлення могло його прибрати
+                    _badge.place(relx=1.0, rely=0.0, anchor='ne', x=0, y=0)
 
             def _on_rf_configure(e):
                 self._grid_canvas.configure(scrollregion=self._grid_canvas.bbox('all'))
@@ -9400,7 +9573,7 @@ class DashboardFrame(tk.Frame):
                         cell_, num_, st_ = ref
                         cell_.grid(row=idx // cols, column=idx % cols, padx=3, pady=3, sticky='nsew')
                         # місце під бейдж «!+4д» праворуч зверху — тому віднімаємо запас
-                        num_.configure(wraplength=max(40, tile_w - 34), justify='center')
+                        num_.configure(wraplength=max(40, tile_w - 48), justify='center')
                 except Exception as _e_rl:
                     log_error("Dashboard._relayout_tiles", _e_rl)
             self._relayout_tiles = _relayout_tiles
@@ -9450,7 +9623,8 @@ class DashboardFrame(tk.Frame):
                     for b in overdue[:12]:
                         d  = b.get('days_late', 0)
                         bc = '#cc0000' if d > 0 else '#cc8800'
-                        bt = f"+{d} дн." if d > 0 else "виїзд"
+                        bt = (b['late_long'] if b.get('late_long')
+                              else (f"+{d} дн." if d > 0 else "виїзд"))
                         nm = (b.get('guest_name') or '—').split()[0]
                         ch = tk.Frame(cf, bg=bc, padx=4, pady=2)
                         ch.pack(side='left', padx=2, pady=1)
@@ -9511,11 +9685,12 @@ class DashboardFrame(tk.Frame):
                         if _ov2 and not _room_is_free2:
                             _dl2 = _ov2.get('days_late', 0)
                             _bb2 = '#cc0000' if _dl2 > 0 else '#cc8800'
-                            _bt2 = f"!+{_dl2}д" if _dl2 > 0 else "!сьогодні"
+                            _bt2 = (f"!{_ov2['late_short']}" if _ov2.get('late_short')
+                                    else (f"!+{_dl2}д" if _dl2 > 0 else "!сьогодні"))
                             _b2  = tk.Label(cell, text=_bt2, bg=_bb2, fg='white',
-                                            font=('Segoe UI', 7, 'bold'), padx=2)
+                                            font=('Segoe UI', 10, 'bold'), padx=5, pady=1)
                             _b2._is_overdue_badge = True
-                            _b2.place(relx=1.0, rely=0.0, anchor='ne', x=-1, y=1)
+                            _b2.place(relx=1.0, rely=0.0, anchor='ne', x=0, y=0)
                     except Exception: pass
             # Оновлюємо overlay
             if hasattr(self, '_overdue_tile_overlay'):
@@ -9552,7 +9727,8 @@ class DashboardFrame(tk.Frame):
                     for b in overdue[:12]:
                         d  = b.get('days_late', 0)
                         bc = '#cc0000' if d > 0 else '#cc8800'
-                        bt = f"+{d} дн." if d > 0 else "виїзд"
+                        bt = (b['late_long'] if b.get('late_long')
+                              else (f"+{d} дн." if d > 0 else "виїзд"))
                         nm = (b.get('guest_name') or '—').split()[0]
                         ch = tk.Frame(cf, bg=bc, padx=4, pady=2)
                         ch.pack(side='left', padx=2, pady=1)
@@ -12553,10 +12729,11 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
     lbl(d_card, "📅  Дати проживання", 13, True).pack(anchor='w', padx=12, pady=(10,5))
     df = tk.Frame(d_card, bg=C['card']); df.pack(fill='x', padx=12, pady=(0,10))
     lbl(df,"Заїзд:",11,color=C['text2']).grid(row=0,column=0,sticky='w',pady=3)
-    e_in = ent(df, w=150); e_in.insert(0, str(click_date)); e_in.grid(row=0,column=1,padx=8,pady=3)
+    e_in = DateField(df, width=120); e_in.insert(0, str(click_date)); e_in.grid(row=0,column=1,padx=8,pady=3,sticky='w')
     lbl(df,"Виїзд:",11,color=C['text2']).grid(row=1,column=0,sticky='w',pady=3)
     checkout_default = click_date + timedelta(days=1)
-    e_out = ent(df, w=150); e_out.insert(0, str(checkout_default)); e_out.grid(row=1,column=1,padx=8,pady=3)
+    e_out = DateField(df, width=120); e_out.insert(0, str(checkout_default)); e_out.grid(row=1,column=1,padx=8,pady=3,sticky='w')
+    _link_date_range(e_in, e_out)
     lbl(df,"Дорослих:",11,color=C['text2']).grid(row=2,column=0,sticky='w',pady=3)
     e_adults = ent(df, w=60); e_adults.insert(0,'1'); e_adults.grid(row=2,column=1,padx=8,pady=3,sticky='w')
 
@@ -14021,7 +14198,7 @@ class ChessFrame(tk.Frame):
                 "Все одно створити бронювання?"):
                 return
 
-        win = dlg_win(self, f"Номер №{room['number']} — {click_date.strftime('%d.%m.%Y')}", "380x290")
+        win = dlg_win(self, f"Номер №{room['number']} — {click_date.strftime('%d.%m.%Y')}", "400x400")
         scroll = ctk.CTkScrollableFrame(win, fg_color=C['bg'])
         scroll.pack(fill='both', expand=True, padx=10, pady=10)
         f = card(scroll); f.pack(fill='x', pady=5)
@@ -15554,6 +15731,7 @@ class BookingDlg(ctk.CTkToplevel):
         self.lift(); self.focus_force()
         self.update_idletasks()
         _center_window(self, 640, 680, parent)
+        _dlg_remember_size(self, "BookingDlg")
         # (grab вимкнено — Windows сумісність)
         _add_exit_bar(self)
         self._build()
@@ -15593,16 +15771,21 @@ class BookingDlg(ctk.CTkToplevel):
                           command=self._fill_price).pack(side='left')
 
         for lt,key,ph,val in [
-            ("Заїзд *",'cin',"РРРР-ММ-ДД",str(date.today())),
+            ("Заїзд *",'cin',"ДД.ММ.РРРР",str(date.today())),
             ("Час заїзду",'cin_time',"ГГ:ХХ","14:00"),
-            ("Виїзд *",'cout',"РРРР-ММ-ДД",str(date.today()+timedelta(days=1))),
+            ("Виїзд *",'cout',"ДД.ММ.РРРР",str(date.today()+timedelta(days=1))),
             ("Час виїзду",'cout_time',"ГГ:ХХ","12:00"),
             ("Ціна/ніч *",'price',"₴",""),
             ("Дорослих",'adults',"","1"),("Дітей",'kids',"","0"),
         ]:
             f=row_frm(b2)
             ctk.CTkLabel(f,text=lt,font=('Segoe UI',11),text_color=C['text2'],width=120,anchor='w').pack(side='left')
-            e=ent(f,ph,w=200); e.insert(0,val); e.pack(side='left'); self.fields[key]=e
+            if key in ('cin','cout'):
+                e=DateField(f,width=140)          # випадаючий календар
+            else:
+                e=ent(f,ph,w=200)
+            e.insert(0,val); e.pack(side='left'); self.fields[key]=e
+        _link_date_range(self.fields['cin'], self.fields['cout'])
 
         f=row_frm(b2)
         ctk.CTkLabel(f,text="🏷 Знижка",font=('Segoe UI',11),text_color=C['text2'],width=120,anchor='w').pack(side='left')
@@ -16746,15 +16929,17 @@ class BookingDetailDlg(ctk.CTkToplevel):
                     _co_time_def = _end_dt_sauna_edit.strftime('%H:%M')
             except Exception:
                 pass
-        lbl(df,"Заїзд (РРРР-ММ-ДД):",11,color=C['text2']).grid(row=0,column=0,sticky='w',pady=3)
-        e_ci = ent(df, w=150); e_ci.grid(row=0,column=1,padx=8,pady=3,sticky='w')
+        lbl(df,"Заїзд:",11,color=C['text2']).grid(row=0,column=0,sticky='w',pady=3)
+        e_ci = DateField(df, width=120); e_ci.grid(row=0,column=1,padx=8,pady=3,sticky='w')
         e_ci.insert(0, _ci_date_def)
         lbl(df,"Час заїзду (ГГ:ХХ):",11,color=C['text2']).grid(row=0,column=2,sticky='w',pady=3,padx=(14,0))
         e_ci_time = ent(df, w=90); e_ci_time.grid(row=0,column=3,padx=8,pady=3,sticky='w')
         e_ci_time.insert(0, _ci_time_def)
-        lbl(df,"Виїзд (РРРР-ММ-ДД):",11,color=C['text2']).grid(row=1,column=0,sticky='w',pady=3)
-        e_co = ent(df, w=150); e_co.grid(row=1,column=1,padx=8,pady=3,sticky='w')
+        lbl(df,"Виїзд:",11,color=C['text2']).grid(row=1,column=0,sticky='w',pady=3)
+        e_co = DateField(df, width=120); e_co.grid(row=1,column=1,padx=8,pady=3,sticky='w')
         e_co.insert(0, _co_date_def)
+        if not _is_hourly_edit:
+            _link_date_range(e_ci, e_co)
         lbl(df,"Час виїзду (ГГ:ХХ):",11,color=C['text2']).grid(row=1,column=2,sticky='w',pady=3,padx=(14,0))
         e_co_time = ent(df, w=90); e_co_time.grid(row=1,column=3,padx=8,pady=3,sticky='w')
         e_co_time.insert(0, _co_time_def)
@@ -17224,6 +17409,7 @@ class PaymentDlg(ctk.CTkToplevel):
         self.attributes('-topmost', True)
         self.update_idletasks()
         _center_window(self, 440, 520, parent)
+        _dlg_remember_size(self, "PaymentDlg")
         self.lift(); self.focus_force()
         self.after(300, lambda: self._safe_remove_topmost())
         _add_exit_bar(self)
@@ -21538,6 +21724,115 @@ class GazeboFrame(_BookableObjectFrame):
     OBJ_ICON     = "⛺"
 
 
+def _sauna_parse_date(txt):
+    """ДД.ММ.РРРР (або ДД.ММ.РР, РРРР-ММ-ДД) → date."""
+    import datetime as _d
+    t = (txt or '').strip()
+    for f in ('%d.%m.%Y', '%d.%m.%y', '%Y-%m-%d', '%d-%m-%Y', '%d/%m/%Y'):
+        try: return _d.datetime.strptime(t, f).date()
+        except ValueError: continue
+    raise ValueError("дата")
+
+def _sauna_parse_time(txt):
+    """ГГ:ХХ (або ГГ, ГГ.ХХ) → time."""
+    import datetime as _d
+    t = (txt or '').strip().replace('.', ':').replace(',', ':')
+    if not t: raise ValueError("час")
+    if ':' not in t: t += ':00'
+    hh, mm = t.split(':')[:2]
+    return _d.time(int(hh), int(mm))
+
+
+class _SaunaTimeFields:
+    """Два рядки в діалозі бані: «Заселення» і «Виселення» — дата та час, що редагуються.
+    Зв'язок із кількістю годин двосторонній:
+      • змінили заселення або години → виселення перераховується;
+      • змінили виселення → кількість годин (і сума) перераховується."""
+    def __init__(self, tf, row_start, row_end, start_dt, get_hours, set_hours, on_change=None):
+        import datetime as _d
+        self._d = _d
+        self._busy = False
+        self._get_hours, self._set_hours, self._on_change = get_hours, set_hours, on_change
+
+        lbl(tf, "Заселення:", 11, color=C['text2']).grid(row=row_start, column=0, sticky='w', pady=4)
+        fs = tk.Frame(tf, bg=C['card']); fs.grid(row=row_start, column=1, sticky='w', padx=10, pady=4)
+        self.s_date = ent(fs, "", w=105); self.s_date.pack(side='left')
+        self.s_time = ent(fs, "", w=65);  self.s_time.pack(side='left', padx=(6, 0))
+        ctk.CTkButton(fs, text="Зараз", width=54, height=28, fg_color=C['card2'],
+                      command=self._set_now).pack(side='left', padx=(6, 0))
+
+        lbl(tf, "Виселення:", 11, color=C['text2']).grid(row=row_end, column=0, sticky='w', pady=4)
+        fe = tk.Frame(tf, bg=C['card']); fe.grid(row=row_end, column=1, sticky='w', padx=10, pady=4)
+        self.e_date = ent(fe, "", w=105); self.e_date.pack(side='left')
+        self.e_time = ent(fe, "", w=65);  self.e_time.pack(side='left', padx=(6, 0))
+        lbl(fe, "ДД.ММ.РРРР  ГГ:ХХ", 9, color=C['text2']).pack(side='left', padx=(8, 0))
+
+        self._fill(self.s_date, self.s_time, start_dt)
+        try: h = float(get_hours() or 0)
+        except Exception: h = 0
+        self._fill(self.e_date, self.e_time, start_dt + _d.timedelta(hours=h))
+
+        for w in (self.s_date, self.s_time):
+            w.bind('<KeyRelease>', self._start_typed)
+            w.bind('<FocusOut>', self._start_changed)
+            w.bind('<Return>', self._start_changed)
+        for w in (self.e_date, self.e_time):
+            w.bind('<FocusOut>', self._end_changed)
+            w.bind('<Return>', self._end_changed)
+
+    def _fill(self, e_d, e_t, dt):
+        e_d.delete(0, 'end'); e_d.insert(0, dt.strftime('%d.%m.%Y'))
+        e_t.delete(0, 'end'); e_t.insert(0, dt.strftime('%H:%M'))
+
+    def start(self):
+        return self._d.datetime.combine(_sauna_parse_date(self.s_date.get()), _sauna_parse_time(self.s_time.get()))
+
+    def end(self):
+        return self._d.datetime.combine(_sauna_parse_date(self.e_date.get()), _sauna_parse_time(self.e_time.get()))
+
+    def refresh_end(self):
+        """Перераховує «Виселення» = заселення + години (викликається при зміні годин)."""
+        if self._busy: return
+        try:
+            st = self.start(); h = float(self._get_hours() or 0)
+        except Exception:
+            return
+        if h > 0:
+            self._fill(self.e_date, self.e_time, st + self._d.timedelta(hours=h))
+
+    def _set_now(self):
+        n = self._d.datetime.now().replace(second=0, microsecond=0)
+        self._fill(self.s_date, self.s_time, n)
+        self._start_changed()
+
+    def _start_typed(self, e=None):
+        # під час друку реагуємо лише на повну дату (щоб «01.10.2» не рахувалось як 2002 рік)
+        if len(self.s_date.get().strip()) >= 8 and len(self.s_time.get().strip()) >= 4:
+            self._start_changed()
+
+    def _start_changed(self, e=None):
+        self.refresh_end()
+        if self._on_change:
+            try: self._on_change()
+            except Exception: pass
+
+    def _end_changed(self, e=None):
+        try:
+            st, en = self.start(), self.end()
+        except Exception:
+            return
+        mins = (en - st).total_seconds() / 60
+        if mins <= 0:
+            messagebox.showerror("", "Час виселення має бути пізніше за час заселення")
+            self.refresh_end(); return
+        self._busy = True          # щоб перерахунок годин не переписав введений час виселення
+        try:
+            self._set_hours(round(mins / 60, 2))
+            if self._on_change: self._on_change()
+        finally:
+            self._busy = False
+
+
 def _open_sauna_checkin_dlg(parent, room, on_save=None, booking=None):
     """Вікно заселення БАНІ: оплата за годину, вибір кількості годин."""
     from app.utils.db import query
@@ -21638,8 +21933,18 @@ def _open_sauna_checkin_dlg(parent, room, on_save=None, booking=None):
                     _book_hours = max(1, round(_diff_h))
         except Exception as _be:
             print(f"[sauna_checkin] booking time parse error: {_be}")
-    lbl(tf,"Початок:",11,color=C['text2']).grid(row=0,column=0,sticky='w',pady=4)
-    lbl(tf, now_dt.strftime('%d.%m.%Y  %H:%M'), 12, True, C['accent']).grid(row=0,column=1,padx=10,sticky='w')
+        # У БД лежить лише дата — точний час початку й тривалість беремо з нотатки
+        try:
+            import re as _re_bk
+            _mn = _re_bk.search(r'Баня:\s*([\d.,]+)\s*год\s*\((\d{2}:\d{2})', str(booking.get('notes') or ''))
+            _cid = booking.get('check_in')
+            if _mn and _cid:
+                if isinstance(_cid, str): _cid = _dt.date.fromisoformat(_cid[:10])
+                elif hasattr(_cid, 'date') and not isinstance(_cid, _dt.date): _cid = _cid.date()
+                now_dt = _dt.datetime.combine(_cid, _dt.datetime.strptime(_mn.group(2), '%H:%M').time())
+                _book_hours = float(_mn.group(1).replace(',', '.'))
+        except Exception as _bn:
+            print(f"[sauna_checkin] booking note parse error: {_bn}")
 
     lbl(tf,"Кількість годин:",11,color=C['text2']).grid(row=1,column=0,sticky='w',pady=4)
     quick_frame = tk.Frame(tf, bg=C['card']); quick_frame.grid(row=1,column=1,sticky='w',pady=4,padx=10)
@@ -21650,8 +21955,15 @@ def _open_sauna_checkin_dlg(parent, room, on_save=None, booking=None):
     e_hours = ent(manual_frame, str(_book_hours), w=80); e_hours.pack(side='left', padx=(0,4))
     lbl(manual_frame,"год",11,color=C['text2']).pack(side='left')
 
-    lbl(tf,"Кінець:",11,color=C['text2']).grid(row=3,column=0,sticky='w',pady=4)
-    end_lbl = lbl(tf,"",12,True,C['yellow']); end_lbl.grid(row=3,column=1,padx=10,sticky='w')
+    quick_btns = []
+    def _set_hours_ci(v):
+        e_hours.delete(0,'end'); e_hours.insert(0, f"{v:g}")
+        for b__ in quick_btns:
+            b__.configure(fg_color=C['accent'] if abs(b__._val - v) < 1e-9 else C['card2'])
+    # Заселення / Виселення — дата й час, що редагуються (рядки 0 і 3)
+    _tfx = _SaunaTimeFields(tf, 0, 3, now_dt.replace(second=0, microsecond=0),
+                            lambda: e_hours.get(), _set_hours_ci,
+                            on_change=lambda: _update_total())
 
     # Оплата
     p_card = card(sc); p_card.pack(fill='x', padx=12, pady=5)
@@ -21713,11 +22025,10 @@ def _open_sauna_checkin_dlg(parent, room, on_save=None, booking=None):
         except: _dep_now = 0.0
         _razom = _topay + _dep_now
         lbl_total_today.configure(text=f"{_razom:.0f}₴  (доплата {_topay:.0f}₴ + залог {_dep_now:.0f}₴)")
-        end_time = now_dt + _dt.timedelta(hours=h)
-        end_lbl.configure(text=end_time.strftime('%d.%m.%Y  %H:%M'))
+        try: _tfx.refresh_end()
+        except NameError: pass
 
     # Кнопки швидкого вибору годин
-    quick_btns = []
     for h in [1,2,3,4,5,6,8,10,12]:
         def _set_h(v=h):
             e_hours.delete(0,'end'); e_hours.insert(0,str(v))
@@ -21819,6 +22130,14 @@ def _open_sauna_checkin_dlg(parent, room, on_save=None, booking=None):
             h = float(e_hours.get() or 0)
             if h <= 0: raise ValueError
         except: messagebox.showerror("","Введіть кількість годин"); return
+        try:
+            ci_dt = _tfx.start(); co_dt = _tfx.end()
+            if co_dt <= ci_dt: raise ValueError("виселення раніше заселення")
+        except Exception:
+            messagebox.showerror("","Невірна дата або час заселення/виселення.\nФормат: ДД.ММ.РРРР та ГГ:ХХ"); return
+        _h_fields = (co_dt - ci_dt).total_seconds() / 3600
+        if abs(_h_fields - h) > 0.02:       # час виселення змінили, а години ще не перерахувались
+            h = round(_h_fields, 2)
         price_per_hour = default_price
         if price_per_hour <= 0:
             messagebox.showerror("","Ціна не вказана для цієї категорії. Перевірте Налаштування → Категорії."); return
@@ -21833,8 +22152,6 @@ def _open_sauna_checkin_dlg(parent, room, on_save=None, booking=None):
         try: dep = float(e_dep.get() or 0)
         except: dep = 0.0
 
-        ci_dt = now_dt
-        co_dt = now_dt + _dt.timedelta(hours=h)
         ci_date = ci_dt.date()
         co_date = co_dt.date() if co_dt.date() > ci_dt.date() else ci_dt.date() + _dt.timedelta(days=1)
 
@@ -21848,7 +22165,7 @@ def _open_sauna_checkin_dlg(parent, room, on_save=None, booking=None):
             g = query("SELECT id FROM guests WHERE phone=%s", (phone,), fetch='one')
             gid = g['id']
 
-        note_text = f"Баня: {h:.1f} год ({ci_dt.strftime('%H:%M')}–{co_dt.strftime('%H:%M')})"
+        note_text = f"Баня: {h:.2f} год ({ci_dt.strftime('%H:%M')}–{co_dt.strftime('%H:%M')})"
         if discount_h > 0:
             note_text = f"Знижка: {discount_h:.0f}₴ ({discount_comment_h})  " + note_text
         extra = e_note.get().strip()
@@ -22045,11 +22362,6 @@ def _open_sauna_booking_dlg(parent, room, on_save=None):
     tf = tk.Frame(t_card, bg=C['card']); tf.pack(fill='x', padx=12, pady=(0,10))
 
     now = _dt.datetime.now()
-    lbl(tf,"Дата:",11,color=C['text2']).grid(row=0,column=0,sticky='w',pady=4)
-    e_date = ent(tf,w=130); e_date.insert(0, now.strftime('%Y-%m-%d')); e_date.grid(row=0,column=1,padx=10,sticky='w')
-
-    lbl(tf,"Початок (год:хв):",11,color=C['text2']).grid(row=1,column=0,sticky='w',pady=4)
-    e_time = ent(tf,w=80); e_time.insert(0, now.strftime('%H:00')); e_time.grid(row=1,column=1,padx=10,sticky='w')
 
     lbl(tf,"Годин:",11,color=C['text2']).grid(row=2,column=0,sticky='w',pady=4)
     hf2 = tk.Frame(tf, bg=C['card']); hf2.grid(row=2,column=1,sticky='w',pady=4,padx=10)
@@ -22066,8 +22378,14 @@ def _open_sauna_booking_dlg(parent, room, on_save=None):
                             fg_color=C['accent'] if hv==2 else C['card2'],command=_sh)
         b_.pack(side='left',padx=2); b_._val=hv; quick_btns2.append(b_)
 
-    lbl(tf,"Кінець:",11,color=C['text2']).grid(row=3,column=0,sticky='w',pady=4)
-    end_lbl2 = lbl(tf,"",12,True,C['yellow']); end_lbl2.grid(row=3,column=1,padx=10,sticky='w')
+    def _set_hours_bk(v):
+        e_hours2.delete(0,'end'); e_hours2.insert(0, f"{v:g}")
+        for b__ in quick_btns2:
+            b__.configure(fg_color=C['accent'] if abs(getattr(b__,'_val',0) - v) < 1e-9 else C['card2'])
+    # Заселення / Виселення — дата й час, що редагуються (рядки 0 і 3)
+    _tfx2 = _SaunaTimeFields(tf, 0, 3, now.replace(minute=0, second=0, microsecond=0),
+                             lambda: e_hours2.get(), _set_hours_bk,
+                             on_change=lambda: _upd())
 
     # ── Оплата ──────────────────────────────────────────
     p_card = card(sc); p_card.pack(fill='x', padx=12, pady=5)
@@ -22109,16 +22427,12 @@ def _open_sauna_booking_dlg(parent, room, on_save=None):
         try:
             h = float(e_hours2.get() or 0)
             total = default_price * h
-            lbl_total2.configure(text=f"{total:.0f}₴  ({h:.1f}г × {default_price:.0f}₴)")
-            d = _dt.date.fromisoformat(e_date.get().strip())
-            t_str = e_time.get().strip()
-            hh,mm = (int(x) for x in (t_str+':00').split(':')[:2])
-            start = _dt.datetime.combine(d, _dt.time(hh,mm))
-            end = start + _dt.timedelta(hours=h)
-            end_lbl2.configure(text=end.strftime('%d.%m.%Y  %H:%M'))
-        except: lbl_total2.configure(text="?")
-    e_hours2.bind('<KeyRelease>', _upd); e_date.bind('<FocusOut>', _upd)
-    e_time.bind('<FocusOut>', _upd); _upd()
+            lbl_total2.configure(text=f"{total:.0f}₴  ({h:.2f}г × {default_price:.0f}₴)")
+        except Exception:
+            lbl_total2.configure(text="?")
+        try: _tfx2.refresh_end()
+        except NameError: pass
+    e_hours2.bind('<KeyRelease>', _upd); _upd()
 
     def do_book():
         name  = e_name.get().strip()
@@ -22126,15 +22440,14 @@ def _open_sauna_booking_dlg(parent, room, on_save=None):
         if not name:  messagebox.showerror("","Введіть ім'я"); return
         if not phone: messagebox.showerror("","Введіть телефон"); return
         try:
+            start_dt = _tfx2.start(); end_dt = _tfx2.end()
+            if end_dt <= start_dt: raise ValueError("Виселення раніше заселення")
             h = float(e_hours2.get() or 0)
-            if h <= 0: raise ValueError("Години <= 0")
-            d = _dt.date.fromisoformat(e_date.get().strip())
-            t_str = e_time.get().strip()
-            hh,mm = (int(x) for x in (t_str+':00').split(':')[:2])
-            start_dt = _dt.datetime.combine(d, _dt.time(hh,mm))
-            end_dt   = start_dt + _dt.timedelta(hours=h)
+            _h_f = (end_dt - start_dt).total_seconds() / 3600
+            if h <= 0 or abs(_h_f - h) > 0.02:     # години не збігаються з полями дати/часу
+                h = round(_h_f, 2)
         except Exception as _e:
-            messagebox.showerror("","Невірна дата/час/години"); return
+            messagebox.showerror("","Невірна дата/час заселення або виселення.\nФормат: ДД.ММ.РРРР та ГГ:ХХ"); return
 
         total   = default_price * h
         water_amt = 0.0
@@ -22161,7 +22474,7 @@ def _open_sauna_booking_dlg(parent, room, on_save=None):
                         r = _cur.fetchone()
                         gid = r[0] if isinstance(r, (list,tuple)) else r['id']
 
-                    note = f"Баня: {h:.1f} год ({start_dt.strftime('%H:%M')}–{end_dt.strftime('%H:%M')})"
+                    note = f"Баня: {h:.2f} год ({start_dt.strftime('%H:%M')}–{end_dt.strftime('%H:%M')})"
                     if e_note2.get().strip(): note += f". {e_note2.get().strip()}"
 
                     _cur.execute("""INSERT INTO bookings
@@ -22444,8 +22757,16 @@ def _pick_date_popup(anchor, current, on_pick):
     pop.resizable(False, False)
     try:
         pop.transient(anchor.winfo_toplevel())
-        pop.geometry(f"+{anchor.winfo_rootx()}+{anchor.winfo_rooty() + 34}")
+        pop.geometry(f"+{anchor.winfo_rootx()}+{anchor.winfo_rooty() + max(anchor.winfo_height(), 28) + 2}")
         pop.after(50, pop.grab_set)
+        pop.bind('<Escape>', lambda e: pop.destroy())
+        def _outside(e):
+            try:
+                if not (pop.winfo_rootx() <= e.x_root < pop.winfo_rootx() + pop.winfo_width() and
+                        pop.winfo_rooty() <= e.y_root < pop.winfo_rooty() + pop.winfo_height()):
+                    pop.destroy()
+            except Exception: pass
+        pop.bind('<Button-1>', _outside, add='+')
     except Exception:
         pass
     _MONTHS = ['Січень','Лютий','Березень','Квітень','Травень','Червень',
@@ -22488,7 +22809,19 @@ def _pick_date_popup(anchor, current, on_pick):
                               text_color=tc, border_width=1 if is_today else 0,
                               border_color=C['green'],
                               command=lambda dd=d: _choose(dd)).grid(row=r, column=c, padx=1, pady=1)
+        ctk.CTkButton(body, text="Сьогодні", height=26, fg_color=C['card2'], hover_color=C['accent'],
+                      command=lambda: _choose(_dt.date.today())
+                      ).grid(row=8, column=0, columnspan=7, sticky='ew', padx=1, pady=(6, 0))
     _draw()
+    # не виходити за межі екрана
+    try:
+        pop.update_idletasks()
+        _x, _y = pop.winfo_x(), pop.winfo_y()
+        _x = max(0, min(_x, pop.winfo_screenwidth() - pop.winfo_reqwidth() - 10))
+        _y = max(0, min(_y, pop.winfo_screenheight() - pop.winfo_reqheight() - 50))
+        pop.geometry(f"+{_x}+{_y}")
+    except Exception:
+        pass
 
 
 def _open_extend_room_dlg(parent, bid, on_save=None):
