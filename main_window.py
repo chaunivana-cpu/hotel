@@ -1494,6 +1494,17 @@ def _free_stay_map(ids):
         return {}
 
 
+def _dash_clear_overdue_overlays(master):
+    """Знищує всі банери «прострочених виїздів» у контейнері дашборда."""
+    try:
+        for w in list(master.winfo_children()):
+            if getattr(w, '_is_overdue_overlay', False):
+                try: w.destroy()
+                except Exception: pass
+    except Exception:
+        pass
+
+
 def _block_if_room_occupied(room_id, exclude_bid=None):
     """True (і показує попередження), якщо в номері вже є заселений гість,
     якого ще не виселили. Повторно заселити такий номер не можна."""
@@ -9968,8 +9979,12 @@ class DashboardFrame(tk.Frame):
                     # прокрутці сітки плитки заїжджали під нього й губились.
                     # Тепер банер — окремий рядок-сусід ПЕРЕД canvas, займає
                     # своє місце і зсуває сітку вниз, нічого не закриваючи.
+                    # Прибираємо ВСІ раніше створені банери перед створенням нового —
+                    # інакше при швидких повторних оновленнях вони множилися (3 банери).
+                    _dash_clear_overdue_overlays(self._grid_canvas.master)
                     ov = tk.Frame(self._grid_canvas.master, bg=_bg,
                                   highlightbackground=_fg, highlightthickness=2)
+                    ov._is_overdue_overlay = True
                     ov.pack(in_=self._grid_canvas.master, before=self._grid_canvas, fill='x', side='top')
                     self._overdue_tile_overlay = ov
 
@@ -10076,8 +10091,12 @@ class DashboardFrame(tk.Frame):
                     _msg = (f"{_ico} {len(strictly)} прострочених виїздів — Виселити або Продовжити"
                             if strictly else
                             f"⚠️ Виїзд сьогодні: {len(today_co)} номерів — Виселити або Продовжити")
+                    # Прибираємо ВСІ раніше створені банери перед створенням нового —
+                    # інакше при швидких повторних оновленнях вони множилися (3 банери).
+                    _dash_clear_overdue_overlays(self._grid_canvas.master)
                     ov = tk.Frame(self._grid_canvas.master, bg=_bg,
                                   highlightbackground=_fg, highlightthickness=2)
+                    ov._is_overdue_overlay = True
                     ov.pack(in_=self._grid_canvas.master, before=self._grid_canvas, fill='x', side='top')
                     self._overdue_tile_overlay = ov
                     hf = tk.Frame(ov, bg=_bg); hf.pack(fill='x', padx=8, pady=(5, 3))
