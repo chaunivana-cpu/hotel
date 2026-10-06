@@ -14935,10 +14935,33 @@ def _ensure_booking_moves_table():
         log_error("booking_moves_table", _e)
 
 
+def _room_current_price(room_id, fallback=0.0):
+    """Актуальна ціна за ніч для номера: категорія (room_categories.base_price)
+    → rooms.price_per_day → rooms.base_price. Якщо нічого не знайдено — fallback."""
+    from app.utils.db import query as _qrp
+    for _sql in (
+        "SELECT rc.base_price AS p FROM rooms r "
+        "JOIN room_categories rc ON rc.id=r.category_id WHERE r.id=%s",
+        "SELECT price_per_day AS p FROM rooms WHERE id=%s",
+        "SELECT base_price AS p FROM rooms WHERE id=%s",
+    ):
+        try:
+            _r = _qrp(_sql, (room_id,), fetch='one')
+            if _r:
+                _v = float((_r.get('p') if hasattr(_r, 'get') else _r[0]) or 0)
+                if _v > 0:
+                    return _v
+        except Exception:
+            continue
+    return fallback
+
+
 def _open_relocate_dlg(parent, bid, on_done=None, user=None):
-    """Переселення гостя в інший номер (форс-мажор). Оплати, ціна й дати
-    лишаються без змін — змінюється тільки номер. Факт фіксується в журналі
-    booking_moves (звіт «Переселення») і в нотатках бронювання."""
+    """Переселення гостя в інший номер. Дати лишаються без змін. Якщо новий
+    номер дорожчий — гість доплачує різницю в ціні за решту ночей (від сьогодні
+    до виїзду); при переселенні в дешевший/рівний номер доплати немає.
+    Факт фіксується в журналі booking_moves (звіт «Переселення»)
+    і в нотатках бронювання."""
     from app.utils.db import query
     from app.modules.logic import get_booking
     import datetime as _dt
@@ -14985,13 +15008,13 @@ def _open_relocate_dlg(parent, bid, on_done=None, user=None):
     if not items:
         messagebox.showinfo("Переселення", "Немає вільних номерів для переселення."); return
 
-    win = dlg_win(parent, "🔁 Переселення", "480x520")
+    win = dlg_win(parent, "🔁 Переселення", "480x680")
     sc = ctk.CTkScrollableFrame(win, fg_color=C['bg']); sc.pack(fill='both', expand=True, padx=10, pady=10)
     h = card(sc); h.pack(fill='x', pady=5)
     lbl(h, f"🔁  Переселення — №{old_num}", 15, True, C['accent']).pack(anchor='w', padx=12, pady=(10,3))
     lbl(h, f"👤 {b.get('guest_name','')}   📅 {b['check_in']} → {b['check_out']}", 11,
         color=C['text2']).pack(anchor='w', padx=12, pady=(0,4))
-    lbl(h, "Оплати, ціна й дати залишаються без змін — змінюється лише номер.", 10,
+    lbl(h, "Дати залишаються без змін. Якщо новий номер дорожчий — доплата різниці за решту ночей.", 10,
         color=C['text2']).pack(anchor='w', padx=12, pady=(0,10))
 
     f1 = card(sc); f1.pack(fill='x', pady=4)
@@ -15007,18 +15030,85 @@ def _open_relocate_dlg(parent, bid, on_done=None, user=None):
     e_reason = ent(f2, "Наприклад: прорвало трубу, немає світла…", w=420)
     e_reason.pack(padx=12, pady=(0,10))
 
-    def _do():
+    # ── Доплата за дорожчий номер ──
+    old_price = float(b.get('price_per_day') or 0)
+    _co = b['check_out']
+    if isinstance(_co, _dt.datetime): _co = _co.date()
+    elif not isinstance(_co, _dt.date):
+        try: _co = _dt.date.fromisoformat(str(_co)[:10])
+        except Exception: _co = _dt.date.today()
+    rem_nights = max((_co - _dt.date.today()).days, 0)
+    is_free = bool(b.get('free_stay'))
+    _price_cache = {}
+
+    def _find_item():
         nm = new_var.get().strip()
         it = by_name.get(nm)
         if not it:
             # ServicePicker чистить назви від кракозябр — шукаємо без урахування цього
             it = next((i for i in items if _fix_mojibake(i['name']) == nm), None)
+        return it
+
+    def _new_price(it):
+        if it['id'] not in _price_cache:
+            _price_cache[it['id']] = _room_current_price(it['id'], 0.0)
+        return _price_cache[it['id']]
+
+    f3 = card(sc); f3.pack(fill='x', pady=4)
+    lbl(f3, "💰 Доплата за різницю в ціні:", 12, True).pack(anchor='w', padx=12, pady=(8,3))
+    lbl_sur = lbl(f3, "Оберіть новий номер", 11, color=C['text2'])
+    lbl_sur.pack(anchor='w', padx=12, pady=(0,4))
+    _sr = tk.Frame(f3, bg=C['card']); _sr.pack(fill='x', padx=12, pady=(0,4))
+    lbl(_sr, "Сума доплати, ₴:", 11, color=C['text2']).pack(side='left', padx=(0,6))
+    e_sur = ent(_sr, "0", w=90); e_sur.pack(side='left')
+    _mr = tk.Frame(f3, bg=C['card']); _mr.pack(fill='x', padx=12, pady=(0,10))
+    lbl(_mr, "Оплата:", 11, color=C['text2']).pack(side='left', padx=(0,6))
+    meth_var = ctk.StringVar(value='cash')
+    for _v, _t, _c in [('cash','💵 Готівка',C['green']),('card','💳 Картка',C['accent']),('transfer','🏦 Переказ','#9b59b6')]:
+        ctk.CTkRadioButton(_mr, text=_t, variable=meth_var, value=_v,
+                           fg_color=_c, text_color=C['text'], font=('Segoe UI',11)).pack(side='left', padx=5)
+
+    def _put_sur(v):
+        e_sur.delete(0, 'end'); e_sur.insert(0, f"{v:.0f}")
+
+    def _upd_sur(*a):
+        it = _find_item()
+        if not it:
+            lbl_sur.configure(text="Оберіть новий номер", text_color=C['text2']); _put_sur(0); return
+        np_ = _new_price(it)
+        diff = np_ - old_price
+        if is_free:
+            lbl_sur.configure(text="🎁 Безкоштовне проживання — доплати немає", text_color=C['text2']); _put_sur(0)
+        elif np_ <= 0:
+            lbl_sur.configure(text="Ціну нового номера не визначено — введіть доплату вручну", text_color=C['yellow']); _put_sur(0)
+        elif diff > 0.01 and rem_nights > 0:
+            amt = diff * rem_nights
+            lbl_sur.configure(text=f"({np_:.0f}₴ − {old_price:.0f}₴) × {rem_nights} н = {amt:.0f}₴", text_color=C['yellow'])
+            _put_sur(amt)
+        elif diff > 0.01:
+            lbl_sur.configure(text="Новий номер дорожчий, але ночей до виїзду не лишилось — доплати немає", text_color=C['text2']); _put_sur(0)
+        else:
+            lbl_sur.configure(text=f"Новий номер не дорожчий ({np_:.0f}₴ ≤ {old_price:.0f}₴) — доплати немає", text_color=C['text2']); _put_sur(0)
+
+    try: new_var.trace_add('write', _upd_sur)
+    except Exception: pass
+
+    def _do():
+        it = _find_item()
         if not it:
             messagebox.showerror("", "Оберіть новий номер"); return
+        try:
+            surcharge = float((e_sur.get() or '0').replace(',', '.').replace(' ', ''))
+            if surcharge < 0: raise ValueError
+        except Exception:
+            messagebox.showerror("", "Невірна сума доплати"); return
+        new_price = _new_price(it)
         reason = e_reason.get().strip()
         if reason.startswith("Наприклад"): reason = ""
-        if not messagebox.askyesno("Переселити?",
-                f"Переселити {b.get('guest_name','')}\nз №{old_num} у №{it['number']}?"):
+        _msg = f"Переселити {b.get('guest_name','')}\nз №{old_num} у №{it['number']}?"
+        if surcharge > 0:
+            _msg += f"\n\n💰 Доплата: {surcharge:.0f}₴ ({ {'cash':'готівка','card':'картка','transfer':'переказ'}.get(meth_var.get(),'') })"
+        if not messagebox.askyesno("Переселити?", _msg):
             return
         try:
             who = (user or {}).get('full_name') or (user or {}).get('username') or ''
@@ -15031,6 +15121,18 @@ def _open_relocate_dlg(parent, bid, on_done=None, user=None):
             if _chk.get('st') not in ('free', 'cleaning'):
                 messagebox.showerror("", "Цей номер уже зайнятий. Оберіть інший."); return
             query("UPDATE bookings SET room_id=%s WHERE id=%s", (it['id'], bid), fetch=None)
+            if surcharge > 0:
+                # total_amount накопичується (старі ночі за старою ціною + доплата);
+                # price_per_day → ціна нового номера (для прострочення/продовження).
+                query("UPDATE bookings SET total_amount = CASE WHEN total_amount IS NULL "
+                      "THEN price_per_day*GREATEST(check_out-check_in,1)+%s ELSE total_amount+%s END, "
+                      "price_per_day=CASE WHEN %s>0 THEN %s ELSE price_per_day END WHERE id=%s",
+                      (surcharge, surcharge, new_price, new_price, bid), fetch=None)
+                query("INSERT INTO payments(booking_id,amount,method,note,shift_id,created_at) "
+                      "VALUES(%s,%s,%s,%s,%s,NOW())",
+                      (bid, surcharge, meth_var.get(),
+                       f"Доплата за переселення №{old_num}→№{it['number']} "
+                       f"({old_price:.0f}₴→{new_price:.0f}₴)", sid), fetch=None)
             query("UPDATE rooms SET status='occupied' WHERE id=%s", (it['id'],), fetch=None)
             query("UPDATE rooms SET status='cleaning' WHERE id=%s", (old_rid,), fetch=None)
             try:
@@ -15056,7 +15158,8 @@ def _open_relocate_dlg(parent, bid, on_done=None, user=None):
         except Exception as _e:
             log_error("relocate", _e)
             messagebox.showerror("Помилка", str(_e)); return
-        messagebox.showinfo("✅", f"Гостя переселено: №{old_num} → №{it['number']}")
+        messagebox.showinfo("✅", f"Гостя переселено: №{old_num} → №{it['number']}"
+                            + (f"\nДоплата: {surcharge:.0f}₴" if surcharge > 0 else ""))
         win.destroy()
         if on_done: on_done()
 
@@ -24661,7 +24764,13 @@ def _open_extend_room_dlg(parent, bid, on_save=None):
 
     b = get_booking(bid)
     if not b: return
-    price = float(b.get('price_per_day') or 0)
+    # Ціна заселення (зафіксована в броні) — лише для довідки.
+    price_old = float(b.get('price_per_day') or 0)
+
+    # Продовження рахуємо за АКТУАЛЬНОЮ ціною номера (категорія → rooms),
+    # а не за ціною, що діяла на момент заселення. Якщо не вдалося
+    # дізнатись — лишається ціна з броні.
+    price = _room_current_price(b.get('room_id'), price_old)
 
     _co0 = b['check_out']
     if isinstance(_co0, _dt.datetime): _co0 = _co0.date()
@@ -24672,7 +24781,10 @@ def _open_extend_room_dlg(parent, bid, on_save=None):
 
     hdr = card(sc); hdr.pack(fill='x', pady=(0,10))
     lbl(hdr, f"📅  Продовжити — №{b.get('room_number','')}", 15, True, C['green']).pack(anchor='w', padx=12, pady=(10,3))
-    lbl(hdr, f"👤 {b.get('guest_name','')}  |  Виїзд: {b['check_out']}  |  {price:.0f}₴/ніч", 11, color=C['text2']).pack(anchor='w', padx=12, pady=(0,10))
+    _price_txt = f"{price:.0f}₴/ніч"
+    if abs(price - price_old) > 0.01:
+        _price_txt = f"нова ціна {price:.0f}₴/ніч (було {price_old:.0f}₴)"
+    lbl(hdr, f"👤 {b.get('guest_name','')}  |  Виїзд: {b['check_out']}  |  {_price_txt}", 11, color=C['text2']).pack(anchor='w', padx=12, pady=(0,10))
 
     p_card = card(sc); p_card.pack(fill='x', pady=5)
     pf = tk.Frame(p_card, bg=C['card']); pf.pack(fill='x', padx=12, pady=10)
@@ -24791,7 +24903,7 @@ def _open_extend_room_dlg(parent, bid, on_save=None):
         query("""INSERT INTO payments(booking_id,amount,method,note,shift_id,created_at)
                   VALUES(%s,%s,%s,%s,%s,NOW())""",
               (bid, amount, meth_var.get(),
-               f"Продовження проживання ({d1.strftime(_FMT)}–{d2.strftime(_FMT)})",
+               f"Продовження проживання ({d1.strftime(_FMT)}–{d2.strftime(_FMT)}) × {price:.0f}₴",
                get_current_shift_id()), fetch=None)
         messagebox.showinfo("✅", f"Продовжено на {n} ніч. Оплачено {amount:.0f}₴. Новий виїзд: {new_co}")
         win.destroy()
