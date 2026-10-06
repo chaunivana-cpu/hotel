@@ -645,7 +645,21 @@ def _cl_load():
         return []
 
 def _cl_append(entry: dict):
-    """Додає один запис у PostgreSQL, fallback → JSON."""
+    """Додає один запис у PostgreSQL, fallback → JSON.
+    Якщо це відкрите прибирання без прибиральниці (авто-запис при виселенні) —
+    підставляє закріплену за номером/категорією прибиральницю."""
+    try:
+        if (entry.get('new_status') == 'cleaning'
+                and not str(entry.get('finished', '')).strip()
+                and str(entry.get('cleaner', '')).strip() in ('', '—', '-')):
+            _who, _why = _resolve_cleaner_for_room(entry.get('room', ''))
+            if _who:
+                entry = dict(entry)
+                entry['cleaner'] = _who
+                _n = str(entry.get('note', '')).strip()
+                entry['note'] = (_n + ' · ' if _n else '') + f'Авто-призначення: {_why}'
+    except Exception:
+        pass
     _ensure_cleaning_log_table()
     try:
         from app.utils.db import get_conn
@@ -1449,6 +1463,96 @@ def _save_cleaners_db(cleaners_list):
         try: log_error("_save_cleaners_db (БД)", _e)
         except Exception: pass
         return False, str(_e)
+
+# ── Закріплення прибиральниць за номерами / категоріями ──────────────────
+# Формат: {"Ім'я": {"rooms": ["10 золотий"], "groups": ["Золоті","Рожеві"]}}
+# Зберігається у hotel_settings (key='cleaner_assignments') + локальний json.
+_cl_assign_cache = None
+
+def _get_cleaner_assignments():
+    import json as _ja, os as _oa
+    global _cl_assign_cache
+    if _cl_assign_cache is not None:
+        return dict(_cl_assign_cache)
+    result = None
+    try:
+        from app.utils.db import get_conn as _gca
+        with _gca() as _cca:
+            with _cca.cursor() as _cua:
+                _cua.execute("SELECT value FROM hotel_settings WHERE key='cleaner_assignments'")
+                _ra = _cua.fetchone()
+                if _ra and _ra[0]:
+                    result = _ja.loads(_ra[0]) or {}
+    except Exception:
+        pass
+    if result is None:
+        try:
+            with open(_oa.path.join(get_data_dir(), 'cleaner_assignments.json'), encoding='utf-8') as _fa:
+                result = _ja.load(_fa) or {}
+        except Exception:
+            result = {}
+    _cl_assign_cache = result
+    return dict(result)
+
+def _save_cleaner_assignments(data):
+    import json as _jb, os as _ob
+    global _cl_assign_cache
+    _cl_assign_cache = dict(data)
+    try:
+        with open(_ob.path.join(get_data_dir(), 'cleaner_assignments.json'), 'w', encoding='utf-8') as _fb:
+            _jb.dump(data, _fb, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    try:
+        from app.utils.db import get_conn as _gcb, mirror_execute_to_cloud as _mirb
+        _wb = _gcb()
+        _sqlb = """INSERT INTO hotel_settings(key,value,updated_at) VALUES('cleaner_assignments',%s,now())
+                   ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()"""
+        _valb = _jb.dumps(data, ensure_ascii=False)
+        with _wb as _ccb:
+            with _ccb.cursor() as _cub:
+                _cub.execute("""CREATE TABLE IF NOT EXISTS hotel_settings
+                    (key TEXT PRIMARY KEY, value TEXT, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
+                _cub.execute(_sqlb, (_valb,))
+            _ccb.commit()
+        if getattr(_wb, 'backend', None) == 'main':
+            _mirb(_sqlb, (_valb,))
+        return True, None
+    except Exception as _eb:
+        try: log_error("_save_cleaner_assignments", _eb)
+        except Exception: pass
+        return False, str(_eb)
+
+def _resolve_cleaner_for_room(room_number):
+    """Повертає (ім'я прибиральниці, причина) для номера або ('','').
+    Пріоритет: закріплення за конкретним номером → за категорією номера."""
+    try:
+        assign = _get_cleaner_assignments()
+        if not assign:
+            return '', ''
+        num = str(room_number).strip()
+        active = set(_get_cleaners_db())
+        for name, cfg in assign.items():
+            if active and name not in active:
+                continue
+            if num in [str(x).strip() for x in cfg.get('rooms', [])]:
+                return name, f'закріплена за номером {num}'
+        from app.utils.db import query as _qrc
+        row = _qrc("""SELECT r.number, COALESCE(rc.name,'') AS cat_name FROM rooms r
+                      LEFT JOIN room_categories rc ON rc.id=r.category_id
+                      WHERE r.number::text=%s LIMIT 1""", (num,), fetch='one') or {}
+        if row:
+            # Ті самі групи, що у фільтрі «Тип» на Шахматці; «Номери» — останньою (залишкова)
+            for gname, gfn in _CLEANER_GROUPS:
+                for name, cfg in assign.items():
+                    if active and name not in active:
+                        continue
+                    if gname in cfg.get('groups', []) and gfn(row):
+                        return name, f'закріплена за групою «{gname}»'
+    except Exception as _er:
+        try: log_error("_resolve_cleaner_for_room", _er)
+        except Exception: pass
+    return '', ''
 
 def _ensure_restaurant_payments_col():
     """Гарантує що payments.booking_id може бути NULL (для ресторану/каси)."""
@@ -8723,6 +8827,14 @@ _ROOM_TYPE_GROUPS = [
     ("Рожеві", _room_in_group_rozhevi),
 ]
 
+# Групи для закріплення прибиральниць (порядок важливий: «Номери» — залишкова, останньою)
+_CLEANER_GROUPS = [
+    ("Золоті", _room_in_group_zoloti),
+    ("Рожеві", _room_in_group_rozhevi),
+    ("Бесідки та Альтанки", _room_in_group_besidky),
+    ("Номери", _room_in_group_nomery),
+]
+
 def _get_rooms_cached(force=False):
     """Повертає список кімнат з кешу (max 15с) або свіжі з БД, або SQLite при офлайні."""
     global _ROOMS_CACHE, _ROOMS_CACHE_TS
@@ -14921,6 +15033,12 @@ def _open_relocate_dlg(parent, bid, on_done=None, user=None):
             query("UPDATE bookings SET room_id=%s WHERE id=%s", (it['id'], bid), fetch=None)
             query("UPDATE rooms SET status='occupied' WHERE id=%s", (it['id'],), fetch=None)
             query("UPDATE rooms SET status='cleaning' WHERE id=%s", (old_rid,), fetch=None)
+            try:
+                _cl_append({'room': str(old_num), 'cleaner': '—',
+                            'started': now.strftime('%d.%m.%Y %H:%M'), 'finished': '',
+                            'new_status': 'cleaning', 'note': 'Авто-запис при переселенні',
+                            'logged_at': now.strftime('%d.%m.%Y %H:%M:%S')})
+            except Exception: pass
             query("INSERT INTO booking_moves(booking_id,from_room_id,from_room_number,to_room_id,"
                   "to_room_number,reason,moved_by,shift_id,moved_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,NOW())",
                   (bid, old_rid, old_num, it['id'], it['number'], reason or None, who or None, sid), fetch=None)
@@ -32239,7 +32357,13 @@ class SettingsFrame(tk.Frame):
 
         def _reload():
             lb.delete(0,'end')
-            for c in _get(): lb.insert('end','  '+c)
+            _as = _get_cleaner_assignments()
+            for c in _get():
+                cfg = _as.get(c, {})
+                parts = []
+                if cfg.get('groups'): parts.append('групи: ' + ', '.join(cfg['groups']))
+                if cfg.get('rooms'): parts.append('номери: ' + ', '.join(str(x) for x in cfg['rooms']))
+                lb.insert('end', '  ' + c + (('   —   ' + ' | '.join(parts)) if parts else ''))
         _reload()
 
         add_f=tk.Frame(p,bg=C['bg']); add_f.pack(fill='x',padx=5,pady=6)
@@ -32256,9 +32380,14 @@ class SettingsFrame(tk.Frame):
         def remove():
             sel=lb.curselection()
             if not sel: return
-            name=lb.get(sel[0]).strip()
+            name=lb.get(sel[0]).split('   —   ')[0].strip()
             lst=_get()
             if name in lst: lst.remove(name); _save(lst)
+            try:
+                _as = _get_cleaner_assignments()
+                if name in _as:
+                    _as.pop(name); _save_cleaner_assignments(_as)
+            except Exception: pass
             _reload()
 
         def edit():
@@ -32266,7 +32395,7 @@ class SettingsFrame(tk.Frame):
             if not sel:
                 messagebox.showwarning("","Оберіть прибиральницю зі списку"); return
             idx=sel[0]
-            old_name=lb.get(idx).strip()
+            old_name=lb.get(idx).split('   —   ')[0].strip()
             from tkinter import simpledialog
             new_name=simpledialog.askstring("✏️ Редагувати","Нове ім'я:",initialvalue=old_name,parent=p)
             if new_name is None: return
@@ -32279,6 +32408,11 @@ class SettingsFrame(tk.Frame):
                     messagebox.showwarning("","Таке ім'я вже є у списку"); return
                 lst[pos]=new_name
                 _save(lst)
+                try:
+                    _as = _get_cleaner_assignments()
+                    if old_name in _as:
+                        _as[new_name] = _as.pop(old_name); _save_cleaner_assignments(_as)
+                except Exception: pass
             _reload()
             lb.selection_set(idx)
 
@@ -32289,7 +32423,7 @@ class SettingsFrame(tk.Frame):
             if not sel or sel[0]==0: return
             lst=_get(); i=sel[0]-1
             # find real index (strip spaces)
-            names=[x.strip() for x in [lb.get(j) for j in range(lb.size())]]
+            names=[x.split('   —   ')[0].strip() for x in [lb.get(j) for j in range(lb.size())]]
             name=names[sel[0]]
             idx=lst.index(name) if name in lst else -1
             if idx>0: lst[idx-1],lst[idx]=lst[idx],lst[idx-1]; _save(lst); _reload(); lb.selection_set(sel[0]-1)
@@ -32297,7 +32431,7 @@ class SettingsFrame(tk.Frame):
         def move_down():
             sel=lb.curselection()
             if not sel: return
-            names=[x.strip() for x in [lb.get(j) for j in range(lb.size())]]
+            names=[x.split('   —   ')[0].strip() for x in [lb.get(j) for j in range(lb.size())]]
             if sel[0]>=len(names)-1: return
             name=names[sel[0]]; lst=_get()
             idx=lst.index(name) if name in lst else -1
@@ -32319,9 +32453,82 @@ class SettingsFrame(tk.Frame):
         btn(btn_f,"⬇",move_down,C['card2'],44,height=34).pack(side='left',padx=2)
         btn(btn_f,"🔄 Синхр.",sync_now,C['accent'],100,height=34).pack(side='left',padx=(8,2))
 
+        def assign_dlg():
+            sel=lb.curselection()
+            if not sel:
+                messagebox.showwarning("","Оберіть прибиральницю зі списку"); return
+            name=lb.get(sel[0]).split('   —   ')[0].strip()
+            from app.utils.db import query as _qas
+            try:
+                rooms=_qas("""SELECT r.number, COALESCE(rc.name,'') AS cat_name FROM rooms r
+                              LEFT JOIN room_categories rc ON rc.id=r.category_id ORDER BY r.number""", fetch='all') or []
+            except Exception as ex:
+                messagebox.showerror("Помилка", f"Не вдалось завантажити номери:\n{ex}"); return
+            all_as=_get_cleaner_assignments()
+            cfg=all_as.get(name, {})
+            cur_groups=set(cfg.get('groups',[]))
+            cur_rooms={str(x).strip() for x in cfg.get('rooms',[])}
+            taken_g={}; taken_r={}
+            for who,c in all_as.items():
+                if who==name: continue
+                for x in c.get('groups',[]): taken_g[x]=who
+                for x in c.get('rooms',[]): taken_r[str(x).strip()]=who
+
+            win=dlg_win(p.winfo_toplevel(), f"📌 Закріплення — {name}", "620x640")
+            top=card(win); top.pack(fill='x',padx=10,pady=(10,4))
+            lbl(top,f"📌  {name}",14,True).pack(anchor='w',padx=12,pady=(10,2))
+            lbl(top,"При виселенні номер автоматично піде на прибирання до цієї прибиральниці.\n"
+                    "Групи — як у фільтрі «Тип» на Шахматці. Закріплення за конкретним номером сильніше за групу.",
+                10,color=C['text2']).pack(anchor='w',padx=12,pady=(0,10))
+            sc=ctk.CTkScrollableFrame(win,fg_color=C['bg']); sc.pack(fill='both',expand=True,padx=10,pady=4)
+
+            lbl(sc,"🏷 Групи номерів",12,True).pack(anchor='w',padx=6,pady=(4,2))
+            grp_vars={}
+            for gname,gfn in _CLEANER_GROUPS:
+                cnt=sum(1 for r in rooms if gfn(r))
+                v=ctk.BooleanVar(value=gname in cur_groups)
+                other=taken_g.get(gname)
+                ctk.CTkCheckBox(sc,text=f"{gname}  ({cnt} ном.)"+(f"   (зараз: {other})" if other else ""),
+                                variable=v,font=('Segoe UI',13,'bold')).pack(anchor='w',padx=16,pady=4)
+                grp_vars[gname]=v
+
+            lbl(sc,"🛏 Окремі номери (необов'язково)",12,True).pack(anchor='w',padx=6,pady=(14,2))
+            room_vars={}
+            for r in rooms:
+                num=str(r['number']).strip()
+                v=ctk.BooleanVar(value=num in cur_rooms)
+                other=taken_r.get(num)
+                ctk.CTkCheckBox(sc,text=f"№{num}"+(f"   (зараз: {other})" if other else ""),
+                                variable=v,font=('Segoe UI',12)).pack(anchor='w',padx=16,pady=2)
+                room_vars[num]=v
+
+            def save_as():
+                new_groups=[g for g,v in grp_vars.items() if v.get()]
+                new_rooms=[n for n,v in room_vars.items() if v.get()]
+                data=_get_cleaner_assignments()
+                for who,c in list(data.items()):
+                    if who==name: continue
+                    c['groups']=[x for x in c.get('groups',[]) if x not in new_groups]
+                    c['rooms']=[x for x in c.get('rooms',[]) if str(x) not in new_rooms]
+                    if not c['groups'] and not c['rooms']: data.pop(who)
+                if new_groups or new_rooms:
+                    data[name]={'groups':new_groups,'rooms':new_rooms}
+                else:
+                    data.pop(name,None)
+                ok,err=_save_cleaner_assignments(data)
+                if not ok:
+                    messagebox.showwarning("Помилка збереження",
+                        f"Не вдалось зберегти на сервері:\n{err}\n\nЗбережено лише локально.",parent=win)
+                _reload(); win.destroy()
+
+            btn(win,"💾 Зберегти закріплення",save_as,C['green'],260,height=40).pack(pady=6)
+
+        btn(btn_f,"📌 Закріпити",assign_dlg,C['yellow'],120,height=34).pack(side='left',padx=(8,2))
+        lb.bind('<Return>', lambda e: assign_dlg())
+
         # Підпис внизу
         info_f=tk.Frame(p,bg=C['bg']); info_f.pack(fill='x',padx=5,pady=(0,4))
-        lbl(info_f,"💡 Подвійний клік або ✏️ Ред. — перейменувати. 🔄 Синхр. — оновити список з сервера",10,color=C['text2']).pack(anchor='w',padx=8)
+        lbl(info_f,"💡 Подвійний клік або ✏️ Ред. — перейменувати. 📌 Закріпити — групи/номери для авто-призначення при виселенні. 🔄 Синхр. — оновити список",10,color=C['text2']).pack(anchor='w',padx=8)
 
 
     def _load_users(self):
