@@ -965,7 +965,7 @@ def _save_db_cfg_shared(cfg, legacy_path):
 # прожиті ночі. Через це той самий гість, що прострочив виїзд, показував
 # РІЗНИЙ борг залежно від того, у якому вікні дивишся. Тепер ВСІ місця
 # викликають саме цю функцію.
-def calc_stay_financials(booking, payments):
+def calc_stay_financials(booking, payments, svc_total=None):
     """booking: dict з check_in, check_out, price_per_day, total_amount,
     status (з таблиці bookings). payments: список dict з amount, note
     (усі платежі цього бронювання, з таблиці payments).
@@ -1008,6 +1008,14 @@ def calc_stay_financials(booking, payments):
         overdue_nights = max(n_actual - n_planned, 0)
     total = total_planned + price * overdue_nights
 
+    # 🎁 Безкоштовне проживання: весь період до виселення не оплачується,
+    # борг за проживання не рахується (послуги/штрафи — як звичайно).
+    _free = booking.get('free_stay')
+    if _free is None and booking.get('id'):
+        _free = int(booking['id']) in _free_stay_map([booking['id']])
+    if _free:
+        total = 0.0
+
     adv_paid = 0.0; dep_paid = 0.0; dopla_paid = 0.0
     for p in (payments or []):
         amt = float(p.get('amount') or 0)
@@ -1022,22 +1030,105 @@ def calc_stay_financials(booking, payments):
             dopla_paid += amt
 
     paid = adv_paid + dopla_paid + dep_paid
+
+    # ── Замовлені послуги (service_orders) ──────────────────────────────
+    # Якщо передано svc_total (сума замовлених послуг без залогів/штрафів) —
+    # борг = борг за проживання + борг за послуги. Раніше послуги, додані
+    # до бронювання, у борг НЕ потрапляли (вікно «Оплата» показувало 0₴).
+    #  • платежі з приміткою «Послуга: …» та «Додаткові послуги при заселенні»
+    #    — це оплата саме послуг;
+    #  • при заселенні вартість послуг уже додана в total_amount, тому її
+    #    віднімаємо від суми проживання, щоб не рахувати двічі;
+    #  • будь-яка переплата понад проживання зараховується на послуги.
+    if svc_total is not None:
+        svc_total = max(float(svc_total or 0), 0.0)
+        svc_paid = 0.0; checkin_svc_paid = 0.0; general_paid = 0.0
+        for p in (payments or []):
+            amt = float(p.get('amount') or 0)
+            if amt <= 0:
+                continue
+            note = p.get('note', '') or ''
+            if any(tag in note for tag in ('Залог', 'deposit', 'Повернення залогу')):
+                continue
+            if note.startswith('Додаткові послуги при заселенні'):
+                checkin_svc_paid += amt
+            elif note.startswith('Послуга'):
+                svc_paid += amt
+            else:
+                general_paid += amt
+        lodging_total = max(total - checkin_svc_paid, 0.0)
+        lodging_debt = max(lodging_total - general_paid, 0.0)
+        surplus = max(general_paid - lodging_total, 0.0)
+        svc_debt = max(svc_total - checkin_svc_paid - svc_paid - surplus, 0.0)
+        return {'total': lodging_total + svc_total, 'paid': paid,
+                'debt': lodging_debt + svc_debt,
+                'adv_paid': adv_paid, 'dopla_paid': dopla_paid, 'dep_paid': dep_paid,
+                'svc_total': svc_total, 'svc_debt': svc_debt,
+                'svc_covered': checkin_svc_paid + svc_paid + surplus,
+                'lodging_debt': lodging_debt}
+
     debt = max(total - (adv_paid + dopla_paid), 0)
     return {'total': total, 'paid': paid, 'debt': debt,
             'adv_paid': adv_paid, 'dopla_paid': dopla_paid, 'dep_paid': dep_paid}
+
+
+def _svc_unpaid_items(bid, covered, _q=None):
+    """Позиції замовлених послуг, ще не покриті оплатою (FIFO: найстаріші
+    вважаються оплаченими першими). covered — скільки вже сплачено за послуги.
+    Повертає [{'name','qty','price','total'}, ...]. При помилці — []."""
+    try:
+        if _q is None:
+            from app.utils.db import query as _q
+        rows = _q("SELECT COALESCE(sv.name, so.note, '?') AS name, so.quantity AS qty, "
+                  "so.price AS price, so.total AS total "
+                  "FROM service_orders so LEFT JOIN services sv ON sv.id=so.service_id "
+                  "WHERE so.booking_id=%s AND COALESCE(so.note,'') NOT ILIKE 'deposit%%' "
+                  "AND COALESCE(so.note,'') NOT ILIKE 'fine%%' "
+                  "ORDER BY so.created_at, so.id", (bid,)) or []
+        out = []; cum = 0.0; covered = float(covered or 0)
+        for r in rows:
+            r = dict(r) if hasattr(r, 'keys') else dict(zip(('name','qty','price','total'), r))
+            tot = float(r.get('total') or 0)
+            cum += tot
+            if cum - covered > 0.5:
+                out.append({'name': _fix_mojibake(str(r.get('name') or '?')),
+                            'qty': float(r.get('qty') or 1),
+                            'price': float(r.get('price') or 0), 'total': tot})
+        return out
+    except Exception:
+        return []
+
+
+def _svc_orders_total(bid, _q=None):
+    """Сума замовлених послуг бронювання (service_orders) БЕЗ залогів і штрафів.
+    При помилці повертає None — тоді calc_stay_financials працює по-старому."""
+    try:
+        if _q is None:
+            from app.utils.db import query as _q
+        rows = _q("SELECT COALESCE(SUM(total),0) AS t FROM service_orders "
+                  "WHERE booking_id=%s AND COALESCE(note,'') NOT ILIKE 'deposit%%' "
+                  "AND COALESCE(note,'') NOT ILIKE 'fine%%'", (bid,)) or []
+        if not rows:
+            return 0.0
+        r = rows[0]
+        v = r['t'] if hasattr(r, 'keys') else r[0]
+        return float(v or 0)
+    except Exception:
+        return None
 
 
 # SQL-фрагмент з ТІЄЮ Ж логікою "Всього" — для списків, які рахують
 # суми ОДНИМ SQL-запитом (заради швидкості на великих таблицях), а не
 # рядок-за-рядком у Python. b — псевдонім таблиці bookings у запиті.
 _SQL_STAY_TOTAL = """
-    (COALESCE(NULLIF(b.total_amount,0), b.price_per_day * GREATEST(b.check_out - b.check_in, 1))
+    (CASE WHEN COALESCE(b.free_stay, FALSE) THEN 0 ELSE
+     (COALESCE(NULLIF(b.total_amount,0), b.price_per_day * GREATEST(b.check_out - b.check_in, 1))
      + CASE
          WHEN b.status='checkedin'
               AND (CURRENT_DATE - b.check_in) > GREATEST(b.check_out - b.check_in, 1)
          THEN b.price_per_day * ((CURRENT_DATE - b.check_in) - GREATEST(b.check_out - b.check_in, 1))
          ELSE 0
-       END)
+       END) END)
 """
 
 # ── Онлайн-оновлення: спільні функції (вкладка «Оновлення» + банер на дашборді) ──
@@ -1367,6 +1458,118 @@ def _ensure_restaurant_payments_col():
     except Exception:
         pass  # вже nullable або не підтримується
 
+_FREE_STAY_COLS_OK = False
+
+def _ensure_free_stay_cols():
+    """Колонки «Безкоштовне проживання» в bookings (створює, якщо немає)."""
+    global _FREE_STAY_COLS_OK
+    if _FREE_STAY_COLS_OK:
+        return True
+    from app.utils.db import query
+    try:
+        query("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS free_stay BOOLEAN DEFAULT FALSE", fetch=None)
+        query("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS free_stay_comment TEXT", fetch=None)
+        _FREE_STAY_COLS_OK = True
+    except Exception as _e:
+        log_error("_ensure_free_stay_cols", _e)
+    return _FREE_STAY_COLS_OK
+
+
+def _free_stay_map(ids):
+    """{booking_id: коментар} лише для бронювань з галочкою
+    «Безкоштовне проживання». Борг за проживання таких броней = 0."""
+    try:
+        ids = [int(i) for i in (ids or []) if i is not None]
+    except Exception:
+        return {}
+    if not ids:
+        return {}
+    try:
+        from app.utils.db import query
+        ph = ','.join(['%s'] * len(ids))
+        rows = query(f"SELECT id, free_stay_comment FROM bookings "
+                     f"WHERE free_stay IS TRUE AND id IN ({ph})", tuple(ids), fetch='all') or []
+        return {int(r['id']): (r.get('free_stay_comment') or '') for r in rows}
+    except Exception:
+        return {}
+
+
+def _block_if_room_occupied(room_id, exclude_bid=None):
+    """True (і показує попередження), якщо в номері вже є заселений гість,
+    якого ще не виселили. Повторно заселити такий номер не можна."""
+    try:
+        from app.utils.db import query
+        if exclude_bid:
+            r = query("""SELECT b.id, COALESCE(g.name,'') AS gname, b.check_out
+                         FROM bookings b LEFT JOIN guests g ON g.id=b.guest_id
+                         WHERE b.room_id=%s AND b.status='checkedin' AND b.id<>%s
+                         ORDER BY b.id DESC LIMIT 1""",
+                      (room_id, exclude_bid), fetch='one')
+        else:
+            r = query("""SELECT b.id, COALESCE(g.name,'') AS gname, b.check_out
+                         FROM bookings b LEFT JOIN guests g ON g.id=b.guest_id
+                         WHERE b.room_id=%s AND b.status='checkedin'
+                         ORDER BY b.id DESC LIMIT 1""",
+                      (room_id,), fetch='one')
+    except Exception as _e:
+        log_error("_block_if_room_occupied", _e)
+        return False
+    if r:
+        messagebox.showwarning(
+            "Номер зайнятий",
+            f"У цьому номері вже проживає гість: {r.get('gname') or '—'} "
+            f"(бронювання #{r.get('id')}, виїзд {str(r.get('check_out'))[:10]}).\n\n"
+            "Спочатку виселіть його (або переселіть), після цього номер можна заселити знову.")
+        return True
+    return False
+
+
+def _save_free_stay(bid, on, comment, zero_total=False):
+    """Зберігає галочку «Безкоштовне проживання» для бронювання."""
+    if not on or not bid:
+        return
+    try:
+        from app.utils.db import query
+        _ensure_free_stay_cols()
+        query("UPDATE bookings SET free_stay=TRUE, free_stay_comment=%s WHERE id=%s",
+              (comment, bid), fetch=None)
+        if zero_total:
+            query("UPDATE bookings SET total_amount=0 WHERE id=%s", (bid,), fetch=None)
+    except Exception as _e:
+        log_error("_save_free_stay", _e)
+
+
+def _is_visit_cat(cat_name):
+    """Бані та бесідки — «відвідування», а не «проживання» (так і підписуємо)."""
+    c = str(cat_name or '').lower()
+    return any(k in c for k in ('баня', 'бані', 'sauna', 'лазня', 'бесідк', 'беседк', 'альтанк', 'gazebo'))
+
+
+def _free_stay_widget(parent, init_on=False, init_comment='', on_change=None, visit=False):
+    """Блок «🎁 Безкоштовне проживання» (галочка + коментар) для форм
+    бронювання/заселення. Повертає (frame, BooleanVar, entry_коментаря).
+    Розмістити frame (pack/grid) має викликач."""
+    fr = ctk.CTkFrame(parent, fg_color='transparent')
+    var = tk.BooleanVar(value=bool(init_on))
+    ctk.CTkCheckBox(
+        fr, text=("🎁 Безкоштовне відвідування (весь час до виселення)" if visit
+                  else "🎁 Безкоштовне проживання (весь період до виселення)"),
+        variable=var, font=('Segoe UI', 11), fg_color=C['accent'],
+        text_color=C['text'],
+        command=(lambda: on_change() if on_change else None)
+    ).pack(anchor='w', pady=(0, 4))
+    cr = ctk.CTkFrame(fr, fg_color='transparent'); cr.pack(anchor='w', fill='x')
+    ctk.CTkLabel(cr, text="Коментар:", font=('Segoe UI', 11),
+                 text_color=C['text2']).pack(side='left', padx=(0, 6))
+    e = ent(cr, "причина (обов'язково)", w=280); e.pack(side='left')
+    if init_comment:
+        e.insert(0, str(init_comment))
+    ctk.CTkLabel(fr, text=("Оплата за відвідування не нараховується." if visit
+                           else "Борг за проживання за цей період не рахується."),
+                 font=('Segoe UI', 9), text_color=C['text2']).pack(anchor='w', pady=(3, 0))
+    return fr, var, e
+
+
 def get_session_start(shift_id=None):
     """Повертає datetime початку поточної зміни або None.
     Читає opened_at з БД щоб .exe і Python показували однаковий час зміни.
@@ -1581,6 +1784,8 @@ def _ensure_shifts_table():
         query("ALTER TABLE shifts ADD COLUMN IF NOT EXISTS opening_deposits NUMERIC(10,2) DEFAULT 0", fetch=None)
         query("ALTER TABLE payments ADD COLUMN IF NOT EXISTS shift_id INTEGER", fetch=None)
         query("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS source_hotels BOOLEAN DEFAULT FALSE", fetch=None)
+        query("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS free_stay BOOLEAN DEFAULT FALSE", fetch=None)
+        query("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS free_stay_comment TEXT", fetch=None)
         query("""CREATE TABLE IF NOT EXISTS cash_transfers (
             id SERIAL PRIMARY KEY,
             shift_id INTEGER,
@@ -2518,6 +2723,33 @@ def ent(p, ph='', w=200, show=None):
 
 def card(p, **kw):
     return ctk.CTkFrame(p, fg_color=C['card'], corner_radius=12, **kw)
+
+
+def _tile_place_badge(owner, badge):
+    """Ставить бейдж прострочення на плитку: у «повній» плитці — угорі праворуч,
+    у компактній (дрібні плитки) — внизу праворуч, щоб не закривати номер."""
+    try:
+        if getattr(owner, '_tile_compact', False):
+            badge.place(relx=1.0, rely=1.0, anchor='se', x=0, y=0)
+        else:
+            badge.place(relx=1.0, rely=0.0, anchor='ne', x=0, y=0)
+    except Exception:
+        pass
+
+
+def _tile_lines_needed(font, text, width):
+    """Скільки рядків займе текст при переносі по словах у ширину width (px)."""
+    width = max(10, int(width)); lines = 1; cur = 0
+    space = font.measure(' ')
+    for word in str(text).split():
+        w = font.measure(word)
+        if w > width:                         # дуже довге слово — переноситься посимвольно
+            extra = -(-w // width)
+            lines += (extra - 1) + (1 if cur else 0); cur = w % width or width; continue
+        if cur == 0: cur = w
+        elif cur + space + w <= width: cur += space + w
+        else: lines += 1; cur = w
+    return lines
 
 
 def _df_parse(txt):
@@ -5028,7 +5260,16 @@ def _fix_mojibake(s):
     if not s or not isinstance(s, str):
         return s
     try:
-        fixed = s.encode('cp1251').decode('utf-8')
+        _raw = bytearray()
+        for ch in s:
+            try:
+                _raw += ch.encode('cp1251')
+            except UnicodeEncodeError:
+                if 0x80 <= ord(ch) <= 0x9f:   # байти, яких немає в cp1251 (напр. 0x98)
+                    _raw.append(ord(ch))
+                else:
+                    return s
+        fixed = bytes(_raw).decode('utf-8')
         if any(('А' <= ch <= 'я') or ch in 'ЄєІіЇїҐґ' for ch in fixed):
             return fixed
     except (UnicodeEncodeError, UnicodeDecodeError):
@@ -8611,6 +8852,52 @@ class DashboardFrame(tk.Frame):
         # _bg_init працює у фоні паралельно, _get_rooms_cached() має fallback
         self.after(300, self._load_data_async)
 
+    def _fit_stat_cards(self):
+        """Автопідгонка карток статистики під ширину вікна і довжину тексту.
+        Усі картки отримують однаковий розмір шрифту: беремо найбільший, при якому найдовший
+        вміст («47  Заброньовано», «1 250  Вільних») вміщується в картку. Якщо навіть найменший
+        в один рядок не влазить — число розташовується над назвою (у два рядки)."""
+        try:
+            import tkinter.font as _tkf
+            items = list(self._stat_card_lbls.values())
+            items = [t for t in items if isinstance(t, tuple)]
+            W = self._st_cols.winfo_width()
+            if not items or W < 120: return
+            n = len(items)
+            avail = W / n - 6 - 12 - 14          # padx сітки, padx вмісту, закруглення
+            texts = [(str(nl.cget('text')), str(tl.cget('text'))) for nl, tl in items]
+            chosen = None
+            for ns_, ts_ in ((16, 10), (15, 10), (14, 9), (13, 9), (12, 8), (11, 8)):
+                fn = _tkf.Font(family='Segoe UI', size=ns_, weight='bold')
+                ft = _tkf.Font(family='Segoe UI', size=ts_)
+                need = max(fn.measure(a) + 6 + ft.measure(b) for a, b in texts)
+                if need <= avail:
+                    chosen = (ns_, ts_, False); break
+            if chosen is None:                    # у два рядки: число зверху, назва знизу
+                for ns_, ts_ in ((16, 9), (14, 9), (13, 8), (12, 8), (11, 7)):
+                    fn = _tkf.Font(family='Segoe UI', size=ns_, weight='bold')
+                    ft = _tkf.Font(family='Segoe UI', size=ts_)
+                    need = max(max(fn.measure(a), ft.measure(b)) for a, b in texts)
+                    if need <= avail:
+                        chosen = (ns_, ts_, True); break
+                if chosen is None:
+                    chosen = (11, 7, True)
+            key = (chosen, tuple(texts))
+            if key == getattr(self, '_stat_fit_key', None):
+                return
+            self._stat_fit_key = key
+            ns_, ts_, stacked = chosen
+            for nl, tl in items:
+                nl.configure(font=('Segoe UI', ns_, 'bold'))
+                tl.configure(font=('Segoe UI', ts_))
+                nl.pack_forget(); tl.pack_forget()
+                if stacked:
+                    nl.pack(side='top'); tl.pack(side='top')
+                else:
+                    nl.pack(side='left'); tl.pack(side='left', padx=(6, 0))
+        except Exception as _e_sf:
+            log_error("Dashboard._fit_stat_cards", _e_sf)
+
     def _build_skeleton(self):
         """Будує статичну частину UI одразу, без запитів до БД."""
         today = date.today()
@@ -8620,7 +8907,7 @@ class DashboardFrame(tk.Frame):
         self._dep_tree         = None
         self._first_render     = True  # перший раз будуємо сітку, далі оновлюємо
 
-        self._hdr = tk.Frame(self, bg=C['bg']); self._hdr.pack(fill='x', padx=20, pady=(15,8))
+        self._hdr = tk.Frame(self, bg=C['bg']); self._hdr.pack(fill='x', padx=20, pady=(10,4))
         lbl(self._hdr, f"🏠  Дашборд — {today.strftime('%d.%m.%Y')}", 22, True).pack(side='left')
         self._shift_lbl = lbl(self._hdr, f"👤 {self.user.get('full_name','')}", 11, color=C['text2'])
         self._shift_lbl.pack(side='left', padx=15)
@@ -8720,9 +9007,10 @@ class DashboardFrame(tk.Frame):
         self.after(60000, self._update_check_tick)
 
         # Статистичні картки — будуємо одразу зі статичним скелетом
-        self._st = tk.Frame(self, bg=C['bg']); self._st.pack(fill='x', padx=20, pady=5)
-        self._loading_lbl = lbl(self._st, "", 11, color=C['text2'])
-        self._loading_lbl.pack()
+        self._st = tk.Frame(self, bg=C['bg']); self._st.pack(fill='x', padx=20, pady=(2, 0))
+        # службовий напис про завантаження/помилку — накладкою справа, місця в розкладці не займає
+        self._loading_lbl = lbl(self._st, "", 10, color=C['text2'])
+        self._loading_lbl.place(relx=1.0, rely=0.0, anchor='ne')
 
         # Stat картки — одразу видимі з "—" поки грузяться дані
         _STAT_DEFS = [
@@ -8736,16 +9024,29 @@ class DashboardFrame(tk.Frame):
             ('departures','Виїзди',     '#1abc9c',   '0'),
         ]
         self._stat_card_lbls = {}
-        _st_cols = tk.Frame(self._st, bg=C['bg']); _st_cols.pack(fill='x', pady=4)
+        _st_cols = tk.Frame(self._st, bg=C['bg']); _st_cols.pack(fill='x', pady=(2, 2))
         for i, (key, title, clr, val) in enumerate(_STAT_DEFS):
-            _st_cols.columnconfigure(i, weight=1)
-            cf = ctk.CTkFrame(_st_cols, fg_color=clr, corner_radius=12)
-            cf.grid(row=0, column=i, padx=4, pady=4, sticky='ew', ipady=2)
-            num_lbl = lbl(cf, val, 18, True, 'white'); num_lbl.pack(pady=(4,0))
-            ttl_lbl = lbl(cf, title, 9, color='white'); ttl_lbl.pack(pady=(0,4))
+            _st_cols.columnconfigure(i, weight=1, uniform='stat')
+            cf = ctk.CTkFrame(_st_cols, fg_color=clr, corner_radius=10)
+            cf.grid(row=0, column=i, padx=3, pady=2, sticky='ew')
+            # компактно: число і назва в один рядок («47  Вільних»)
+            _row_in = ctk.CTkFrame(cf, fg_color='transparent')
+            _row_in.pack(padx=6, pady=3)
+            num_lbl = lbl(_row_in, val, 16, True, 'white'); num_lbl.pack(side='left')
+            ttl_lbl = lbl(_row_in, title, 10, color='white'); ttl_lbl.pack(side='left', padx=(6, 0))
             self._stat_card_lbls[key] = (num_lbl, ttl_lbl)
+        self._st_cols = _st_cols
+        self._stat_fit_key = None
+        def _sched_fit(e=None):
+            try:
+                if getattr(self, '_stat_fit_job', None):
+                    self.after_cancel(self._stat_fit_job)
+                self._stat_fit_job = self.after(30, self._fit_stat_cards)
+            except Exception: pass
+        self._sched_stat_fit = _sched_fit
+        _st_cols.bind('<Configure>', _sched_fit)
 
-        lbl(self, "🗺️  Статус номерів", 15, True).pack(anchor='w', padx=20, pady=(12,4))
+        lbl(self, "🗺️  Статус номерів", 13, True).pack(anchor='w', padx=20, pady=(6,2))
         # ── Placeholder для банера прострочених — прямо над сіткою плиток ──
         self._overdue_banner_frame = tk.Frame(self, bg=C['bg'])
         self._overdue_banner_frame.pack(fill='x', padx=20, pady=(0, 4))
@@ -9458,6 +9759,8 @@ class DashboardFrame(tk.Frame):
                     else:
                         _lbl_ref.configure(text=str(val))
                 except Exception: pass
+        try: self._sched_stat_fit()
+        except Exception: pass
 
         _need_rebuild = self._first_render or (len(rooms) != len(self._tile_refs))
         if _need_rebuild:
@@ -9540,9 +9843,9 @@ class DashboardFrame(tk.Frame):
                     _badge_txt = (f"!{_ov_info['late_short']}" if _ov_info.get('late_short')
                                   else (f"!+{_dl}д" if _dl > 0 else "!сьогодні"))
                     _badge = tk.Label(cell, text=_badge_txt, bg=_badge_bg, fg='white',
-                                      font=('Segoe UI', 10, 'bold'), padx=5, pady=1)
+                                      font=('Segoe UI', getattr(self, '_badge_sz', 10), 'bold'), padx=4, pady=0)
                     _badge._is_overdue_badge = True   # щоб оновлення могло його прибрати
-                    _badge.place(relx=1.0, rely=0.0, anchor='ne', x=0, y=0)
+                    _tile_place_badge(self, _badge)
 
             def _on_rf_configure(e):
                 self._grid_canvas.configure(scrollregion=self._grid_canvas.bbox('all'))
@@ -9552,36 +9855,95 @@ class DashboardFrame(tk.Frame):
                     except Exception: pass
             self._rf.bind('<Configure>', _on_rf_configure)
 
-            def _relayout_tiles(width):
-                """Автопідбір: кількість колонок залежить від ширини вікна, колонки
-                однакової ширини (uniform), довгі назви номерів переносяться на 2-й рядок —
-                нічого не обрізається і не наїжджає на бейдж прострочення."""
+            def _relayout_tiles(width, height=None):
+                """Автопідгонка: плитки масштабуються так, щоб УСІ номери вмістились на екрані
+                (без прокрутки), якщо це можливо. Підбираємо кількість колонок, при якій плитка
+                найближча до зручного розміру; розмір шрифту підганяється під розмір плитки.
+                Якщо навіть найменша плитка не влазить — лишається прокрутка."""
+                import math
                 try:
-                    cols = max(1, min(COLS, int(width) // _MINW))
-                    tile_w = max(60, int(width) // cols - 8)
-                    if getattr(self, '_tile_cols', None) == (cols, tile_w):
+                    import tkinter.font as _tkf
+                    N = len(self._tile_order)
+                    if N == 0: return
+                    W = max(240, int(width)); H = int(height or 0)
+                    MIN_TW, MIN_TH, MAX_TH, IDEAL_H = 64, 40, 78, 60
+                    IDEAL_W = 100        # зручна ширина плитки; точна підгонка — за наявним місцем
+                    best = None
+                    for cols_ in range(1, max(1, min(N, W // MIN_TW)) + 1):
+                        rows_ = math.ceil(N / cols_)
+                        tw_ = W / cols_
+                        th_ = (H / rows_) if H > 60 else IDEAL_H
+                        sc = min(tw_ / IDEAL_W, th_ / IDEAL_H)
+                        if best is None or sc > best[0] + 1e-9:
+                            best = (sc, cols_, rows_, tw_, th_)
+                    _, cols, rows, tw_f, th_f = best
+                    tw = int(tw_f); th = int(max(MIN_TH, min(MAX_TH, th_f)))
+                    key_ = (cols, tw, th, N)
+                    if getattr(self, '_tile_cols', None) == key_:
                         return
-                    self._tile_cols = (cols, tile_w)
-                    for ci in range(COLS + 12):
-                        if ci < cols:
-                            self._rf.columnconfigure(ci, weight=1, minsize=0, uniform='tile')
-                        else:
-                            self._rf.columnconfigure(ci, weight=0, minsize=0, uniform='')
+                    self._tile_cols = key_
+                    full = (th >= 58 and tw >= 100)         # «повна» плитка: номер + статус
+                    self._tile_compact = not full
+                    self._badge_sz = 10 if full else (9 if th >= 46 else 8)
+
+                    old_rows = getattr(self, '_tile_rows', 0)
+                    for ci in range(max(cols, getattr(self, '_tile_ncols', 0)) + 1):
+                        self._rf.columnconfigure(ci, weight=1 if ci < cols else 0, minsize=0,
+                                                 uniform='tile' if ci < cols else '')
+                    for ri in range(max(rows, old_rows) + 1):
+                        self._rf.rowconfigure(ri, weight=1 if ri < rows else 0, minsize=0,
+                                              uniform='trow' if ri < rows else '')
+                    self._tile_ncols, self._tile_rows = cols, rows
+                    self._grid_canvas.itemconfig(self._rf_win_id, width=W, height=rows * th)
+
+                    fcache = {}
+                    def _fit(text, wrap_w, avail_h, sizes):
+                        k_ = (text, wrap_w, avail_h, sizes)
+                        if k_ in fcache: return fcache[k_]
+                        res = sizes[-1]
+                        for sz in sizes:
+                            f = _tkf.Font(family='Segoe UI', size=sz, weight='bold')
+                            if _tile_lines_needed(f, text, wrap_w) * f.metrics('linespace') <= avail_h:
+                                res = sz; break
+                        fcache[k_] = res
+                        return res
+
                     for idx, rid_ in enumerate(self._tile_order):
                         ref = self._tile_refs.get(rid_)
                         if not ref: continue
                         cell_, num_, st_ = ref
                         cell_.grid(row=idx // cols, column=idx % cols, padx=3, pady=3, sticky='nsew')
-                        # місце під бейдж «!+4д» праворуч зверху — тому віднімаємо запас
-                        num_.configure(wraplength=max(40, tile_w - 48), justify='center')
+                        cell_.configure(width=max(30, tw - 6), height=max(24, th - 6))
+                        cell_.pack_propagate(False)
+                        txt = num_.cget('text')
+                        num_.pack_forget(); st_.pack_forget()
+                        if full:
+                            st_.configure(font=('Segoe UI', 10, 'bold'), pady=1)
+                            st_.pack(side='bottom', pady=(0, 3))
+                            wrap_w = tw - 6 - 40                        # запас під бейдж угорі праворуч
+                            avail = th - 6 - 22
+                            sz = _fit(txt, wrap_w, avail, (12, 11, 10, 9))
+                            num_.configure(font=('Segoe UI', sz, 'bold'), wraplength=wrap_w,
+                                           justify='center', padx=2, pady=0)
+                            num_.pack(side='top', expand=True)
+                        else:
+                            wrap_w = tw - 10
+                            avail = th - 8 - 12                         # знизу — запас під бейдж
+                            sz = _fit(txt, wrap_w, avail, (11, 10, 9, 8, 7))
+                            num_.configure(font=('Segoe UI', sz, 'bold'), wraplength=wrap_w,
+                                           justify='center', padx=1, pady=0)
+                            num_.pack(side='top', expand=True, fill='both', pady=(0, 8))
+                        for w_ in cell_.winfo_children():
+                            if getattr(w_, '_is_overdue_badge', False):
+                                w_.configure(font=('Segoe UI', self._badge_sz, 'bold'), padx=4, pady=0)
+                                _tile_place_badge(self, w_)
                 except Exception as _e_rl:
                     log_error("Dashboard._relayout_tiles", _e_rl)
             self._relayout_tiles = _relayout_tiles
 
             def _on_canvas_resize(e):
-                # Розтягуємо _rf на повну ширину canvas і перекладаємо плитки під нову ширину
-                self._grid_canvas.itemconfig(self._rf_win_id, width=e.width)
-                _relayout_tiles(e.width)
+                # Підлаштовуємо плитки під поточний розмір області (ширина І висота)
+                _relayout_tiles(e.width, e.height)
             self._grid_canvas.bind('<Configure>', _on_canvas_resize)
 
             # ── Overlay-банер над сіткою плиток (після побудови _rf) ────────
@@ -9665,6 +10027,8 @@ class DashboardFrame(tk.Frame):
                         else:
                             _ref.configure(text=str(val))
                     except Exception: pass
+            try: self._sched_stat_fit()
+            except Exception: pass
             # Оновлюємо плитки номерів
             _overdue_by_room2 = {str(b.get('room_number','')): b for b in self._overdue_list}
             for r in rooms:
@@ -9688,9 +10052,9 @@ class DashboardFrame(tk.Frame):
                             _bt2 = (f"!{_ov2['late_short']}" if _ov2.get('late_short')
                                     else (f"!+{_dl2}д" if _dl2 > 0 else "!сьогодні"))
                             _b2  = tk.Label(cell, text=_bt2, bg=_bb2, fg='white',
-                                            font=('Segoe UI', 10, 'bold'), padx=5, pady=1)
+                                            font=('Segoe UI', getattr(self, '_badge_sz', 10), 'bold'), padx=4, pady=0)
                             _b2._is_overdue_badge = True
-                            _b2.place(relx=1.0, rely=0.0, anchor='ne', x=0, y=0)
+                            _tile_place_badge(self, _b2)
                     except Exception: pass
             # Оновлюємо overlay
             if hasattr(self, '_overdue_tile_overlay'):
@@ -11658,7 +12022,11 @@ def _open_checkout_dlg(parent, bid, on_close=None):
           COALESCE(SUM(CASE WHEN amount>0 AND (note IS NULL OR (
             note NOT LIKE 'Залог%%' AND note NOT LIKE 'deposit%%'
             AND note NOT LIKE 'Повернення залогу%%'
+            AND note NOT LIKE 'Послуга%%' AND note NOT LIKE 'Додаткові послуги при заселенні%%'
           )) THEN amount END), 0) AS paid_no_dep,
+          COALESCE(SUM(CASE WHEN amount>0 AND (note LIKE 'Послуга%%'
+            OR note LIKE 'Додаткові послуги при заселенні%%')
+            THEN amount END), 0) AS svc_paid,
           COALESCE(SUM(CASE WHEN amount>0 AND note LIKE 'Залог%%'
             THEN amount END), 0) AS dep_in,
           COALESCE(ABS(SUM(CASE WHEN amount<0 AND lower(note) LIKE '%%повернення залог%%'
@@ -11676,6 +12044,8 @@ def _open_checkout_dlg(parent, bid, on_close=None):
     paid_total = living_income  # для сумісності нижче
     booked_nights = (b['check_out'] - b['check_in']).days or 1
     price         = float(b.get('price_per_day') or 0)
+    if int(bid) in _free_stay_map([bid]):
+        price = 0.0   # 🎁 безкоштовне проживання — за проживання нічого не нараховується
 
     # Визначаємо чи це погодинний тариф (баня) — по нотатці
     import re as _re
@@ -11705,6 +12075,37 @@ def _open_checkout_dlg(parent, bid, on_close=None):
     living_paid  = living_income
     debt         = max(living_total - living_income, 0)
     overpaid     = max(living_income - living_total, 0)
+
+    # ── Послуги та штрафи бронювання ──────────────────────────────
+    svc_paid = float(_pay_all.get('svc_paid') or 0)
+    try:
+        svc_rows = []
+        for _r in (query(
+            "SELECT COALESCE(sv.name, so.note, '?') AS name, so.quantity AS qty, "
+            "so.price AS price, so.total AS total FROM service_orders so "
+            "LEFT JOIN services sv ON sv.id=so.service_id WHERE so.booking_id=%s "
+            "AND COALESCE(so.note,'') NOT ILIKE 'deposit%%' AND COALESCE(so.note,'') NOT ILIKE 'fine%%' "
+            "ORDER BY so.created_at, so.id", (bid,)) or []):
+            _r = dict(_r)
+            svc_rows.append({'name': _fix_mojibake(str(_r.get('name') or '?')),
+                             'qty': float(_r.get('qty') or 1),
+                             'price': float(_r.get('price') or 0),
+                             'total': float(_r.get('total') or 0)})
+    except Exception as _e_sv:
+        log_error("checkout_services", _e_sv); svc_rows = []
+    svc_total = sum(x['total'] for x in svc_rows)
+    svc_debt  = max(svc_total - svc_paid, 0.0)
+    svc_unpaid_items = _svc_unpaid_items(bid, svc_paid, query) if svc_debt > 0 else []
+    try:
+        fine_rows = []
+        for _r in (query("SELECT note, total FROM service_orders WHERE booking_id=%s "
+                         "AND note LIKE 'fine%%' ORDER BY created_at, id", (bid,)) or []):
+            _r = dict(_r); _pp = (_r.get('note') or '').split(':', 2)
+            fine_rows.append({'reason': (_pp[1].strip() if len(_pp) > 1 else (_r.get('note') or '')),
+                              'total': float(_r.get('total') or 0)})
+    except Exception as _e_fn:
+        log_error("checkout_fines", _e_fn); fine_rows = []
+    fine_total = sum(x['total'] for x in fine_rows)
 
     win  = dlg_win(parent, "🚪 Виселення", "500x680")
     main = ctk.CTkScrollableFrame(win, fg_color=C['bg'])
@@ -11760,7 +12161,8 @@ def _open_checkout_dlg(parent, bid, on_close=None):
     # міг натиснути "Виселити" не помітивши, що сума доплати порожня,
     # і борг просто ніколи не стягувався. Тепер поле одразу підставляє
     # поточний борг (далі число можна вручну змінити/обнулити).
-    e_extra = ent(pf, f"{debt:.0f}" if debt > 0 else "0", w=100); e_extra.pack(side='left', padx=8)
+    _due0 = debt + svc_debt
+    e_extra = ent(pf, f"{_due0:.0f}" if _due0 > 0 else "0", w=100); e_extra.pack(side='left', padx=8)
     lbl(pf, "₴", 11, color=C['text2']).pack(side='left')
     meth_var = ctk.StringVar(value='cash')
     mf = tk.Frame(pay_card, bg=C['card']); mf.pack(fill='x', padx=12, pady=(0,10))
@@ -11786,10 +12188,11 @@ def _open_checkout_dlg(parent, bid, on_close=None):
             _cur_extra = e_extra.get().strip()
         except Exception:
             _cur_extra = None
+        _due = debt + svc_debt
         if _cur_extra == getattr(_refresh_fin, '_auto_val', None):
             e_extra.delete(0, 'end')
-            e_extra.insert(0, f"{debt:.0f}" if debt > 0 else "0")
-        _refresh_fin._auto_val = f"{debt:.0f}" if debt > 0 else "0"
+            e_extra.insert(0, f"{_due:.0f}" if _due > 0 else "0")
+        _refresh_fin._auto_val = f"{_due:.0f}" if _due > 0 else "0"
         _bu_str = f"{booked_units:.1f}" if is_hourly_booking else str(int(booked_units))
         _n_str = f"{n:.1f}" if is_hourly_booking else str(int(n))
         rows_fin = [
@@ -11801,7 +12204,13 @@ def _open_checkout_dlg(parent, bid, on_close=None):
         rows_fin.append(("💵 Оплата при заселенні", f"{living_income - adv_paid:.0f}₴" if living_income > adv_paid else f"{living_income:.0f}₴", C['green']))
         if refund_units > 0:
             rows_fin.append((f"↩️ Повернення за {refund_units:.1f}{unit_label}", f"{refund_amt:.0f}₴", C['yellow']))
-        rows_fin.append(("❗ Борг", f"{debt:.0f}₴", C['red'] if debt > 0 else C['gray']))
+        rows_fin.append(("❗ Борг за проживання", f"{debt:.0f}₴", C['red'] if debt > 0 else C['gray']))
+        if svc_total > 0:
+            rows_fin.append(("🛎 Послуги (замовлено)", f"{svc_total:.0f}₴", C['accent']))
+            rows_fin.append(("   сплачено за послуги", f"{min(svc_paid, svc_total):.0f}₴", C['green']))
+            rows_fin.append(("❗ Борг за послуги", f"{svc_debt:.0f}₴", C['red'] if svc_debt > 0 else C['gray']))
+        if fine_total > 0:
+            rows_fin.append(("⚠️ Штрафи (нараховано)", f"{fine_total:.0f}₴", C['red']))
         if dep_amt > 0:
             rows_fin.append(("🔒 Залог (повернути гостю)", f"{dep_amt:.0f}₴", '#e67e22'))
         for row_lbl, val, clr in rows_fin:
@@ -11829,10 +12238,19 @@ def _open_checkout_dlg(parent, bid, on_close=None):
                   (bid, overdue_amt, meth_var.get(),
                    f'Доплата за прострочення {int(overdue_n)} дн.',
                    get_current_shift_id()), fetch=None)
-        if extra > 0:
+        svc_part = min(max(extra - debt, 0.0), svc_debt) if (svc_debt > 0 and svc_unpaid_items) else 0.0
+        main_extra = extra - svc_part
+        if main_extra > 0.004:
             query("""INSERT INTO payments (booking_id,amount,method,note,shift_id,created_at)
                        VALUES (%s,%s,%s,'Доплата при виселенні',%s,NOW())""",
-                  (bid, extra, meth_var.get(), get_current_shift_id()), fetch=None)
+                  (bid, main_extra, meth_var.get(), get_current_shift_id()), fetch=None)
+        if svc_part > 0.004:
+            _svc_note = "Послуга: " + ", ".join(f"{i['name']} ×{i['qty']:g}" for i in svc_unpaid_items)
+            if svc_part + 0.5 < svc_debt:
+                _svc_note += " (частково)"
+            query("""INSERT INTO payments (booking_id,amount,method,note,shift_id,created_at)
+                       VALUES (%s,%s,%s,%s,%s,NOW())""",
+                  (bid, svc_part, meth_var.get(), _svc_note[:250], get_current_shift_id()), fetch=None)
         # Повернення за незвані ночі (від'ємний платіж)
         if refund_amt > 0:
             query("""INSERT INTO payments (booking_id,amount,method,note,shift_id,created_at)
@@ -11869,6 +12287,23 @@ def _open_checkout_dlg(parent, bid, on_close=None):
         ]
         if extra > 0:
             lines.append(f"  Доплата      : +{extra:.0f}₴")
+        if svc_rows:
+            lines.append(f"{'─'*52}")
+            lines.append("  Додаткові послуги:")
+            for _it in svc_rows:
+                lines.append(f"    {_it['name']}")
+                lines.append(f"      {_it['qty']:g} × {_it['price']:.0f}₴ = {_it['total']:.0f}₴")
+            lines.append(f"  Разом послуги        : {svc_total:.0f}₴")
+            lines.append(f"  Сплачено за послуги  : {min(svc_paid + svc_part, svc_total):.0f}₴")
+            _left = max(svc_total - svc_paid - svc_part, 0)
+            if _left > 0.5:
+                lines.append(f"  Борг за послуги      : {_left:.0f}₴")
+        if fine_rows:
+            lines.append(f"{'─'*52}")
+            lines.append("  Штрафи:")
+            for _fn in fine_rows:
+                lines.append(f"    {_fn['reason']} : {_fn['total']:.0f}₴")
+            lines.append(f"  Разом штрафи         : {fine_total:.0f}₴")
         if refund_amt > 0:
             lines += [
                 f"{'─'*52}",
@@ -11928,6 +12363,9 @@ def _open_checkin_existing(parent, b, room, on_save=None):
     from app.utils.db import query
     from app.modules.logic import get_balance, update_booking_status
     import datetime as _dt
+
+    if _block_if_room_occupied(room['id'], exclude_bid=b['id']):
+        return
 
     bal    = get_balance(b['id'])
     nights = (b['check_out'] - b['check_in']).days
@@ -11992,6 +12430,15 @@ def _open_checkin_existing(parent, b, room, on_save=None):
     except Exception:
         pass
 
+    # 🎁 Безкоштовне проживання (може бути вже позначене раніше)
+    _fs0_c = _free_stay_map([b['id']])
+    fs_card_c = card(sc); fs_card_c.pack(fill='x', padx=12, pady=5)
+    _fs_fr_c, free_var_c, e_free_cm_c = _free_stay_widget(
+        fs_card_c, init_on=(int(b['id']) in _fs0_c),
+        init_comment=_fs0_c.get(int(b['id']), ''),
+        on_change=lambda: _on_free_toggle_c())
+    _fs_fr_c.pack(fill='x', padx=12, pady=10)
+
     # ══ Розрахунок — чітка розбивка ══
     p_card = card(sc); p_card.pack(fill='x', padx=12, pady=5)
     lbl(p_card, "💰  Розрахунок", 13, True).pack(anchor='w', padx=12, pady=(10,5))
@@ -12004,15 +12451,28 @@ def _open_checkin_existing(parent, b, room, on_save=None):
         ctk.CTkLabel(rf, text=value, font=('Segoe UI', size+1, 'bold' if bold else 'normal'),
                      text_color=clr or C['text']).pack(side='right', padx=12)
 
-    _add_row(f"🛏 Вартість ({nights} ніч × {price:.0f}₴)", f"{total:.0f}₴", C['accent'], bold=True, size=13)
     _adv_paid_ex2 = float(bal.get('paid') or 0)
-    if _adv_paid_ex2 > 0:
-        _add_row(f"✅ Вже сплачено (аванс)", f"-{_adv_paid_ex2:.0f}₴", C['yellow'])
-    _debt_display = max(total - _adv_paid_ex2, 0)
-    if _debt_display > 0:
-        _add_row("💸 До сплати за номер:", f"{_debt_display:.0f}₴", C['red'], bold=True, size=13)
-    else:
-        _add_row("✅ Номер повністю сплачений", "0₴", C['green'])
+    _dd = {'v': 0.0}
+    def _render_calc_rows():
+        for _w in pf.winfo_children():
+            _w.destroy()
+        if free_var_c.get():
+            _add_row("🎁 Безкоштовне проживання", "0₴", C['green'], bold=True, size=13)
+            _dd['v'] = 0.0
+            return
+        _add_row(f"🛏 Вартість ({nights} ніч × {price:.0f}₴)", f"{total:.0f}₴", C['accent'], bold=True, size=13)
+        if _adv_paid_ex2 > 0:
+            _add_row(f"✅ Вже сплачено (аванс)", f"-{_adv_paid_ex2:.0f}₴", C['yellow'])
+        _dd['v'] = max(total - _adv_paid_ex2, 0)
+        if _dd['v'] > 0:
+            _add_row("💸 До сплати за номер:", f"{_dd['v']:.0f}₴", C['red'], bold=True, size=13)
+        else:
+            _add_row("✅ Номер повністю сплачений", "0₴", C['green'])
+    _render_calc_rows()
+    def _on_free_toggle_c():
+        _render_calc_rows()
+        try: _upd_razom(); _upd_ch()
+        except Exception: pass
 
     # Залог
     dep_row = tk.Frame(p_card, bg=C['card']); dep_row.pack(fill='x', padx=12, pady=(4,4))
@@ -12043,10 +12503,10 @@ def _open_checkin_existing(parent, b, room, on_save=None):
     def _upd_razom(*_):
         try: _d = float(e_dep.get() or 0)
         except: _d = 0.0
-        _razom = _debt_display + _d
+        _razom = _dd['v'] + _d
         lbl_razom.configure(text=f"{_razom:.0f}₴")
         parts = []
-        if _debt_display > 0: parts.append(f"номер {_debt_display:.0f}₴")
+        if _dd['v'] > 0: parts.append(f"номер {_dd['v']:.0f}₴")
         if _d > 0: parts.append(f"залог {_d:.0f}₴")
         lbl_razom_hint.configure(text=" + ".join(parts) if parts else "")
 
@@ -12084,7 +12544,7 @@ def _open_checkin_existing(parent, b, room, on_save=None):
             try: dep_v = float(e_dep.get() or 0)
             except: dep_v = 0.0
             # РАЗОМ сьогодні = борг за номер + залог
-            nd = _debt_display + dep_v
+            nd = _dd['v'] + dep_v
             _ch_lbl_title.configure(text=f"🪙 Здача (з {nd:.0f}₴):")
             if meth_var.get() != 'cash' or rv <= 0:
                 _ch_lbl.configure(text="—", text_color=C['text2'])
@@ -12102,11 +12562,17 @@ def _open_checkin_existing(parent, b, room, on_save=None):
     meth_var.trace_add('write', _on_meth_ci)
 
     def do_checkin():
+        if _block_if_room_occupied(room['id'], exclude_bid=b['id']): return
         pseries = e_series.get().strip()
         pnum    = e_pnum.get().strip()
         passport_info = _format_doc_info(doc_type_var.get(), pseries, pnum)
         try: dep = float(e_dep.get() or 0)
         except: dep = 0.0
+        _free_on = bool(free_var_c.get())
+        _free_cm = e_free_cm_c.get().strip()
+        if _free_on and not _free_cm:
+            messagebox.showerror("", "Вкажіть коментар до безкоштовного проживання"); return
+        _tot_eff = 0.0 if _free_on else total
 
         # Оновити ім'я/телефон гостя якщо змінено
         new_name  = e_name.get().strip()
@@ -12127,14 +12593,15 @@ def _open_checkin_existing(parent, b, room, on_save=None):
             query("UPDATE bookings SET notes=%s WHERE id=%s", (new_notes, b['id']), fetch=None)
 
         # Встановити/оновити total_amount = сума проживання + залог
-        total_with_dep = total + dep
+        total_with_dep = _tot_eff + dep
         query("UPDATE bookings SET total_amount=%s WHERE id=%s",
               (total_with_dep, b['id']), fetch=None)
+        _save_free_stay(b['id'], _free_on, _free_cm)
 
         # Записати оплату ТІЛЬКИ залишку (total - вже сплачений аванс - інші платежі)
         # bal['paid'] вже включає аванс — НЕ додаємо _adv_paid_ex повторно
         already_paid = float(bal.get('paid') or 0)
-        debt_now = max(total - already_paid, 0)
+        debt_now = max(_tot_eff - already_paid, 0)
         if debt_now > 0:
             query("""INSERT INTO payments (booking_id,amount,method,note,shift_id,created_at)
                       VALUES (%s,%s,%s,'Оплата за проживання при заселенні',%s,NOW())""",
@@ -12171,13 +12638,13 @@ def _open_checkin_existing(parent, b, room, on_save=None):
             f"  Ночей   : {nights}",
             f"  Ціна/ніч: {price:.0f}₴",
             f"{'─'*52}",
-            f"  Проживання : {total:.0f}₴",
+            (f"  Проживання : БЕЗКОШТОВНО ({_free_cm})" if _free_on else f"  Проживання : {total:.0f}₴"),
         ]
         if _adv_paid_ex > 0:
             lines.append(f"  Аванс      : -{_adv_paid_ex:.0f}₴  (сплачено при бронюванні)")
         if debt_now > 0:
             lines.append(f"  До сплати  : {debt_now:.0f}₴")
-        elif already_paid >= total:
+        elif already_paid >= _tot_eff and not _free_on:
             lines.append(f"  ✅ Проживання повністю сплачено")
         if dep > 0:
             lines += [
@@ -12676,6 +13143,9 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
     from app.modules.logic import get_rooms
     import datetime as _dt
 
+    if _block_if_room_occupied(room['id']):
+        return
+
     win = dlg_win(parent, "✅ Заселення", "500x640")
     main = tk.Frame(win, bg=C['bg']); main.pack(fill='both', expand=True)
     canvas_ = tk.Canvas(main, bg=C['bg'], highlightthickness=0)
@@ -12737,6 +13207,10 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
     lbl(df,"Дорослих:",11,color=C['text2']).grid(row=2,column=0,sticky='w',pady=3)
     e_adults = ent(df, w=60); e_adults.insert(0,'1'); e_adults.grid(row=2,column=1,padx=8,pady=3,sticky='w')
 
+    # 🎁 Безкоштовне проживання (вміст створюється нижче)
+    fs_card_n = card(sc); fs_card_n.pack(fill='x', padx=12, pady=5)
+    lbl(fs_card_n, "🎁  Безкоштовне проживання", 13, True).pack(anchor='w', padx=12, pady=(10,0))
+
     # Оплата
     p_card = card(sc); p_card.pack(fill='x', padx=12, pady=5)
     lbl(p_card, "💰  Розрахунок", 13, True).pack(anchor='w', padx=12, pady=(10,5))
@@ -12786,19 +13260,26 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
 
     lbl(pf,"Сума за номер:",12).grid(row=1,column=0,sticky='w',pady=4)
     lbl_total = lbl(pf, "", 13, True, C['green']); lbl_total.grid(row=1,column=1,padx=15,pady=4,sticky='w')
+    _free_ref = {}
+    def _is_free_now():
+        try: return bool(_free_ref['var'].get())
+        except Exception: return False
     def _update_total(*a):
         try:
             ci = date.fromisoformat(e_in.get().strip())
             co = date.fromisoformat(e_out.get().strip())
             n = max((co-ci).days, 1)
-            base = default_price * n
+            base = 0.0 if _is_free_now() else default_price * n
             try:
                 svc_total = sum(float(sv.get('total', 0)) for sv in _get_room_svcs())
             except (NameError, Exception):
                 svc_total = 0.0
             grand = base + svc_total
             svc_str = f" + {svc_total:.0f}₴ послуги" if svc_total > 0 else ""
-            lbl_total.configure(text=f"{grand:.0f}₴  ({n} ніч × {default_price:.0f}₴{svc_str})")
+            if _is_free_now():
+                lbl_total.configure(text=f"{grand:.0f}₴  (🎁 проживання безкоштовне{svc_str})")
+            else:
+                lbl_total.configure(text=f"{grand:.0f}₴  ({n} ніч × {default_price:.0f}₴{svc_str})")
         except: lbl_total.configure(text="?")
     _update_total()
     e_in.bind('<FocusOut>', _update_total); e_out.bind('<FocusOut>', _update_total)
@@ -12859,6 +13340,7 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
         except Exception: _dep = 0.0
         try: _disc = max(float(e_discount.get() or 0), 0.0)
         except Exception: _disc = 0.0
+        if _is_free_now(): _disc = 0.0
         _n = _get_nights_now()
         _room_sum = max(_room_sum - _disc * _n, 0.0)
         return _room_sum, _dep, _room_sum + _dep
@@ -12962,6 +13444,12 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
             _disc_hint.configure(text="")
     e_discount.bind('<KeyRelease>', lambda e: (_upd_disc_hint(), _upd_razom_new(), _upd_chg()))
 
+    # ── 🎁 Безкоштовне проживання ───────────────────────────────────────
+    _fs_fr_n, free_var_n, e_free_cm_n = _free_stay_widget(
+        fs_card_n, on_change=lambda: (_update_total(), _upd_razom_new(), _upd_chg()))
+    _fs_fr_n.pack(fill='x', padx=12, pady=(6,10))
+    _free_ref['var'] = free_var_n
+
     # ── Додаткові послуги ───────────────────────────────────────────────
     _get_room_svcs = _build_services_block(sc, ['restaurant','minibar','other'],
                                            "🛎 Додаткові послуги до номера",
@@ -12983,6 +13471,7 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
 
     def do_checkin():
         from app.modules.logic import update_booking_status
+        if _block_if_room_occupied(room['id']): return
         name  = e_name.get().strip()
         phone = e_phone.get().strip()
         pseries = e_pass_series.get().strip()
@@ -13004,6 +13493,12 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
         discount_comment = e_discount_comment.get().strip()
         if discount > 0 and not discount_comment:
             messagebox.showerror("", "Вкажіть коментар (причину) знижки"); return
+        _free_on = bool(free_var_n.get())
+        _free_cm = e_free_cm_n.get().strip()
+        if _free_on and not _free_cm:
+            messagebox.showerror("", "Вкажіть коментар до безкоштовного проживання"); return
+        if _free_on:
+            total = 0.0; discount = 0.0; discount_comment = ''
 
         # Створити/знайти гостя
         passport_info = _format_doc_info(doc_type_var.get(), pseries, pnum)
@@ -13021,6 +13516,8 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
         # Знижка діє за кожну добу проживання (на весь період), а не одноразово:
         # якщо знижка == ціні/добу, проживання повністю безкоштовне, без боргу.
         room_total_amt = max(price * nights_cnt - discount * nights_cnt, 0)
+        if _free_on:
+            room_total_amt = 0.0   # 🎁 безкоштовне проживання
         _disc_note = f"Знижка: {discount:.0f}₴ ({discount_comment})  " if discount > 0 else ""
         query("""INSERT INTO bookings
                   (guest_id, room_id, check_in, check_out, price_per_day,
@@ -13036,10 +13533,13 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
         bid = b_row['id']
         _mark_booking_event_time(bid, 'заселення')
 
-        # Оплата повної суми
-        query("""INSERT INTO payments (booking_id, amount, method, note, shift_id, created_at)
-                  VALUES (%s,%s,%s,'Оплата при заселенні',%s,NOW())""",
-              (bid, room_total_amt, meth_var.get(), get_current_shift_id()), fetch=None)
+        _save_free_stay(bid, _free_on, _free_cm)
+
+        # Оплата повної суми (для безкоштовного проживання платежу немає)
+        if not _free_on:
+            query("""INSERT INTO payments (booking_id, amount, method, note, shift_id, created_at)
+                      VALUES (%s,%s,%s,'Оплата при заселенні',%s,NOW())""",
+                  (bid, room_total_amt, meth_var.get(), get_current_shift_id()), fetch=None)
 
         # Залог
         if dep > 0:
@@ -13103,7 +13603,7 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
             f"  Виїзд   : {co}",
             f"  Ночей   : {nights}",
             f"  Ціна/ніч: {price:.0f}₴",
-            f"  Проживання: {total:.0f}₴",
+            (f"  Проживання: БЕЗКОШТОВНО ({_free_cm})" if _free_on else f"  Проживання: {total:.0f}₴"),
         ]
         if _svcs_sel:
             lines.append(f"{'─'*52}")
@@ -13297,7 +13797,7 @@ class TodayDeparturesFrame(tk.Frame):
                 cur.execute("""
                     SELECT b.id, r.number as room_number, COALESCE(g.name,'') as guest_name,
                            g.phone, b.check_in, b.check_out,
-                           GREATEST(
+                           CASE WHEN COALESCE(b.free_stay, FALSE) THEN 0 ELSE GREATEST(
                                (COALESCE(NULLIF(b.total_amount,0), b.price_per_day * GREATEST(b.check_out - b.check_in, 1))
                                 + CASE
                                     WHEN b.status='checkedin'
@@ -13309,7 +13809,7 @@ class TodayDeparturesFrame(tk.Frame):
                                SELECT SUM(p.amount) FROM payments p
                                WHERE p.booking_id = b.id AND p.amount > 0
                                  AND (p.note IS NULL OR p.note NOT LIKE 'Залог%%%%')
-                           ), 0), 0) AS debt
+                           ), 0), 0) END AS debt
                     FROM bookings b
                     JOIN rooms r ON r.id = b.room_id
                     LEFT JOIN guests g ON g.id = b.guest_id
@@ -14070,7 +14570,7 @@ class ChessFrame(tk.Frame):
 
     def _booking_action_dlg(self, b):
         """Клік на існуюче бронювання — дії."""
-        win = dlg_win(self, f"Бронювання #{b['id']}", "400x320")
+        win = dlg_win(self, f"Бронювання #{b['id']}", "400x440" if b.get('status') == 'checkedin' else "400x320")
         scroll = ctk.CTkScrollableFrame(win, fg_color=C['bg'])
         scroll.pack(fill='both', expand=True, padx=10, pady=10)
         f = card(scroll); f.pack(fill='x', pady=5)
@@ -14108,6 +14608,22 @@ class ChessFrame(tk.Frame):
             win.destroy()
         btn(r_co, "🚪 Виселити", do_checkout_from_chess,
             C['yellow'], 360, height=40).pack(fill='x', padx=5)
+        if b.get('status') == 'checkedin':
+            r_ex = ctk.CTkFrame(scroll, fg_color='transparent'); r_ex.pack(fill='x', pady=2)
+            def do_extend_from_chess():
+                win.destroy()
+                _cn_x = (b.get('cat_name') or '').lower()
+                if any(k in _cn_x for k in ['баня','бані','sauna']):
+                    _rm_x = _get_room_by_id(b['room_id']) or {}
+                    _open_extend_sauna_dlg(self, b['id'], _rm_x, self._redraw)
+                else:
+                    _open_extend_room_dlg(self, b['id'], self._redraw)
+            btn(r_ex, "📅 Продовжити", do_extend_from_chess,
+                C['green'], 360, height=40).pack(fill='x', padx=5)
+            r_rl = ctk.CTkFrame(scroll, fg_color='transparent'); r_rl.pack(fill='x', pady=2)
+            btn(r_rl, "🔁 Переселити",
+                lambda: (win.destroy(), _open_relocate_dlg(self, b['id'], self._redraw, self.user)),
+                '#16a085', 360, height=40).pack(fill='x', padx=5)
         # Скасувати — без залогу
         r_ca = ctk.CTkFrame(scroll, fg_color='transparent'); r_ca.pack(fill='x', pady=2)
         btn(r_ca, "❌ Скасувати", lambda: action('cancelled'), C['red'], 360, height=40).pack(fill='x', padx=5)
@@ -14248,10 +14764,22 @@ class ChessFrame(tk.Frame):
             ]
         if active_bid is not None:
             _bid_ref = active_bid
+            def _extend_from_form():
+                win.destroy()
+                if _is_hourly:
+                    _open_extend_sauna_dlg(self, _bid_ref, room, self._redraw)
+                else:
+                    _open_extend_room_dlg(self, _bid_ref, self._redraw)
             actions.append((
                 "🚪 Виселити",
                 lambda: (win.destroy(), _open_checkout_dlg(self, _bid_ref, self._redraw)),
                 C['yellow']
+            ))
+            actions.append(("📅 Продовжити", _extend_from_form, C['green']))
+            actions.append((
+                "🔁 Переселити",
+                lambda: (win.destroy(), _open_relocate_dlg(self, _bid_ref, self._redraw, self.user)),
+                '#16a085'
             ))
         actions.append(("✖ Скасувати", win.destroy, C['red']))
 
@@ -14262,6 +14790,144 @@ class ChessFrame(tk.Frame):
 # ══════════════════════════════════════════════════════
 # БРОНЮВАННЯ
 # ══════════════════════════════════════════════════════
+def _ensure_booking_moves_table():
+    try:
+        from app.utils.db import query as _qm
+        _qm("""CREATE TABLE IF NOT EXISTS booking_moves (
+                 id SERIAL PRIMARY KEY,
+                 booking_id INTEGER NOT NULL,
+                 from_room_id INTEGER, from_room_number TEXT,
+                 to_room_id INTEGER,   to_room_number TEXT,
+                 reason TEXT, moved_by TEXT, shift_id INTEGER,
+                 moved_at TIMESTAMP DEFAULT NOW())""", fetch=None)
+    except Exception as _e:
+        log_error("booking_moves_table", _e)
+
+
+def _open_relocate_dlg(parent, bid, on_done=None, user=None):
+    """Переселення гостя в інший номер (форс-мажор). Оплати, ціна й дати
+    лишаються без змін — змінюється тільки номер. Факт фіксується в журналі
+    booking_moves (звіт «Переселення») і в нотатках бронювання."""
+    from app.utils.db import query
+    from app.modules.logic import get_booking
+    import datetime as _dt
+    b = get_booking(bid)
+    if not b:
+        messagebox.showerror("", "Бронювання не знайдено"); return
+    if (b.get('status') or 'checkedin') != 'checkedin':
+        messagebox.showwarning("", "Переселити можна лише заселеного гостя"); return
+    _ensure_booking_moves_table()
+    old_rid = b['room_id']; old_num = str(b.get('room_number', old_rid))
+
+    # Вільні номери беремо з get_rooms() — так само, як дашборд/шахматка
+    # (працює і онлайн, і в офлайн-режимі). Далі відсікаємо ті, що мають
+    # активне бронювання, яке перетинається з датами проживання гостя.
+    from app.modules.logic import get_rooms
+    try:
+        _rooms_all = get_rooms() or []
+    except Exception as _e:
+        log_error("relocate_get_rooms", _e); _rooms_all = []
+    _busy = set()
+    try:
+        for x in (query(
+                "SELECT DISTINCT room_id FROM bookings WHERE room_id IS NOT NULL "
+                "AND status IN ('checkedin','confirmed') AND id<>%s "
+                "AND check_in < %s AND check_out > CURRENT_DATE", (bid, b['check_out'])) or []):
+            _busy.add(int(dict(x).get('room_id')))
+    except Exception as _e:
+        log_error("relocate_busy", _e)
+    items = []
+    for r in _rooms_all:
+        r = dict(r)
+        try: rid = int(r['id'])
+        except Exception: continue
+        st = r.get('status') or 'free'
+        if rid == int(old_rid) or st not in ('free', 'cleaning') or rid in _busy:
+            continue
+        cat = _fix_mojibake(str(r.get('cat_name') or r.get('category') or 'Номери'))
+        items.append({'id': rid, 'name': f"№{r.get('number')}  ·  {cat}  ·  " + ('прибирання' if st == 'cleaning' else 'вільний'),
+                      'number': str(r.get('number')), 'category': cat, 'price': 0})
+    try:
+        items.sort(key=lambda x: (0, int(''.join(ch for ch in x['number'] if ch.isdigit()) or 0), x['number']))
+    except Exception:
+        pass
+    if not items:
+        messagebox.showinfo("Переселення", "Немає вільних номерів для переселення."); return
+
+    win = dlg_win(parent, "🔁 Переселення", "480x520")
+    sc = ctk.CTkScrollableFrame(win, fg_color=C['bg']); sc.pack(fill='both', expand=True, padx=10, pady=10)
+    h = card(sc); h.pack(fill='x', pady=5)
+    lbl(h, f"🔁  Переселення — №{old_num}", 15, True, C['accent']).pack(anchor='w', padx=12, pady=(10,3))
+    lbl(h, f"👤 {b.get('guest_name','')}   📅 {b['check_in']} → {b['check_out']}", 11,
+        color=C['text2']).pack(anchor='w', padx=12, pady=(0,4))
+    lbl(h, "Оплати, ціна й дати залишаються без змін — змінюється лише номер.", 10,
+        color=C['text2']).pack(anchor='w', padx=12, pady=(0,10))
+
+    f1 = card(sc); f1.pack(fill='x', pady=4)
+    lbl(f1, "🛏 Новий номер:", 12, True).pack(anchor='w', padx=12, pady=(8,3))
+    new_var = ctk.StringVar(value='')
+    by_name = {i['name']: i for i in items}
+    ServicePicker(f1, [dict(i, category=i['category']) for i in items], variable=new_var, width=420,
+                  show_cat_filter=True, placeholder='🔍 Оберіть вільний номер…',
+                  show_price=False).pack(padx=12, pady=(0,10))
+
+    f2 = card(sc); f2.pack(fill='x', pady=4)
+    lbl(f2, "📝 Причина (форс-мажор):", 12, True).pack(anchor='w', padx=12, pady=(8,3))
+    e_reason = ent(f2, "Наприклад: прорвало трубу, немає світла…", w=420)
+    e_reason.pack(padx=12, pady=(0,10))
+
+    def _do():
+        nm = new_var.get().strip()
+        it = by_name.get(nm)
+        if not it:
+            # ServicePicker чистить назви від кракозябр — шукаємо без урахування цього
+            it = next((i for i in items if _fix_mojibake(i['name']) == nm), None)
+        if not it:
+            messagebox.showerror("", "Оберіть новий номер"); return
+        reason = e_reason.get().strip()
+        if reason.startswith("Наприклад"): reason = ""
+        if not messagebox.askyesno("Переселити?",
+                f"Переселити {b.get('guest_name','')}\nз №{old_num} у №{it['number']}?"):
+            return
+        try:
+            who = (user or {}).get('full_name') or (user or {}).get('username') or ''
+            sid = None
+            try: sid = get_current_shift_id()
+            except Exception: pass
+            now = _dt.datetime.now()
+            # перевірка що номер досі вільний
+            _chk = query("SELECT COALESCE(status,'free') AS st FROM rooms WHERE id=%s", (it['id'],), fetch='one') or {}
+            if _chk.get('st') not in ('free', 'cleaning'):
+                messagebox.showerror("", "Цей номер уже зайнятий. Оберіть інший."); return
+            query("UPDATE bookings SET room_id=%s WHERE id=%s", (it['id'], bid), fetch=None)
+            query("UPDATE rooms SET status='occupied' WHERE id=%s", (it['id'],), fetch=None)
+            query("UPDATE rooms SET status='cleaning' WHERE id=%s", (old_rid,), fetch=None)
+            query("INSERT INTO booking_moves(booking_id,from_room_id,from_room_number,to_room_id,"
+                  "to_room_number,reason,moved_by,shift_id,moved_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,NOW())",
+                  (bid, old_rid, old_num, it['id'], it['number'], reason or None, who or None, sid), fetch=None)
+            # позначка в нотатках бронювання
+            try:
+                _r = query("SELECT notes FROM bookings WHERE id=%s", (bid,), fetch='one') or {}
+                _n = (_r.get('notes') or '').strip()
+                _n = (_n + '  ' if _n else '') + f"Переселення: №{old_num}→№{it['number']} [{now.strftime('%Y-%m-%d %H:%M')}]"
+                query("UPDATE bookings SET notes=%s WHERE id=%s", (_n, bid), fetch=None)
+            except Exception as _en:
+                log_error("relocate_notes", _en)
+            try: _invalidate_rooms_cache()
+            except Exception: pass
+            log_info(f"[Переселення] бронювання #{bid}: №{old_num} → №{it['number']} ({reason}) {who}")
+        except Exception as _e:
+            log_error("relocate", _e)
+            messagebox.showerror("Помилка", str(_e)); return
+        messagebox.showinfo("✅", f"Гостя переселено: №{old_num} → №{it['number']}")
+        win.destroy()
+        if on_done: on_done()
+
+    bf = tk.Frame(win, bg=C['bg']); bf.pack(fill='x', padx=10, pady=8)
+    btn(bf, "🔁 Переселити", _do, C['accent'], 170, height=40).pack(side='left', padx=8)
+    btn(bf, "✖ Скасувати", win.destroy, C['card2'], 110, height=40).pack(side='left')
+
+
 class CheckedinFrame(tk.Frame):
     """Вкладка заселених гостей — тільки checkedin."""
     def __init__(self, parent, user):
@@ -14288,6 +14954,30 @@ class CheckedinFrame(tk.Frame):
         self.e_srch=ent(flt,"Гість або номер кімнати",w=240)
         self.e_srch.pack(side='left',pady=8)
         self.e_srch.bind('<Return>',lambda e:self._load())
+
+        # ── Фільтр за період (з — по) та за номером ──
+        import datetime as _dtf
+        lbl(flt,"Період:",11,color=C['text2']).pack(side='left',padx=(18,4),pady=8)
+        self.f_from = DateField(flt, width=100, on_change=self._on_period_change); self.f_from.pack(side='left',pady=8)
+        lbl(flt,"—",11,color=C['text2']).pack(side='left',padx=4)
+        self.f_to = DateField(flt, width=100, on_change=self._on_period_change); self.f_to.pack(side='left',pady=8)
+        self.f_from.set_date(_dtf.date.today()); self.f_to.set_date(_dtf.date.today())
+        self.f_from.bind('<FocusOut>', lambda e=None: self._on_period_change())
+        self.f_to.bind('<FocusOut>', lambda e=None: self._on_period_change())
+        btn(flt,"Сьогодні",self._period_today,C['card2'],80,height=28).pack(side='left',padx=(8,2))
+        btn(flt,"Усі зміни",self._period_all,C['card2'],85,height=28).pack(side='left',padx=2)
+        lbl(flt,"Тип:",11,color=C['text2']).pack(side='left',padx=(18,4))
+        self.type_var = ctk.StringVar(value="Усі")
+        self.type_menu = ctk.CTkOptionMenu(
+            flt, values=["Усі","Бесідки та Альтанки","Номери","Золоті","Рожеві"],
+            variable=self.type_var, width=170, fg_color=C['card2'], button_color=C['accent'],
+            command=self._on_type_change)
+        self.type_menu.pack(side='left',pady=8)
+        lbl(flt,"Номер:",11,color=C['text2']).pack(side='left',padx=(14,4))
+        self.room_var = ctk.StringVar(value="Усі")
+        self.room_menu = ctk.CTkOptionMenu(flt, values=["Усі"], variable=self.room_var, width=130,
+                                           command=lambda v: self._load())
+        self.room_menu.pack(side='left',pady=8)
 
         cols=('id','room','guest','phone','cin','cout','n','price','discount','adv','dopla','dep','sплачено','debt',
               'category','notes','email','booked_at','ext')
@@ -14346,6 +15036,7 @@ class CheckedinFrame(tk.Frame):
             ("📅 Продовжити",  self._extend,    C['green']),
             ("💰 Оплата",      self._pay,        C['accent']),
             ("📋 Деталі",      self._open,       C['card2']),
+            ("🔁 Переселити",  self._relocate,   '#16a085'),
         ]
         if self.user.get('role') in ('admin', 'manager'):
             _btns.append(("✏️ Редагувати заселення", self._edit_checkin, '#9b59b6'))
@@ -14361,11 +15052,57 @@ class CheckedinFrame(tk.Frame):
     def _on_layout_applied(self):
         apply_table_layout(self.tree, 'checkedin', self._all_fields)
 
+    # ── Фільтри: період і номер ──
+    def _on_period_change(self, *a):
+        try:
+            df, dt_ = self.f_from.date_value(), self.f_to.date_value()
+            if df and dt_ and dt_ < df:
+                self.f_to.set_date(df)
+                dt_ = df
+            if (df, dt_) == getattr(self, '_last_period', None):
+                return   # період не змінився — зайвий перезапис не потрібен
+        except Exception:
+            pass
+        self._load()
+
+    def _period_today(self):
+        import datetime as _dtf
+        self.f_from.set_date(_dtf.date.today()); self.f_to.set_date(_dtf.date.today())
+        self._load()
+
+    def _on_type_change(self, value):
+        # Змінили тип — скидаємо вибраний номер (його може не бути в новому типі)
+        self.room_var.set("Усі")
+        self._load()
+
+    def _period_all(self):
+        self.f_from.delete(); self.f_to.delete()
+        self.type_var.set("Усі")
+        self.room_var.set("Усі")
+        self._load()
+
+    def _refresh_room_menu(self, rooms):
+        try:
+            cur = self.room_var.get()
+            vals = ["Усі"] + [str(x) for x in rooms]
+            if cur not in vals:
+                vals.append(cur)
+            self.room_menu.configure(values=vals)
+        except Exception:
+            pass
+
     def _load(self):
         import threading
         if getattr(self, '_loading_in_progress', False):
             return
         self._loading_in_progress = True
+        # Знімаємо стан фільтрів у головному потоці (Tk) і передаємо у фоновий
+        try:
+            self._flt = {'d_from': self.f_from.date_value(), 'd_to': self.f_to.date_value(),
+                         'room': self.room_var.get(), 'type': self.type_var.get()}
+            self._last_period = (self._flt['d_from'], self._flt['d_to'])
+        except Exception:
+            self._flt = {}
         threading.Thread(target=self._load_bg, daemon=True).start()
 
     def _load_bg(self):
@@ -14465,6 +15202,7 @@ class CheckedinFrame(tk.Frame):
                     log_error("CheckedinFrame ext payments", _e_ext)
                     ext_map = {}
             rows = []
+            _free_map_ci = _free_stay_map([b['id'] for b in data])
             for b in data:
                 bid_int = int(b['id'])
                 n = (b['check_out'] - b['check_in']).days
@@ -14524,6 +15262,8 @@ class CheckedinFrame(tk.Frame):
                 total_live = total_live_base
                 paid_live  = adv + paid_dopla
                 debt       = max(total_live - paid_live, 0)
+                if bid_int in _free_map_ci:
+                    debt = 0.0   # 🎁 безкоштовне проживання
                 adv_str    = f"{adv:.0f}₴"       if adv > 0       else "—"
                 dopla_str  = f"{paid_dopla:.0f}₴" if paid_dopla > 0 else "—"
                 dep_str    = f"{dep:.0f}₴"       if dep > 0       else "—"
@@ -14575,19 +15315,32 @@ class CheckedinFrame(tk.Frame):
                 discount_str = f"{discount_total:.0f}₴" if discount_total > 0 else "—"
                 _ext = ext_map.get(bid_int)
                 _ext_txt = ''
-                _group_ts = b.get('created_at')
+                _ext_at = None
+                # Групуємо за ФАКТИЧНИМ часом заселення (а не за створенням броні чи
+                # продовженням) — давні, ще не виселені гості лишаються у своїй зміні
+                # і не тягнуться в активну.
+                _group_ts = _to_naive_dt(_ci_raw) or b.get('created_at')
                 if _ext:
                     _at = _to_naive_dt(_ext['at'])
+                    _ext_at = _at
                     _at_s = _at.strftime('%d.%m %H:%M') if _at else ''
                     _ext_txt = f"🔄 Продовжено проживання +{_ext['amount']:.0f}₴"
                     if _ext['period']:
                         _ext_txt += f" ({_ext['period']})"
                     if _at_s:
                         _ext_txt += f" · {_at_s}"
-                    # групуємо за часом продовження, якщо воно пізніше за заселення
-                    _c0 = _to_naive_dt(b.get('created_at'))
-                    if _at and (not _c0 or _at > _c0):
+                    # Продовжене проживання «піднімається» у зміну, де його продовжили
+                    # (щоб адміністратор бачив його в поточній зміні) — але лише для
+                    # недавніх заселень. Давні (довше _LONG_STAY_DAYS діб), що живуть
+                    # місяцями, лишаються у своїй зміні і не тягнуться в активну.
+                    _LONG_STAY_DAYS = 7
+                    _ci0 = _to_naive_dt(_ci_raw)
+                    if _at and (not _ci0 or (_at > _ci0 and (_at - _ci0).days < _LONG_STAY_DAYS)):
                         _group_ts = _at
+                if bid_int in _free_map_ci:
+                    _fr_txt = ("🎁 Безкоштовне відвідування" if (_is_visit_cat(b.get('cat_name')) or 'баня:' in str(b.get('notes') or '').lower())
+                               else "🎁 Безкоштовне проживання") + (f": {_free_map_ci[bid_int]}" if _free_map_ci[bid_int] else "")
+                    _ext_txt = _fr_txt + (" · " + _ext_txt if _ext_txt else "")
                 rows.append({
                     'vals': (b['id'], b['room_number'], b.get('guest_name', ''),
                              b.get('guest_phone', ''), _cin_display, _cout_display,
@@ -14600,7 +15353,10 @@ class CheckedinFrame(tk.Frame):
                              _ext_txt),
                     'debt': debt > 0,
                     'room_number': b['room_number'],
+                    'cat_name': (b.get('cat_name') or b.get('room_category') or ''),
                     'created_at': _group_ts,
+                    'ci_ts': _to_naive_dt(_ci_raw) or _to_naive_dt(b.get('created_at')),
+                    'ext_ts': _ext_at,
                 })
 
             # ── Групування: свіжі заселення поточної зміни — завжди зверху,
@@ -14618,27 +15374,86 @@ class CheckedinFrame(tk.Frame):
                 m = _re_rn.match(r'\s*(\d+)', s)
                 return (cat, int(m.group(1)) if m else 10**9, s)
 
+            # ── Фільтри: номер і період (з — по) ──
+            _flt = getattr(self, '_flt', None) or {}
+            _d_from, _d_to = _flt.get('d_from'), _flt.get('d_to')
+            if _d_from and not _d_to: _d_to = _d_from
+            if _d_to and not _d_from: _d_from = _d_to
+            if _d_from and _d_to and _d_from > _d_to: _d_from, _d_to = _d_to, _d_from
+            _period_on = bool(_d_from and _d_to)
+            _type_sel = _flt.get('type') or 'Усі'
+            if _type_sel != 'Усі':
+                rows = [r for r in rows if ChessFrame._room_matches_filter(
+                            {'number': r['room_number'], 'cat_name': r.get('cat_name')}, _type_sel)]
+            _all_rooms = sorted({str(r['room_number']) for r in rows}, key=_room_sort_key)
+            _room_sel = _flt.get('room') or 'Усі'
+            if _room_sel != 'Усі':
+                rows = [r for r in rows if str(r['room_number']) == _room_sel]
+
+            def _overlaps(o_d, c_d):
+                """Чи перетинається зміна [o_d, c_d] з обраним періодом."""
+                if not _period_on: return True
+                if o_d is None: return False
+                c_d = c_d or o_d
+                return o_d <= _d_to and c_d >= _d_from
+
+            _grp_failed = False
             groups = []
             try:
                 session_start = _to_naive_dt(get_session_start())
-                cur_rows, past_rows = [], []
-                for r in rows:
-                    ca = _to_naive_dt(r.get('created_at'))
-                    if session_start and ca and ca >= session_start:
-                        cur_rows.append(r)
-                    else:
-                        past_rows.append(r)
+                # Усі, хто ще заселений, показуються в ПОТОЧНІЙ зміні (переходять у
+                # нову при її відкритті) І ЗАЛИШАЮТЬСЯ в тих змінах, де їх заселили
+                # (і де продовжили) — у старих групах це копії того ж запису.
+                cur_rows = list(rows)
+                past_rows = rows
 
                 cur_rows.sort(key=lambda r: _room_sort_key(r['room_number']))
-                if cur_rows:
-                    groups.append((None, cur_rows))
+                # Заголовок поточної (відкритої) зміни — «чия зміна відкрита»
+                _cur_shift_id = None
+                _cur_hdr = None
+                _cs = None
+                try:
+                    from app.utils.db import query as _qCur
+                    _cur_shift_id = get_current_shift_id()
+                    _cs = (_qCur("SELECT id, full_name, username, opened_at FROM shifts WHERE id=%s",
+                                 (_cur_shift_id,), fetch='one') if _cur_shift_id else None)
+                    if _cs:
+                        _coa = _to_naive_dt(_cs.get('opened_at'))
+                        _coa_s = _coa.strftime('%d.%m.%Y') if hasattr(_coa, 'strftime') else str(_cs.get('opened_at'))[:10]
+                        _cname = _cs.get('full_name') or _cs.get('username') or '—'
+                        _cur_hdr = (_coa_s, f"Зміна: {_cname}", 'open', "🟢 ВІДКРИТА")
+                except Exception as _e_ch:
+                    log_error("CheckedinFrame cur shift header", _e_ch)
+                import datetime as _dtc
+                _cur_open_d = None
+                try:
+                    if _cs and _to_naive_dt(_cs.get('opened_at')):
+                        _cur_open_d = _to_naive_dt(_cs.get('opened_at')).date()
+                except Exception: pass
+                if _cur_open_d is None and session_start:
+                    _cur_open_d = session_start.date()
+                if _cur_open_d is None:
+                    _cur_open_d = _dtc.date.today()
+                # поточна зміна триває від відкриття до сьогодні
+                if cur_rows and _overlaps(_cur_open_d, _dtc.date.today()):
+                    groups.append((_cur_hdr, cur_rows))
 
                 if past_rows:
                     try:
                         from app.utils.db import query as _qSh2
-                        all_shifts = _qSh2("SELECT id, full_name, username, opened_at FROM shifts ORDER BY opened_at DESC") or []
+                        try:
+                            all_shifts = _qSh2("SELECT id, full_name, username, opened_at, closed_at FROM shifts ORDER BY opened_at DESC") or []
+                        except Exception:
+                            all_shifts = _qSh2("SELECT id, full_name, username, opened_at FROM shifts ORDER BY opened_at DESC") or []
                         for _sh in all_shifts:
                             _sh['opened_at'] = _to_naive_dt(_sh.get('opened_at'))
+                        # кінець зміни: closed_at, а якщо нема — відкриття наступної зміни
+                        for _i_sh, _sh in enumerate(all_shifts):
+                            _ca = _to_naive_dt(_sh.get('closed_at')) if _sh.get('closed_at') else None
+                            if not _ca and _i_sh > 0:
+                                _ca = all_shifts[_i_sh - 1].get('opened_at')
+                            _sh['_open_d'] = _sh['opened_at'].date() if _sh.get('opened_at') else None
+                            _sh['_close_d'] = _ca.date() if _ca else None
                     except Exception:
                         all_shifts = []
 
@@ -14651,10 +15466,21 @@ class CheckedinFrame(tk.Frame):
 
                     buckets = {}  # shift_id_or_None -> {'shift':sh,'rows':[...]}
                     for r in past_rows:
-                        sh = _find_shift(_to_naive_dt(r.get('created_at')))
-                        key = sh['id'] if sh else None
-                        buckets.setdefault(key, {'shift': sh, 'rows': []})
-                        buckets[key]['rows'].append(r)
+                        _seen_keys = set()
+                        for _ts in (r.get('ci_ts'), r.get('ext_ts')):
+                            if not _ts:
+                                continue
+                            if session_start and _ts >= session_start:
+                                continue   # це поточна зміна — запис і так угорі
+                            sh = _find_shift(_ts)
+                            key = sh['id'] if sh else None
+                            if key in _seen_keys:
+                                continue
+                            _seen_keys.add(key)
+                            _r2 = dict(r)
+                            _r2['iid'] = f"{r['vals'][0]}__s{key}"
+                            buckets.setdefault(key, {'shift': sh, 'rows': []})
+                            buckets[key]['rows'].append(_r2)
 
                     def _bucket_sort_key(item):
                         sh = item[1]['shift']
@@ -14666,26 +15492,36 @@ class CheckedinFrame(tk.Frame):
                     for key, b_ in sorted(buckets.items(), key=_bucket_sort_key, reverse=True):
                         b_['rows'].sort(key=lambda r: _room_sort_key(r['room_number']))
                         sh = b_['shift']
+                        if _period_on:
+                            if not sh or not _overlaps(sh.get('_open_d'), sh.get('_close_d')):
+                                continue   # зміна поза обраним періодом
                         if sh:
                             _oa = sh.get('opened_at')
                             _oa_s = _oa.strftime('%d.%m.%Y') if hasattr(_oa, 'strftime') else str(_oa)[:10]
                             _name = sh.get('full_name') or sh.get('username') or '—'
-                            hdr_txt = (_oa_s, f"Зміна: {_name}")
+                            if _cur_shift_id and sh.get('id') == _cur_shift_id:
+                                hdr_txt = (_oa_s, f"Зміна: {_name}", 'open', "🟢 ВІДКРИТА")
+                            else:
+                                hdr_txt = (_oa_s, f"Зміна: {_name}", 'closed', "🔒 закрита")
                         else:
-                            hdr_txt = ('', "Попередні зміни")
+                            hdr_txt = ('', "Попередні зміни", 'closed', "🔒 закриті")
                         groups.append((hdr_txt, b_['rows']))
             except Exception as _e_grp:
                 log_error("CheckedinFrame grouping", _e_grp)
                 groups = []
+                _grp_failed = True
 
-            if not groups:
+            if not groups and _period_on and not _grp_failed:
+                # Фільтр за період нічого не знайшов — показуємо підказку (а не весь список)
+                groups = [(('', 'Немає записів за обраний період / номер', 'closed', ''), [])]
+            elif not groups:
                 # Аварійний резерв: якщо групування з будь-якої причини не
                 # вдалось — показуємо звичайний плаский список, відсортований
                 # по номеру кімнати, аби таблиця НІКОЛИ не лишалась порожньою.
                 _flat = sorted(rows, key=lambda r: _room_sort_key(r['room_number']))
                 groups = [(None, _flat)] if _flat else []
 
-            self.after(0, lambda: self._apply_checkedin_rows(groups))
+            self.after(0, lambda: (self._refresh_room_menu(_all_rooms), self._apply_checkedin_rows(groups)))
         except Exception as e:
             log_error("CheckedinFrame._load_bg", e)
         finally:
@@ -14696,15 +15532,20 @@ class CheckedinFrame(tk.Frame):
         self.tree.tag_configure('debt', foreground='#e74c3c')
         self.tree.tag_configure('nodebt', foreground='#2ecc71')
         self.tree.tag_configure('shift_header', background=C['card2'], foreground=C['yellow'])
+        self.tree.tag_configure('shift_header_open', background=C['card2'], foreground='#2ecc71')
+        self.tree.tag_configure('shift_header_closed', background=C['card2'], foreground='#95a5a6')
         _hdr_i = 0
         for hdr_txt, grp_rows in groups:
             if hdr_txt:
                 _hdr_i += 1
-                _date_col, _name_col = hdr_txt
-                self.tree.insert('', 'end', iid=f"__hdr_{_hdr_i}", tags=('shift_header',),
-                                  values=('', _date_col, _name_col) + ('',) * (len(self._all_fields) - 3))
+                _date_col, _name_col = hdr_txt[0], hdr_txt[1]
+                _hdr_kind = hdr_txt[2] if len(hdr_txt) > 2 else ''
+                _status_col = hdr_txt[3] if len(hdr_txt) > 3 else ''
+                _hdr_tag = {'open': 'shift_header_open', 'closed': 'shift_header_closed'}.get(_hdr_kind, 'shift_header')
+                self.tree.insert('', 'end', iid=f"__hdr_{_hdr_i}", tags=(_hdr_tag,),
+                                  values=('', _date_col, _name_col, _status_col) + ('',) * max(len(self._all_fields) - 4, 0))
             for r in grp_rows:
-                self.tree.insert('', 'end', iid=r['vals'][0],
+                self.tree.insert('', 'end', iid=r.get('iid', r['vals'][0]),
                                   tags=('debt',) if r['debt'] else ('nodebt',),
                                   values=r['vals'])
         self._autosize_columns()
@@ -14776,7 +15617,7 @@ class CheckedinFrame(tk.Frame):
         s=self.tree.selection()
         if not s or str(s[0]).startswith('__hdr_'):
             messagebox.showwarning("","Оберіть гостя"); return None
-        return int(s[0])
+        return int(str(s[0]).split('__')[0])
 
     def _checkout(self):
         bid=self._sel()
@@ -14916,6 +15757,10 @@ class CheckedinFrame(tk.Frame):
     def _pay(self):
         bid=self._sel()
         if bid: PaymentDlg(self,bid,self._load)
+
+    def _relocate(self):
+        bid=self._sel()
+        if bid: _open_relocate_dlg(self, bid, self._load, self.user)
 
     def _open(self):
         bid=self._sel()
@@ -15095,6 +15940,7 @@ class CheckedOutFrame(tk.Frame):
                     paid_map[bid_k] = (_paid, _dep, _adv)
 
             rows = []
+            _free_map_co = _free_stay_map([b['id'] for b in data])
             for b in data:
                 bid = int(b['id'])
                 from datetime import date as _date, datetime as _datetime
@@ -15105,6 +15951,8 @@ class CheckedOutFrame(tk.Frame):
                     except Exception: return _date.today()
                 n = (_to_date(b['check_out']) - _to_date(b['check_in'])).days or 1
                 total = float(b['total_amount'] or 0)
+                if bid in _free_map_co:
+                    total = 0.0   # 🎁 безкоштовне проживання
                 paid, dep, adv = paid_map.get(bid, (0.0, 0.0, 0.0))
                 paid_ttl = paid + dep + adv
                 debt = max(total - paid_ttl, 0)
@@ -15302,6 +16150,28 @@ class BookingsFrame(tk.Frame):
         self.e_srch=ent(flt,"Гість або номер кімнати",w=280)
         self.e_srch.pack(side='left',pady=8); self.e_srch.bind('<Return>',lambda e:self._load())
 
+        # ── Фільтри: період (з — по), тип, номер. Період порожній = усі броні ──
+        lbl(flt,"Період:",11,color=C['text2']).pack(side='left',padx=(18,4),pady=8)
+        self.f_from = DateField(flt, width=100, on_change=self._on_period_change); self.f_from.pack(side='left',pady=8)
+        lbl(flt,"—",11,color=C['text2']).pack(side='left',padx=4)
+        self.f_to = DateField(flt, width=100, on_change=self._on_period_change); self.f_to.pack(side='left',pady=8)
+        self.f_from.bind('<FocusOut>', lambda e=None: self._on_period_change())
+        self.f_to.bind('<FocusOut>', lambda e=None: self._on_period_change())
+        btn(flt,"Сьогодні",self._period_today,C['card2'],80,height=28).pack(side='left',padx=(8,2))
+        btn(flt,"Усі",self._period_all,C['card2'],50,height=28).pack(side='left',padx=2)
+        lbl(flt,"Тип:",11,color=C['text2']).pack(side='left',padx=(18,4))
+        self.type_var = ctk.StringVar(value="Усі")
+        self.type_menu = ctk.CTkOptionMenu(
+            flt, values=["Усі","Бесідки та Альтанки","Номери","Золоті","Рожеві"],
+            variable=self.type_var, width=170, fg_color=C['card2'], button_color=C['accent'],
+            command=self._on_type_change)
+        self.type_menu.pack(side='left',pady=8)
+        lbl(flt,"Номер:",11,color=C['text2']).pack(side='left',padx=(14,4))
+        self.room_var = ctk.StringVar(value="Усі")
+        self.room_menu = ctk.CTkOptionMenu(flt, values=["Усі"], variable=self.room_var, width=130,
+                                           command=lambda v: self._load())
+        self.room_menu.pack(side='left',pady=8)
+
         cols=('id','room','guest','phone','cin','cout','n','total','paid','debt','status',
               'category','notes','email','booked_at')
         widths=[40,70,180,120,90,90,55,85,85,85,120,120,220,160,130]
@@ -15340,11 +16210,54 @@ class BookingsFrame(tk.Frame):
     def _on_layout_applied(self):
         apply_table_layout(self.tree, 'bookings', self._all_fields)
 
+    # ── Фільтри ──
+    def _on_period_change(self, *a):
+        try:
+            df, dt_ = self.f_from.date_value(), self.f_to.date_value()
+            if df and dt_ and dt_ < df:
+                self.f_to.set_date(df); dt_ = df
+            if (df, dt_) == getattr(self, '_last_period', None):
+                return
+        except Exception:
+            pass
+        self._load()
+
+    def _period_today(self):
+        import datetime as _dtf
+        self.f_from.set_date(_dtf.date.today()); self.f_to.set_date(_dtf.date.today())
+        self._load()
+
+    def _period_all(self):
+        self.f_from.delete(); self.f_to.delete()
+        self.type_var.set("Усі"); self.room_var.set("Усі")
+        self._load()
+
+    def _on_type_change(self, value):
+        self.room_var.set("Усі")
+        self._load()
+
+    def _refresh_room_menu(self, rooms):
+        try:
+            cur = self.room_var.get()
+            vals = ["Усі"] + [str(x) for x in rooms]
+            if cur not in vals:
+                vals.append(cur)
+            self.room_menu.configure(values=vals)
+        except Exception:
+            pass
+
     def _load(self):
         import threading
         if getattr(self, '_loading_in_progress', False):
             return
         self._loading_in_progress = True
+        # Стан фільтрів знімаємо в головному потоці (Tk)
+        try:
+            self._flt = {'d_from': self.f_from.date_value(), 'd_to': self.f_to.date_value(),
+                         'room': self.room_var.get(), 'type': self.type_var.get()}
+            self._last_period = (self._flt['d_from'], self._flt['d_to'])
+        except Exception:
+            self._flt = {}
         threading.Thread(target=self._load_bg, daemon=True).start()
 
     def _load_bg(self):
@@ -15378,7 +16291,37 @@ class BookingsFrame(tk.Frame):
                     for bid_k, pays in pay_by_bid.items():
                         paid_map[bid_k] = sum(float(p.get('amount',0)) for p in pays
                                               if float(p.get('amount',0)) > 0)
+            # ── Фільтри: тип, номер, період ──
+            import datetime as _dtfl
+            _flt = getattr(self, '_flt', None) or {}
+            _type_sel = _flt.get('type') or 'Усі'
+            if _type_sel != 'Усі':
+                data = [b for b in data if ChessFrame._room_matches_filter(
+                            {'number': b.get('room_number'),
+                             'cat_name': b.get('cat_name') or b.get('room_category')}, _type_sel)]
+            _all_rooms = sorted({str(b.get('room_number')) for b in data}, key=_room_sort_key)
+            _room_sel = _flt.get('room') or 'Усі'
+            if _room_sel != 'Усі':
+                data = [b for b in data if str(b.get('room_number')) == _room_sel]
+            _d_from, _d_to = _flt.get('d_from'), _flt.get('d_to')
+            if _d_from and not _d_to: _d_to = _d_from
+            if _d_to and not _d_from: _d_from = _d_to
+            if _d_from and _d_to and _d_from > _d_to: _d_from, _d_to = _d_to, _d_from
+            if _d_from and _d_to:
+                def _as_date(v):
+                    if isinstance(v, _dtfl.datetime): return v.date()
+                    if isinstance(v, _dtfl.date): return v
+                    try: return _dtfl.date.fromisoformat(str(v)[:10])
+                    except Exception: return None
+                def _in_period(b):
+                    ci, co = _as_date(b.get('check_in')), _as_date(b.get('check_out'))
+                    if not ci: return False
+                    co = max(co or ci, ci + _dtfl.timedelta(days=1))   # ніч виїзду не займає номер
+                    return ci <= _d_to and co > _d_from
+                data = [b for b in data if _in_period(b)]
+
             rows = []
+            _free_map_bk = _free_stay_map([b['id'] for b in data])
             for b in data:
                 bid_int = int(b['id'])
                 _cn = (b.get('cat_name') or '').lower()
@@ -15424,16 +16367,20 @@ class BookingsFrame(tk.Frame):
                 cin_disp2 = _fmt_dt2(b['check_in'])
                 cout_disp2 = cout_disp if _is_hourly else _fmt_dt2(cout_disp)
                 paid_ttl = paid_map.get(bid_int, 0.0)
+                _free_note_bk = ''
+                if bid_int in _free_map_bk:
+                    total = 0.0   # 🎁 безкоштовне проживання
+                    _free_note_bk = "🎁 Безкоштовно" + (f": {_free_map_bk[bid_int]}" if _free_map_bk[bid_int] else "") + "  "
                 debt = max(total - paid_ttl, 0)
                 rows.append((b['id'], b['room_number'], b.get('guest_name', ''),
                              b.get('guest_phone', ''), cin_disp2, cout_disp2,
                              n_disp, f"{total:.0f}₴", f"{paid_ttl:.0f}₴", f"{debt:.0f}₴",
                              STATUS_UA.get(b['status'], b['status']),
                              (b.get('cat_name') or b.get('room_category') or ''),
-                             (b.get('notes') or '')[:200],
+                             (_free_note_bk + (b.get('notes') or ''))[:200],
                              (b.get('guest_email') or b.get('email') or ''),
                              str(b.get('created_at') or '')[:16]))
-            self.after(0, lambda: self._apply_bookings_rows(rows))
+            self.after(0, lambda: (self._refresh_room_menu(_all_rooms), self._apply_bookings_rows(rows)))
         except Exception as e:
             log_error("BookingsFrame._load_bg", e)
         finally:
@@ -15506,11 +16453,15 @@ class BookingsFrame(tk.Frame):
         """Продовження _checkin_dlg — виконується на головному потоці ПІСЛЯ того,
         як дані бронювання/кімнати вже завантажені у фоні."""
         from app.modules.logic import get_balance, update_booking_status
+        from app.utils.db import query
         import datetime as _dt
         if not b:
             messagebox.showerror("", "Не вдалось завантажити дані бронювання (перевірте з'єднання з БД)."); return
         if b['status'] == 'checkedin':
             messagebox.showinfo("","Гість вже заселений."); return
+        bid = b['id']   # у цьому методі bid раніше не був оголошений
+        if _block_if_room_occupied(b['room_id'], exclude_bid=b['id']):
+            return
 
         # Нормалізуємо поле phone (get_booking може повертати guest_phone)
         if not b.get('phone') and b.get('guest_phone'):
@@ -15573,29 +16524,53 @@ class BookingsFrame(tk.Frame):
         lbl(pf,"Номер:",11,color=C['text2']).grid(row=2,column=0,sticky='w',pady=3)
         e_pnum = ent(pf,"123456",w=140); e_pnum.grid(row=2,column=1,padx=8,pady=3,sticky='w')
 
+        # 🎁 Безкоштовне проживання (може бути вже позначене раніше)
+        _fs0_d = _free_stay_map([b['id']])
+        fs_card_d = card(sc); fs_card_d.pack(fill='x',padx=12,pady=5)
+        _fs_fr_d, free_var_d, e_free_cm_d = _free_stay_widget(
+            fs_card_d, init_on=(int(b['id']) in _fs0_d),
+            init_comment=_fs0_d.get(int(b['id']), ''),
+            on_change=lambda: _on_free_toggle_d())
+        _fs_fr_d.pack(fill='x',padx=12,pady=10)
+
         # Оплата
         oc = card(sc); oc.pack(fill='x',padx=12,pady=5)
         lbl(oc,"💰  Розрахунок",13,True).pack(anchor='w',padx=12,pady=(10,5))
         of = tk.Frame(oc, bg=C['card']); of.pack(fill='x',padx=12,pady=(0,6))
-        rf1=tk.Frame(of,bg=C['card2']); rf1.pack(fill='x',pady=2)
-        lbl(rf1,f"Проживання ({nights} × {price:.0f}₴)",12).pack(side='left',padx=10,pady=7)
-        lbl(rf1,f"{room_total:.0f}₴",13,True,C['accent']).pack(side='right',padx=12)
 
         # Аванс при бронюванні (вже сплачений)
         _adv_paid = 0.0
         try:
-            _ar = query("SELECT COALESCE(SUM(amount),0) AS adv FROM payments WHERE booking_id=%s AND note LIKE 'Аванс%%'", (bid,), fetch='one')
+            _ar = query("SELECT COALESCE(SUM(amount),0) AS adv FROM payments WHERE booking_id=%s AND note LIKE 'Аванс%%'", (b['id'],), fetch='one')
             _adv_paid = float(_ar['adv'] if _ar else 0)
         except Exception: pass
 
-        if _adv_paid > 0:
-            rf_adv = tk.Frame(of, bg=C['card2']); rf_adv.pack(fill='x', pady=2)
-            lbl(rf_adv, "💰 Аванс (сплачено при бронюванні)", 12).pack(side='left', padx=10, pady=7)
-            lbl(rf_adv, f"-{_adv_paid:.0f}₴", 13, True, C['yellow']).pack(side='right', padx=12)
-            _to_pay = max(0.0, room_total - _adv_paid)
-            rf_rest = tk.Frame(of, bg=C['card2']); rf_rest.pack(fill='x', pady=2)
-            lbl(rf_rest, "💵 До доплати при заселенні", 12, True).pack(side='left', padx=10, pady=7)
-            lbl(rf_rest, f"{_to_pay:.0f}₴", 13, True, C['green']).pack(side='right', padx=12)
+        _pay_d = {'v': 0.0}
+        def _render_of():
+            for _w in of.winfo_children():
+                _w.destroy()
+            _free_d = bool(free_var_d.get())
+            _rt = 0.0 if _free_d else room_total
+            rf1=tk.Frame(of,bg=C['card2']); rf1.pack(fill='x',pady=2)
+            if _free_d:
+                lbl(rf1,"🎁 Безкоштовне проживання",12).pack(side='left',padx=10,pady=7)
+                lbl(rf1,"0₴",13,True,C['green']).pack(side='right',padx=12)
+            else:
+                lbl(rf1,f"Проживання ({nights} × {price:.0f}₴)",12).pack(side='left',padx=10,pady=7)
+                lbl(rf1,f"{room_total:.0f}₴",13,True,C['accent']).pack(side='right',padx=12)
+            _pay_d['v'] = max(0.0, _rt - _adv_paid)
+            if _adv_paid > 0 and not _free_d:
+                rf_adv = tk.Frame(of, bg=C['card2']); rf_adv.pack(fill='x', pady=2)
+                lbl(rf_adv, "💰 Аванс (сплачено при бронюванні)", 12).pack(side='left', padx=10, pady=7)
+                lbl(rf_adv, f"-{_adv_paid:.0f}₴", 13, True, C['yellow']).pack(side='right', padx=12)
+                rf_rest = tk.Frame(of, bg=C['card2']); rf_rest.pack(fill='x', pady=2)
+                lbl(rf_rest, "💵 До доплати при заселенні", 12, True).pack(side='left', padx=10, pady=7)
+                lbl(rf_rest, f"{_pay_d['v']:.0f}₴", 13, True, C['green']).pack(side='right', padx=12)
+        _render_of()
+        def _on_free_toggle_d():
+            _render_of()
+            try: _upd_razom_bk()
+            except Exception: pass
 
         lbl(oc,"💛  Залог (повертається при виїзді):",13,True).pack(anchor='w',padx=12,pady=(8,3))
         dr = tk.Frame(oc,bg=C['card']); dr.pack(fill='x',padx=12,pady=(0,10))
@@ -15612,7 +16587,6 @@ class BookingsFrame(tk.Frame):
         lbl(dr,"₴ (введіть 0 якщо без залогу)",11,color=C['text2']).pack(side='left')
 
         # РАЗОМ сьогодні — доплата + залог
-        _to_pay_bk = max(0.0, room_total - _adv_paid)
         razom_card = card(sc); razom_card.pack(fill='x',padx=12,pady=5)
         razom_row_bk = tk.Frame(razom_card, bg=C['card2']); razom_row_bk.pack(fill='x',padx=12,pady=8)
         lbl(razom_row_bk,"💳 РАЗОМ сьогодні:",13,True,C['accent']).pack(side='left',padx=10)
@@ -15621,8 +16595,8 @@ class BookingsFrame(tk.Frame):
         def _upd_razom_bk(*_):
             try: _d = float(e_dep.get() or 0)
             except: _d = 0.0
-            _r = _to_pay_bk + _d
-            lbl_razom_bk.configure(text=f"{_r:.0f}₴  (доплата {_to_pay_bk:.0f}₴ + залог {_d:.0f}₴)")
+            _r = _pay_d['v'] + _d
+            lbl_razom_bk.configure(text=f"{_r:.0f}₴  (доплата {_pay_d['v']:.0f}₴ + залог {_d:.0f}₴)")
 
         e_dep.bind('<KeyRelease>', _upd_razom_bk)
         _upd_razom_bk()
@@ -15640,10 +16614,16 @@ class BookingsFrame(tk.Frame):
                                font=('Segoe UI',12)).pack(side='left',padx=8)
 
         def do_checkin():
+            if _block_if_room_occupied(b['room_id'], exclude_bid=b['id']): return
             try: dep = float(e_dep.get() or 0)
             except: dep = 0.0
             passport_info = _format_doc_info(doc_type_var.get(), e_series.get().strip(), e_pnum.get().strip())
-            total_with_dep = room_total + dep
+            _free_on = bool(free_var_d.get())
+            _free_cm = e_free_cm_d.get().strip()
+            if _free_on and not _free_cm:
+                messagebox.showerror("", "Вкажіть коментар до безкоштовного проживання"); return
+            _rt_eff = 0.0 if _free_on else room_total
+            total_with_dep = _rt_eff + dep
 
             # Зберегти паспорт у нотатки
             if passport_info.strip():
@@ -15654,6 +16634,7 @@ class BookingsFrame(tk.Frame):
             # Встановити total_amount = проживання + залог
             query("UPDATE bookings SET total_amount=%s WHERE id=%s",
                   (total_with_dep, bid), fetch=None)
+            _save_free_stay(bid, _free_on, _free_cm)
 
             # Платіж — доплата при заселенні (проживання мінус вже сплачений аванс)
             _sid = get_current_shift_id()
@@ -15662,7 +16643,7 @@ class BookingsFrame(tk.Frame):
                 _ar2 = query("SELECT COALESCE(SUM(amount),0) AS adv FROM payments WHERE booking_id=%s AND note LIKE 'Аванс%%'", (bid,), fetch='one')
                 _adv_already = float(_ar2['adv'] if _ar2 else 0)
             except Exception: pass
-            _topay_now = max(0.0, room_total - _adv_already)
+            _topay_now = max(0.0, _rt_eff - _adv_already)
             if _topay_now > 0:
                 query("""INSERT INTO payments(booking_id,amount,method,note,shift_id,created_at)
                           VALUES(%s,%s,%s,'Доплата при заселенні',%s,NOW())""",
@@ -15697,9 +16678,9 @@ class BookingsFrame(tk.Frame):
                 f"  Ночей   : {nights}",
                 f"  Ціна/ніч: {price:.0f}₴",
                 f"{'─'*52}",
-                f"  Проживання : {room_total:.0f}₴",
+                (f"  Проживання : БЕЗКОШТОВНО ({_free_cm})" if _free_on else f"  Проживання : {room_total:.0f}₴"),
             ]
-            if _adv_already > 0:
+            if _adv_already > 0 and not _free_on:
                 lines.append(f"  Аванс      : -{_adv_already:.0f}₴  (сплачено при бронюванні)")
             if dep > 0:
                 lines += [
@@ -15806,6 +16787,11 @@ class BookingDlg(ctk.CTkToplevel):
                          fg_color=C['accent'], text_color=C['text']).pack(side='left')
 
         f=row_frm(b2)
+        ctk.CTkLabel(f,text="🎁 Безкоштовно",font=('Segoe UI',11),text_color=C['text2'],width=120,anchor='w').pack(side='left',anchor='n')
+        _fs_fr, self.var_free, self.e_free_comment = _free_stay_widget(f)
+        _fs_fr.pack(side='left')
+
+        f=row_frm(b2)
         ctk.CTkLabel(f,text="💰 Аванс",font=('Segoe UI',11),text_color=C['text2'],width=120,anchor='w').pack(side='left')
         dep_f=tk.Frame(f,bg=C['card2']); dep_f.pack(side='left')
         self.e_deposit=ent(dep_f,"0",w=120); self.e_deposit.pack(side='left')
@@ -15894,6 +16880,10 @@ class BookingDlg(ctk.CTkToplevel):
         discount_comment = self.e_discount_comment.get().strip()
         if discount > 0 and not discount_comment:
             messagebox.showerror("", "Вкажіть коментар (причину) знижки"); return
+        _free_on = bool(self.var_free.get())
+        _free_cm = self.e_free_comment.get().strip()
+        if _free_on and not _free_cm:
+            messagebox.showerror("", "Вкажіть коментар до безкоштовного проживання"); return
         gid=self.guest_id or save_guest({'name':name,'phone':self.fields['phone'].get().strip()})
         rc=self.room_var.get()
         rid=self.room_map[rc]['id']
@@ -15923,6 +16913,18 @@ class BookingDlg(ctk.CTkToplevel):
                            (discount * _nights, _use_bid_d), fetch=None)
             except Exception as _ed:
                 log_error("BookingDlg discount apply", _ed)
+        # 🎁 Безкоштовне проживання
+        if _free_on:
+            try:
+                from app.utils.db import query as _qfs
+                _use_bid_f = _new_bid
+                if not _use_bid_f:
+                    _last_f = _qfs("SELECT id FROM bookings WHERE room_id=%s AND guest_id=%s ORDER BY created_at DESC LIMIT 1",
+                                   (rid, gid), fetch='one')
+                    _use_bid_f = _last_f['id'] if _last_f else None
+                _save_free_stay(_use_bid_f, True, _free_cm, zero_total=True)
+            except Exception as _efs:
+                log_error("BookingDlg free_stay", _efs)
         # Позначка "Hotels" (джерело бронювання) — окремим UPDATE, оскільки
         # create_booking() з app.modules.logic може не знати про це поле.
         try:
@@ -15975,6 +16977,180 @@ class BookingDlg(ctk.CTkToplevel):
         self.destroy()
 
 # ══════════════════════════════════════════════════════
+_SVC_CAT_LABELS = {
+    'restaurant': '🍽 Ресторан', 'bar': '🍺 Бар', 'minibar': '🥃 Мінібар',
+    'kitchen': '👨‍🍳 Кухня', 'laundry': '👕 Пральня', 'transfer': '🚌 Трансфер',
+    'other': '📦 Інше', 'до_кави': '☕ До кави', 'до_пива': '🍺 До пива',
+    'бані': '🔥 Бані', 'бесідки': '🌿 Бесідки', 'штрафи': '⚠️ Штрафи',
+}
+
+def _svc_cat_label(cat):
+    cat = _fix_mojibake(cat or '')
+    if not cat:
+        return '📦 Без категорії'
+    return _SVC_CAT_LABELS.get(cat, cat.replace('_', ' ').capitalize())
+
+
+class ServicePicker(ctk.CTkFrame):
+    """Вибір послуги: кнопка відкриває вікно з пошуком (фільтр під час
+    введення) і фільтром за категоріями. Значення — у variable (назва)."""
+    ALL = 'Всі категорії'
+
+    def __init__(self, parent, services, variable=None, width=260, on_select=None,
+                 show_cat_filter=True, placeholder='🔍 Оберіть послугу…', show_price=True):
+        super().__init__(parent, fg_color='transparent')
+        self._show_price = show_price
+        self._show_cat = show_cat_filter
+        self._ph = placeholder
+        self._items = []
+        for s in services or []:
+            if not isinstance(s, dict):
+                continue
+            nm = _fix_mojibake(str(s.get('name') or '')).strip()
+            if not nm:
+                continue
+            cat = s.get('category') or ''
+            try:
+                price = float(s.get('price') or 0)
+            except (TypeError, ValueError):
+                price = 0.0
+            self._items.append({'name': nm, 'cat': _fix_mojibake(cat),
+                                'label': _svc_cat_label(cat), 'price': price,
+                                'hay': nm.casefold()})
+        self._items.sort(key=lambda x: x['name'].casefold())
+        self.var = variable if variable is not None else ctk.StringVar()
+        self._on_select = on_select
+        self._popup = None
+        self._shown = []
+        self._btn = ctk.CTkButton(
+            self, text=self._ph, width=width, height=32, anchor='w',
+            fg_color=C['card2'], hover_color=C['accent'], text_color=C['text'],
+            font=('Segoe UI', 12), command=self._open)
+        self._btn.pack(side='left')
+        cur = self.var.get()
+        if cur:
+            self._btn.configure(text=cur)
+
+    def get(self):
+        return self.var.get()
+
+    def set(self, name):
+        self.var.set(name)
+        self._btn.configure(text=name or self._ph)
+
+    # ── popup ──
+    def _open(self):
+        if self._popup is not None:
+            try:
+                if self._popup.winfo_exists():
+                    self._popup.focus_force(); return
+            except Exception:
+                pass
+        top = self.winfo_toplevel()
+        p = ctk.CTkToplevel(top)
+        self._popup = p
+        p.title('Оберіть послугу')
+        p.configure(fg_color=C['bg'])
+        w, h = 480, 520
+        try:
+            x = self._btn.winfo_rootx()
+            y = self._btn.winfo_rooty() + self._btn.winfo_height() + 2
+            sw, sh = p.winfo_screenwidth(), p.winfo_screenheight()
+            if y + h > sh - 50:
+                y = max(10, self._btn.winfo_rooty() - h - 2)
+            x = max(0, min(x, sw - w - 10))
+            p.geometry(f'{w}x{h}+{x}+{y}')
+        except Exception:
+            p.geometry(f'{w}x{h}')
+        try: p.transient(top)
+        except Exception: pass
+
+        self._q = tk.StringVar()
+        top_f = ctk.CTkFrame(p, fg_color='transparent'); top_f.pack(fill='x', padx=10, pady=(10, 4))
+        self._entry = ctk.CTkEntry(top_f, textvariable=self._q, height=34,
+                                   placeholder_text='🔍 Почніть вводити назву…',
+                                   fg_color=C['card2'], border_color=C['accent'],
+                                   text_color=C['text'], font=('Segoe UI', 12))
+        self._entry.pack(fill='x')
+        try: _attach_entry_clipboard(self._entry)
+        except Exception: pass
+
+        cats = {}
+        for it in self._items:
+            cats[it['label']] = cats.get(it['label'], 0) + 1
+        self._cat_values = [self.ALL] + [f"{k} ({v})" for k, v in sorted(cats.items())]
+        self._cat_var = tk.StringVar(value=self.ALL)
+        cf = ctk.CTkFrame(p, fg_color='transparent')
+        if self._show_cat:
+            cf.pack(fill='x', padx=10, pady=(0, 6))
+        ctk.CTkLabel(cf, text='Категорія:', text_color=C['text2'],
+                     font=('Segoe UI', 11)).pack(side='left', padx=(0, 6))
+        ctk.CTkOptionMenu(cf, values=self._cat_values, variable=self._cat_var, height=30,
+                          fg_color=C['card2'], button_color=C['accent'],
+                          dropdown_fg_color=C['card'], dropdown_hover_color=C['accent'],
+                          font=('Segoe UI', 11),
+                          command=lambda v: self._refresh()).pack(side='left', fill='x', expand=True)
+
+        self._cnt = ctk.CTkLabel(p, text='', text_color=C['text2'], font=('Segoe UI', 10), anchor='w')
+        self._cnt.pack(fill='x', padx=12)
+
+        lf = tk.Frame(p, bg=C['card2']); lf.pack(fill='both', expand=True, padx=10, pady=(2, 10))
+        self._lb = tk.Listbox(lf, bg=C['card2'], fg=C['text'], selectbackground=C['accent'],
+                              selectforeground='#ffffff', font=('Segoe UI', 11),
+                              activestyle='none', highlightthickness=0, bd=0,
+                              exportselection=False)
+        sb = ctk.CTkScrollbar(lf, command=self._lb.yview)
+        self._lb.configure(yscrollcommand=sb.set)
+        sb.pack(side='right', fill='y'); self._lb.pack(side='left', fill='both', expand=True)
+
+        self._q.trace_add('write', lambda *a: self._refresh())
+        self._lb.bind('<Double-Button-1>', lambda e: self._choose())
+        self._lb.bind('<Return>', lambda e: self._choose())
+        self._entry.bind('<Return>', lambda e: self._choose())
+        self._entry.bind('<Down>', lambda e: self._focus_list())
+        p.bind('<Escape>', lambda e: p.destroy())
+        self._refresh()
+        p.after(50, lambda: (p.lift(), self._entry.focus_force()))
+
+    def _focus_list(self):
+        self._lb.focus_set()
+        if self._lb.size() and not self._lb.curselection():
+            self._lb.selection_set(0); self._lb.activate(0)
+        return 'break'
+
+    def _refresh(self):
+        words = self._q.get().casefold().split()
+        sel = self._cat_var.get()
+        cat_label = None if sel == self.ALL else sel.rsplit(' (', 1)[0]
+        self._shown = []
+        self._lb.delete(0, 'end')
+        for it in self._items:
+            if cat_label and it['label'] != cat_label:
+                continue
+            if words and not all(wd in it['hay'] for wd in words):
+                continue
+            self._shown.append(it)
+            self._lb.insert('end', f"{it['name']}   —   {it['price']:.0f}₴" if self._show_price else it['name'])
+        if self._shown:
+            self._lb.selection_set(0)
+        self._cnt.configure(text=f"Знайдено: {len(self._shown)} з {len(self._items)}")
+
+    def _choose(self):
+        sel = self._lb.curselection()
+        idx = sel[0] if sel else (0 if self._shown else None)
+        if idx is None or idx >= len(self._shown):
+            return 'break'
+        name = self._shown[idx]['name']
+        self.set(name)
+        try: self._popup.destroy()
+        except Exception: pass
+        self._popup = None
+        if self._on_select:
+            try: self._on_select(name)
+            except Exception: pass
+        return 'break'
+
+
 class BookingDetailDlg(ctk.CTkToplevel):
     def __init__(self, parent, bid, on_close=None):
         super().__init__(parent)
@@ -16216,11 +17392,11 @@ class BookingDetailDlg(ctk.CTkToplevel):
             # БД (а не з get_booking()/get_payments(), чия форма словника невідома
             # тут) — так само, як уже надійно працює для "Заселені гості" й шахматки.
             try:
-                _brow_fin = _q("SELECT check_in, check_out, price_per_day, total_amount, status "
+                _brow_fin = _q("SELECT id, check_in, check_out, price_per_day, total_amount, status, free_stay "
                                "FROM bookings WHERE id=%s", (self.bid,)) or []
                 _b_fin = dict(_brow_fin[0]) if _brow_fin else dict(b or {})
                 _pay_fin = _q("SELECT amount, note FROM payments WHERE booking_id=%s", (self.bid,)) or []
-                _fin = calc_stay_financials(_b_fin, _pay_fin)
+                _fin = calc_stay_financials(_b_fin, _pay_fin, svc_total=_svc_orders_total(self.bid, _q))
                 bal['total'] = _fin['total']; bal['paid'] = _fin['paid']; bal['debt'] = _fin['debt']
             except Exception as _e_bal:
                 log_error(f"BookingDetailDlg._load_bg: перерахунок балансу bid={self.bid}", _e_bal)
@@ -16351,7 +17527,7 @@ class BookingDetailDlg(ctk.CTkToplevel):
             # (те саме, що використовують "Виселення", "Шахматка",
             # "Заброньовано" тощо — щоб цифри були однакові скрізь)
             try:
-                _fin = calc_stay_financials(b, pay)
+                _fin = calc_stay_financials(b, pay, svc_total=_svc_orders_total(self.bid))
                 bal['total'] = _fin['total']
                 bal['paid']  = _fin['paid']
                 bal['debt']  = _fin['debt']
@@ -16485,11 +17661,16 @@ class BookingDetailDlg(ctk.CTkToplevel):
                 parts = note.split(':',2)
                 reason = parts[1].strip() if len(parts)>1 else note
                 detail = parts[2].strip() if len(parts)>2 else ''
-                ft.insert('','end', values=(reason, f"{float(f['total'] or 0):.0f}₴", detail, str(f['created_at'])[:16]))
+                ft.insert('','end', iid=str(f['id']),
+                          values=(reason, f"{float(f['total'] or 0):.0f}₴", detail, str(f['created_at'])[:16]))
             ff_f.pack(fill='x', padx=8, pady=(0,4))
+            self._fine_map = {str(f['id']): f for f in fines}
         else:
             lbl(ff_card, "Штрафів немає", 11, color=C['text2']).pack(anchor='w', padx=12, pady=(0,8))
-        btn(ff_card, "➕ Додати штраф", self._fine_dlg, C['red'], 160).pack(anchor='w', padx=12, pady=(0,10))
+        _fbf = ctk.CTkFrame(ff_card, fg_color='transparent'); _fbf.pack(fill='x', padx=12, pady=(0,10))
+        btn(_fbf, "➕ Додати штраф", self._fine_dlg, C['red'], 160).pack(side='left')
+        if fines:
+            btn(_fbf, "↩ Скасувати штраф", lambda: self._cancel_fine(ft), C['card2'], 170).pack(side='left', padx=8)
 
         # ── Послуги ───────────────────────────────────
         sv = card(scroll); sv.pack(fill='x', pady=5)
@@ -16497,13 +17678,14 @@ class BookingDetailDlg(ctk.CTkToplevel):
         ff, st = mktree(sv, ('name','qty','price','total','time'), 5, [200,60,80,80,140])
         for c, h in zip(('name','qty','price','total','time'), ['Послуга','Кіл.','Ціна','Сума','Час']): st.heading(c, text=h)
         for s in svc:
-            st.insert('','end', iid=s['id'], values=(s['svc_name'], s['quantity'], f"{float(s['price'] or 0):.0f}₴", f"{float(s['total'] or 0):.0f}₴", str(s['created_at'])[:16]))
+            st.insert('','end', iid=s['id'], values=(_fix_mojibake(s['svc_name']), s['quantity'], f"{float(s['price'] or 0):.0f}₴", f"{float(s['total'] or 0):.0f}₴", str(s['created_at'])[:16]))
         ff.pack(fill='x', padx=8, pady=(0,5))
         af = ctk.CTkFrame(sv, fg_color='transparent'); af.pack(fill='x', padx=8, pady=(0,10))
-        self.svc_map = {s['name']: s for s in (services or [])}
+        self.svc_map = {_fix_mojibake(s['name']): s for s in (services or [])
+                        if isinstance(s, dict) and s.get('name')}
         self.svc_var = ctk.StringVar()
-        ctk.CTkOptionMenu(af, values=list(self.svc_map.keys()) or ['—'], variable=self.svc_var,
-                          width=220, fg_color=C['card2'], button_color=C['accent']).pack(side='left', padx=(0,5))
+        ServicePicker(af, [x for x in (services or []) if isinstance(x, dict) and (x.get('category') or '') != 'штрафи'],
+                      variable=self.svc_var, width=260).pack(side='left', padx=(0,5))
         self.e_qty = ent(af, "Кіл.", w=65); self.e_qty.insert(0,'1'); self.e_qty.pack(side='left', padx=5)
         btn(af, "➕ Додати", lambda: self._add_svc(st), C['green'], 100).pack(side='left')
 
@@ -16688,6 +17870,31 @@ class BookingDetailDlg(ctk.CTkToplevel):
         btn(bf, "💾 Зберегти", _save, C['accent'], 150, height=38).pack(side='left', padx=5)
         btn(bf, "✖ Скасувати", win.destroy, C['card2'], 130, height=38).pack(side='left', padx=5)
 
+    def _cancel_fine(self, ft):
+        """Скасування (видалення) штрафу, нарахованого помилково."""
+        sel = ft.selection()
+        if not sel:
+            messagebox.showinfo("", "Оберіть штраф у списку"); return
+        fid = sel[0]
+        f = getattr(self, '_fine_map', {}).get(fid) or {}
+        parts = (f.get('note') or '').split(':', 2)
+        reason = parts[1].strip() if len(parts) > 1 else (f.get('note') or '')
+        amt_txt = f"{float(f.get('total') or 0):.0f}₴"
+        if not messagebox.askyesno("Скасувати штраф",
+                f"Скасувати штраф «{reason}» на {amt_txt}?\nЦю дію не можна відмінити."):
+            return
+        from app.utils.db import query as _qf
+        try:
+            _qf("DELETE FROM service_orders WHERE id=%s AND booking_id=%s AND note LIKE 'fine%%'",
+                (int(fid), self.bid), fetch=None)
+            try:
+                log_info(f"[BookingDlg #{self.bid}] штраф #{fid} «{reason}» {amt_txt} скасовано")
+            except Exception:
+                pass
+        except Exception as _ex:
+            messagebox.showerror("Помилка", str(_ex)); return
+        self._rebuild()
+
     def _delete_payment(self, pt):
         """Видалення платежу (напр. внесеного помилково)."""
         sel = pt.selection()
@@ -16739,6 +17946,7 @@ class BookingDetailDlg(ctk.CTkToplevel):
         """Редагування бронювання/заселення (тільки для адміністратора):
         дати, гість, телефон, кількість дорослих, ціна за добу, нотатки."""
         from app.utils.db import query as _qe
+        _ensure_free_stay_cols()
 
         # ── Пере-завантажуємо "сирі" дані напряму з таблиць bookings/guests ──
         # get_booking() (з app.modules.logic) в деяких версіях повертає інші
@@ -16974,6 +18182,27 @@ class BookingDetailDlg(ctk.CTkToplevel):
             e_ad = ent(df, w=80); e_ad.grid(row=2,column=1,padx=8,pady=3,sticky='w')
             e_ad.insert(0, str(b.get('adults','') or ''))
 
+        # 🎁 Безкоштовне проживання
+        fr_card = card(sc); fr_card.pack(fill='x', padx=12, pady=5)
+        _visit_edit = bool(_is_hourly_edit or _is_visit_cat(b.get('cat_name')))
+        _free_word = "відвідування" if _visit_edit else "проживання"
+        lbl(fr_card, f"🎁  Безкоштовне {_free_word}", 13, True).pack(anchor='w', padx=12, pady=(10,5))
+        frf = tk.Frame(fr_card, bg=C['card']); frf.pack(fill='x', padx=12, pady=(0,10))
+        free_var = tk.BooleanVar(value=bool(b.get('free_stay')))
+        _free_chk = ctk.CTkCheckBox(
+            frf, text=f"Безкоштовне {_free_word} (весь час до виселення)",
+            variable=free_var, font=('Segoe UI',11), text_color=C['text'],
+            fg_color=C['accent'])
+        _free_chk.grid(row=0, column=0, columnspan=2, sticky='w', pady=3)
+        lbl(frf, "Коментар:", 11, color=C['text2']).grid(row=1, column=0, sticky='w', pady=3)
+        e_free_comment = ent(frf, "причина (обов'язково)", w=300)
+        e_free_comment.grid(row=1, column=1, padx=8, pady=3, sticky='w')
+        if b.get('free_stay_comment'):
+            e_free_comment.insert(0, str(b.get('free_stay_comment')))
+        lbl(frf, ("Оплата за відвідування не нараховується." if _visit_edit
+                  else "Борг за проживання за цей період не рахується."), 9,
+            color=C['text2']).grid(row=2, column=0, columnspan=2, sticky='w', pady=(2,0))
+
         # Розрахунок
         p_card = card(sc); p_card.pack(fill='x', padx=12, pady=5)
         lbl(p_card, "💰  Розрахунок", 13, True).pack(anchor='w', padx=12, pady=(10,5))
@@ -17095,10 +18324,13 @@ class BookingDetailDlg(ctk.CTkToplevel):
             except Exception:
                 _d = 0.0
             _rest = max(_t - _adv_paid - _d, 0.0)
+            if free_var.get():
+                _rest = 0.0
             _rest_holder['v'] = _rest
             _todopl_lbl.configure(text=f"💳 До доплати за номер: {_rest:.0f}₴  (без залогу)")
         e_total.bind('<KeyRelease>', _upd_todopl)
         e_disc.bind('<KeyRelease>', _upd_todopl)
+        _free_chk.configure(command=_upd_todopl)
         _upd_todopl()
 
         # ── Внести доплату зараз — реальний платіж, а не лише розрахунок.
@@ -17162,6 +18394,10 @@ class BookingDetailDlg(ctk.CTkToplevel):
             discount_comment = e_disc_comment.get().strip()
             if discount > 0 and not discount_comment:
                 _st.configure(text="❌ Вкажіть коментар (причину) знижки", text_color=C['red']); return
+            _free_on = bool(free_var.get())
+            _free_comment = e_free_comment.get().strip()
+            if _free_on and not _free_comment:
+                _st.configure(text=f"❌ Вкажіть коментар до безкоштовного {_free_word}", text_color=C['red']); return
             try:
                 dep_new = max(float((e_dep_edit.get().strip() or '0').replace(',', '.')), 0.0)
             except ValueError:
@@ -17212,8 +18448,10 @@ class BookingDetailDlg(ctk.CTkToplevel):
                     _qe("UPDATE guests SET name=%s, phone=%s WHERE id=%s",
                         (name, phone, b['guest_id']), fetch=None)
                 _qe("""UPDATE bookings SET check_in=%s, check_out=%s, adults=%s,
-                       price_per_day=%s, total_amount=%s, notes=%s WHERE id=%s""",
-                    (ci, co, adults, price, total, notes, self.bid), fetch=None)
+                       price_per_day=%s, total_amount=%s, notes=%s,
+                       free_stay=%s, free_stay_comment=%s WHERE id=%s""",
+                    (ci, co, adults, price, total, notes,
+                     _free_on, (_free_comment if _free_on else None), self.bid), fetch=None)
                 # ── Коригування залогу, якщо суму в полі змінили вручну ──
                 _dep_diff = round(dep_new - _dep_paid, 2)
                 if abs(_dep_diff) >= 0.01:
@@ -17287,7 +18525,7 @@ class BookingDetailDlg(ctk.CTkToplevel):
         from app.utils.db import query
         from app.modules.logic import get_booking
         b = get_booking(self.bid)
-        win = dlg_win(self, "⚠️ Штраф", "440x420")
+        win = dlg_win(self, "⚠️ Штраф", "440x520")
         scroll = ctk.CTkScrollableFrame(win, fg_color=C['bg'])
         scroll.pack(fill='both', expand=True, padx=10, pady=10)
         hdr = card(scroll); hdr.pack(fill='x', pady=5)
@@ -17297,16 +18535,40 @@ class BookingDetailDlg(ctk.CTkToplevel):
         # Причина — вибір або власна
         f1 = card(scroll); f1.pack(fill='x', pady=4)
         lbl(f1,"📋 Причина штрафу:",12,True).pack(anchor='w',padx=12,pady=(8,3))
+        # Причини беремо з Налаштування → Меню (категорія «штрафи»); якщо там
+        # порожньо — запасний список.
+        fine_svcs = [dict(x, category='штрафи') for x in (_svcs_by_cat(['штрафи']) or [])]
+        _fine_by_name = {_fix_mojibake(str(x.get('name') or '')).strip(): x for x in fine_svcs}
         reasons=["Пошкодження майна","Куріння в номері","Пізній виїзд",
                  "Тварини без дозволу","Втрата ключа","Порушення тиші","Інше"]
-        reason_var=ctk.StringVar(value=reasons[0])
-        ctk.CTkOptionMenu(f1,values=reasons,variable=reason_var,
-                          width=380,fg_color=C['card2'],button_color=C['accent']).pack(padx=12,pady=(0,4))
-        e_reason=ent(f1,"Або введіть власну причину...",w=380); e_reason.pack(padx=12,pady=(0,10))
+        reason_var=ctk.StringVar(value='')
+        e_reason=ent(f1,"Або введіть власну причину...",w=380)
+        f2 = card(scroll)
+        e_amt=ent(f2,"0.00",w=300)
 
-        f2 = card(scroll); f2.pack(fill='x', pady=4)
+        def _pick_reason(name):
+            e_reason.delete(0,'end')
+            sv=_fine_by_name.get(name)
+            try:
+                pr=float((sv or {}).get('price') or 0)
+            except (TypeError, ValueError):
+                pr=0.0
+            if pr>0:
+                e_amt.delete(0,'end'); e_amt.insert(0,str(int(pr)) if pr==int(pr) else f"{pr:.2f}")
+
+        if fine_svcs:
+            ServicePicker(f1, fine_svcs, variable=reason_var, width=380,
+                          show_cat_filter=False, placeholder='🔍 Оберіть штраф із меню…',
+                          on_select=_pick_reason).pack(padx=12,pady=(0,4))
+        else:
+            reason_var.set(reasons[0])
+            ctk.CTkOptionMenu(f1,values=reasons,variable=reason_var,
+                              width=380,fg_color=C['card2'],button_color=C['accent']).pack(padx=12,pady=(0,4))
+        e_reason.pack(padx=12,pady=(0,10))
+
+        f2.pack(fill='x', pady=4)
         lbl(f2,"💰 Сума штрафу:",12,True).pack(anchor='w',padx=12,pady=(8,3))
-        e_amt=ent(f2,"0.00",w=300); e_amt.pack(padx=12,pady=(0,8))
+        e_amt.pack(padx=12,pady=(0,8))
 
         f3 = card(scroll); f3.pack(fill='x', pady=4)
         lbl(f3,"📝 Деталі:",12,True).pack(anchor='w',padx=12,pady=(8,3))
@@ -17322,16 +18584,25 @@ class BookingDetailDlg(ctk.CTkToplevel):
             try: amt=float(e_amt.get())
             except: messagebox.showerror("","Невірна сума"); return
             if amt<=0: messagebox.showerror("","Введіть суму штрафу"); return
-            reason=e_reason.get().strip() or reason_var.get()
+            reason=e_reason.get().strip() or reason_var.get().strip()
+            if not reason:
+                messagebox.showerror("","Оберіть або введіть причину штрафу"); return
             detail=e_note.get().strip()
             note_text=f"fine:{reason}:{detail}"
+            _chosen=_fine_by_name.get(reason_var.get().strip()) if not e_reason.get().strip() else None
 
             def _do_save():
-                first_svc=query("SELECT id FROM services LIMIT 1",fetch='one')
-                sid=first_svc['id'] if first_svc else 1
+                if _chosen and _chosen.get('id'):
+                    sid=_chosen['id']
+                else:
+                    first_svc=(fine_svcs[0] if fine_svcs else None) or \
+                              query("SELECT id FROM services LIMIT 1",fetch='one')
+                    sid=first_svc['id'] if first_svc else 1
+                # INSERT без RETURNING → fetch=None (інакше «no results to fetch»
+                # і запис не зберігався)
                 query("""INSERT INTO service_orders (booking_id,room_id,service_id,quantity,price,total,note,created_at)
                           VALUES (%s,%s,%s,1,%s,%s,%s,NOW())""",
-                      (self.bid,b['room_id'],sid,amt,amt,note_text))
+                      (self.bid,b['room_id'],sid,amt,amt,note_text),fetch=None)
 
             def _on_success(_r):
                 try:
@@ -17439,11 +18710,16 @@ class PaymentDlg(ctk.CTkToplevel):
         try:
             _b_row = get_booking(self.bid) or {}
             _pay_raw = get_payments(self.bid) or []
-            _fin = calc_stay_financials(_b_row, _pay_raw)
+            _fin = calc_stay_financials(_b_row, _pay_raw, svc_total=_svc_orders_total(self.bid, _qbal))
             _total = _fin['total']
             _debt = _fin['debt']
+            self._lodging_debt = float(_fin.get('lodging_debt', _fin['debt']) or 0)
+            self._svc_debt = float(_fin.get('svc_debt', 0) or 0)
+            self._svc_items = (_svc_unpaid_items(self.bid, _fin.get('svc_covered', 0), _qbal)
+                               if self._svc_debt > 0 else [])
         except Exception:
             _debt = self._bal.get('debt', 0)
+            self._lodging_debt = float(_debt or 0); self._svc_debt = 0.0; self._svc_items = []
 
         # Дістаємо дані гостя для чека
         self._guest_name = ''; self._guest_phone = ''; self._room_number = ''
@@ -17476,6 +18752,12 @@ class PaymentDlg(ctk.CTkToplevel):
 
         lbl(f, f"Борг: {_debt:.0f}₴", 22, True,
             C['red'] if _debt > 0 else C['green']).pack(pady=4)
+        if self._svc_debt > 0 and self._svc_items:
+            _parts = []
+            if self._lodging_debt > 0:
+                _parts.append(f"проживання {self._lodging_debt:.0f}₴")
+            _parts.append(f"послуги {self._svc_debt:.0f}₴")
+            lbl(f, "  +  ".join(_parts), 11, color=C['text2']).pack(pady=(0, 2))
 
         # Метод оплати
         lbl(f,"Метод оплати:",11,color=C['text2']).pack(pady=(10,3))
@@ -17527,7 +18809,7 @@ class PaymentDlg(ctk.CTkToplevel):
 
         btn(f,"✅  Прийняти оплату",self._save,C['green'],280,height=44).pack(pady=14)
 
-    def _build_receipt_lines(self, amount, method_str, received=0):
+    def _build_receipt_lines(self, amount, method_str, received=0, svc_part=0.0, main_part=None):
         import datetime as _dt
         _method_ua = {'cash':'Готівка','card':'Картка','transfer':'Переказ','online':'Онлайн'}
         lines = [
@@ -17537,8 +18819,23 @@ class PaymentDlg(ctk.CTkToplevel):
             f"  Тел.     : {self._guest_phone or '—'}",
             f"{'─'*52}",
             f"  Метод    : {_method_ua.get(method_str, method_str)}",
-            f"  Сума     : {amount:.0f}₴",
         ]
+        _items = getattr(self, '_svc_items', []) or []
+        if svc_part > 0 and _items:
+            lines.append(f"{'─'*52}")
+            lines.append("  За що оплата:")
+            if main_part and main_part > 0:
+                lines.append(f"  • Проживання / оренда : {main_part:.0f}₴")
+            lines.append("  • Додаткові послуги:")
+            for _it in _items:
+                _q = _it['qty']
+                _qs = f"{_q:g}"
+                lines.append(f"      {_it['name']}")
+                lines.append(f"        {_qs} × {_it['price']:.0f}₴ = {_it['total']:.0f}₴")
+            if svc_part + 0.5 < self._svc_debt:
+                lines.append(f"      (частково сплачено {svc_part:.0f} з {self._svc_debt:.0f}₴)")
+            lines.append(f"{'─'*52}")
+        lines.append(f"  Сума     : {amount:.0f}₴")
         if method_str == 'cash' and received > 0:
             lines.append(f"  Отримано : {received:.0f}₴")
             if received - amount >= 0:
@@ -17564,19 +18861,41 @@ class PaymentDlg(ctk.CTkToplevel):
         method = self.method.get()
         note   = self.e_note.get()
 
+        # Розподіл: спочатку закриваємо проживання/оренду, решта — послуги.
+        # Частина за послуги пишеться окремим платежем «Послуга: …» з переліком,
+        # тому в касі й у чеку видно, ЗА ЩО саме оплата (і виручка йде у «послуги»).
+        _lod = float(getattr(self, '_lodging_debt', 0) or 0)
+        _sd  = float(getattr(self, '_svc_debt', 0) or 0)
+        _items = getattr(self, '_svc_items', []) or []
+        svc_part = min(max(amount - _lod, 0.0), _sd) if (_sd > 0 and _items) else 0.0
+        main_part = amount - svc_part
+        _items_txt = ", ".join(f"{i['name']} ×{i['qty']:g}" for i in _items)
+
         # Записуємо оплату в БД
-        query("INSERT INTO payments(booking_id,amount,method,note,shift_id,created_at) VALUES(%s,%s,%s,%s,%s,NOW())",
-              (self.bid, amount, method, note, sid), fetch=None)
+        if main_part > 0.004:
+            query("INSERT INTO payments(booking_id,amount,method,note,shift_id,created_at) VALUES(%s,%s,%s,%s,%s,NOW())",
+                  (self.bid, main_part, method, note, sid), fetch=None)
+        if svc_part > 0.004:
+            _svc_note = f"Послуга: {_items_txt}"
+            if svc_part + 0.5 < _sd:
+                _svc_note += " (частково)"
+            if note.strip():
+                _svc_note += f" | {note.strip()}"
+            query("INSERT INTO payments(booking_id,amount,method,note,shift_id,created_at) VALUES(%s,%s,%s,%s,%s,NOW())",
+                  (self.bid, svc_part, method, _svc_note[:250], sid), fetch=None)
 
         # Завжди показуємо чек для перегляду і друку
+        _desc = (f"Послуги: {_items_txt}"[:100] if (svc_part > 0 and main_part <= 0.004)
+                 else f"Оплата за бронювання #{self.bid}")
         cbx_ask_and_receipt(amount,
             "CARD" if method == "card" else "CASH",
-            f"Оплата за бронювання #{self.bid}",
+            _desc,
             self._guest_name, self._guest_phone)
         _recv_val = 0.0
         try: _recv_val = float(self._e_received.get() or 0)
         except Exception: pass
-        lines = self._build_receipt_lines(amount, method, received=_recv_val)
+        lines = self._build_receipt_lines(amount, method, received=_recv_val,
+                                          svc_part=svc_part, main_part=main_part)
         print_text(f"Чек оплати — №{self._room_number}", lines)
 
         if self.on_save: self.on_save()
@@ -17702,6 +19021,31 @@ def _hybrid_conn_cursor():
     yield _CoHybridCursor(None)
 
 
+def _cash_income_refunds(shift_id):
+    """Повернення ДОХОДУ (не залогів) за зміну по методах оплати: {'cash','card','transfer','total'} (≥0).
+    Раніше каса ігнорувала такі повернення: у «Готівці в касі» й «Безналі» вони не віднімались
+    (хоча звіт зміни їх відніме). Тепер від'ємні платежі, окрім повернень залогу, віднімаються."""
+    out = {'cash': 0.0, 'card': 0.0, 'transfer': 0.0, 'total': 0.0}
+    if not shift_id:
+        return out
+    try:
+        from app.utils.db import query as _qir
+        rows = _qir("""SELECT COALESCE(method,'cash') AS m, COALESCE(SUM(-amount),0) AS s
+                       FROM payments
+                       WHERE shift_id=%s AND amount<0
+                         AND COALESCE(note,'') NOT LIKE 'Повернення залогу%%'
+                         AND COALESCE(note,'') NOT LIKE 'deposit_returned%%'
+                       GROUP BY 1""", (shift_id,)) or []
+        for r in rows:
+            m = str(r.get('m') if isinstance(r, dict) else r[0]).lower()
+            v = float((r.get('s') if isinstance(r, dict) else r[1]) or 0)
+            key = 'cash' if m == 'cash' else ('card' if m == 'card' else 'transfer')
+            out[key] += v; out['total'] += v
+    except Exception as _e:
+        log_error("_cash_income_refunds", _e)
+    return out
+
+
 class CashierFrame(tk.Frame):
     def __init__(self, parent, user):
         super().__init__(parent, bg=C['bg'])
@@ -17799,6 +19143,7 @@ class CashierFrame(tk.Frame):
         bani_rev = besidky_rev = rooms_rev_only = 0.0
         rest_svc_total = paid_total = ret_total = dep_total_bg = 0.0
         cash_total = card_total = transfer_total = 0.0
+        inc_ret_total = 0.0      # повернення доходу за зміну (для картки «Повернено»)
         pay = []; pay_rows_all = []; bk_cnt = 0
         try:
             with _hybrid_conn_cursor() as cur:
@@ -17913,6 +19258,13 @@ class CashierFrame(tk.Frame):
                         _agg = cur.fetchone() or (0, 0, 0, 0, 0, 0, 0)
                         dep_total_bg, ret_total, rooms_all, rest_svc_total, cash_total, card_total, transfer_total = (
                             float(v or 0) for v in _agg)
+                        # Повернення доходу (кнопка «Повернення коштів» і виселення з поверненням ночей)
+                        # зменшують відповідну суму: готівка/картка/переказ — нетто.
+                        _ir = _cash_income_refunds(current_shift_id)
+                        cash_total     -= _ir['cash']
+                        card_total     -= _ir['card']
+                        transfer_total -= _ir['transfer']
+                        inc_ret_total   = _ir['total']
 
                         # [8] Бані і бесідки — підмножина rooms_all через JOIN з категорією
                         cur.execute(f"""
@@ -18203,7 +19555,7 @@ class CashierFrame(tk.Frame):
                     'besidky':   f"{besidky_rev:.0f}₴",
                     'rest':      f"{rest_svc_total:.0f}₴",
                     'total':     f"{paid_total:.0f}₴",
-                    'ret':       f"-{ret_total:.0f}₴" if ret_total > 0 else "0₴",
+                    'ret':       f"-{(ret_total + inc_ret_total):.0f}₴" if (ret_total + inc_ret_total) > 0 else "0₴",
                     'dep':       f"{max(dep_total_bg + _op_dep - ret_total, 0):.0f}₴",
                     'rooms_cnt': str(bk_cnt),
                 },
@@ -18357,6 +19709,7 @@ class CashierFrame(tk.Frame):
         paid_total = ret_total = dep_total = dep_total_bg = rooms_rev = 0.0
         bani_rev = besidky_rev = rooms_rev_only = rest_svc_total = 0.0
         svcs_rev = rest_total = cash_total = card_total = transfer_total = 0.0
+        inc_ret_total = 0.0
         pay = []; pay_rows_all = []; bk_cnt = 0; shift_label = "—"
         _op_cash = _op_dep = 0.0
 
@@ -18673,6 +20026,12 @@ class CashierFrame(tk.Frame):
         cash_total     = sum(float(p['amount'] or 0) for p in pay_rows_all if p.get('method') == 'cash'                        and float(p.get('amount') or 0) > 0 and not _is_deposit(p))
         card_total     = sum(float(p['amount'] or 0) for p in pay_rows_all if p.get('method') == 'card'                        and float(p.get('amount') or 0) > 0 and not _is_deposit(p))
         transfer_total = sum(float(p['amount'] or 0) for p in pay_rows_all if p.get('method') in ('transfer','online') and float(p.get('amount') or 0) > 0 and not _is_deposit(p))
+        # Повернення доходу віднімаємо від методів (див. _cash_income_refunds)
+        _ir_b = _cash_income_refunds(current_shift_id)
+        cash_total     -= _ir_b['cash']
+        card_total     -= _ir_b['card']
+        transfer_total -= _ir_b['transfer']
+        inc_ret_total   = _ir_b['total']
 
         # ── Будуємо UI ──
         shift_start_dt = get_session_start()
@@ -18772,7 +20131,7 @@ class CashierFrame(tk.Frame):
         _dep_val_lbl.pack(side='left', padx=(8, 24))
 
         # деталі: відкриття + прийнято - повернено - переміщено
-        _detail = f"Відкриття: {_opening_cash_bi:.0f}₴  +  Прийнято: {_cash_total_bi:.0f}₴"
+        _detail = f"Відкриття: {_opening_cash_bi:.0f}₴  +  Прийнято: {(_cash_total_bi + _ret_cash_bi):.0f}₴"
         if _ret_cash_bi:   _detail += f"  −  Повернено: {_ret_cash_bi:.0f}₴"
         if _transfers_out: _detail += f"  −  Переміщено: {_transfers_out:.0f}₴"
         lbl(_cb_inner, _detail, 10, color=C['text2']).pack(side='left', padx=8)
@@ -18789,7 +20148,7 @@ class CashierFrame(tk.Frame):
             ("🌿 Бесідки",         f"{besidky_rev:.0f}₴",              '#2d7a4f',   'besidky'),
             ("🍽 Ресторан/Послуги",f"{rest_svc_total:.0f}₴",           '#9b59b6',   'rest'),
             ("✅ Всього отримано", f"{paid_total:.0f}₴",               C['green'],  'total'),
-            ("↩️ Повернено",       f"-{ret_total:.0f}₴" if ret_total else "0₴", C['red'], 'ret'),
+            ("↩️ Повернено",       f"-{(ret_total + inc_ret_total):.0f}₴" if (ret_total + inc_ret_total) else "0₴", C['red'], 'ret'),
             ("🔒 Залишок залогів", f"{max(dep_total_bg + _op_dep - ret_total, 0):.0f}₴", '#e67e22', 'dep'),
             ("🏨 Заселені",        str(bk_cnt),                        C['green'],  'rooms_cnt'),
         ]):
@@ -18848,7 +20207,9 @@ class CashierFrame(tk.Frame):
         self._transfer_tree = tt
 
         ap = card(split_row); ap.grid(row=0, column=1, sticky='nsew', padx=(8,0))
-        lbl(ap, "📋  Транзакції зміни", 13, True).pack(anchor='w', padx=12, pady=(10,5))
+        ap_hdr = tk.Frame(ap, bg=C['card']); ap_hdr.pack(fill='x', padx=12, pady=(10,5))
+        lbl(ap_hdr, "📋  Транзакції зміни", 13, True).pack(side='left')
+        btn(ap_hdr, "↩ Повернення коштів", self._refund_dialog, C['red'], 170, height=30).pack(side='right')
         ff2, at = mktree(ap, ('time','room','guest','amount','method','note'),
                          10, [110, 90, 200, 90, 80, 260])
         for c_, h in zip(('time','room','guest','amount','method','note'),
@@ -18877,6 +20238,294 @@ class CashierFrame(tk.Frame):
         ff2.pack(fill='both', expand=True, padx=8, pady=(0,10))
         self._pay_tree = at
         self._all_tree = at
+
+    # ══════════════ ПОВЕРНЕННЯ КОШТІВ ══════════════
+    _RF_KIND_LABEL = {'room': '🛏 Номер', 'bath': '🛁 Баня', 'gaz': '🌿 Бесідка',
+                      'svc': '🛎 Послуга', 'rest': '🍽 Ресторан', 'dep': '🔒 Залог', 'other': '💵 Інше'}
+
+    @staticmethod
+    def _rf_kind(note, cat_name, has_booking):
+        """Тип операції каси за приміткою платежу та категорією номера."""
+        n = (note or '').strip().lower()
+        if n.startswith('залог') or n.startswith('deposit'):         return 'dep'
+        if n.startswith('ресторан'):                                  return 'rest'
+        if n.startswith('послуга') or n.startswith('додаткові послуги'): return 'svc'
+        c = (cat_name or '').lower()
+        if 'бан' in c or 'saun' in c:                                 return 'bath'
+        if 'бесід' in c or 'альтанк' in c:                            return 'gaz'
+        return 'room' if has_booking else 'other'
+
+    @staticmethod
+    def _rf_where(room):
+        """« №12» для числових номерів і «Баня №3» як є — без подвійного «№»."""
+        import re as _rw
+        room = str(room or '').strip()
+        if room in ('', '—'): return ""
+        return f" №{room}" if _rw.fullmatch(r'[\d/.\-]+', room) else f" {room}"
+
+    def _rf_title(self, kind, room):
+        """«🛁 Баня №3», «🛏 Номер №12», «🍽 Ресторан» — без дубля слова («Баня Баня №3»)."""
+        lab = self._RF_KIND_LABEL[kind]
+        emoji, _, word = lab.partition(' ')
+        w = self._rf_where(room).strip()
+        if w and w.lower().startswith(word.lower()):
+            return f"{emoji} {w}"
+        return f"{lab} {w}".strip()
+
+    def _refund_dialog(self):
+        """Повернення коштів по БУДЬ-ЯКІЙ операції каси за поточну зміну: номер, баня, бесідка,
+        послуга, ресторан, залог. Створює від'ємний платіж (мінус у касі, червоний рядок у
+        «Транзакціях зміни»). Якщо повертаємо за номер/баню/бесідку, де гість зараз заселений, —
+        можна одразу звільнити його й відправити на прибирання."""
+        import re as _re
+        import datetime as _dtr
+        from app.utils.db import query as _qr
+        try:
+            shift_id = get_current_shift_id()
+        except Exception:
+            shift_id = None
+        if not shift_id:
+            messagebox.showwarning("Повернення коштів", "Немає відкритої зміни"); return
+
+        # ── Операції зміни ──
+        try:
+            rows = _qr("""SELECT p.id, p.booking_id, p.amount, COALESCE(p.method,'cash') AS method,
+                                 COALESCE(p.note,'') AS note,
+                                 p.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Kyiv' AS cat,
+                                 COALESCE(g.name,'—') AS guest, COALESCE(r.number,'—') AS room_number,
+                                 r.id AS room_id, LOWER(COALESCE(rc.name,'')) AS cat_name,
+                                 b.status AS bstatus
+                          FROM payments p
+                          LEFT JOIN bookings b ON p.booking_id=b.id
+                          LEFT JOIN guests g ON b.guest_id=g.id
+                          LEFT JOIN rooms r ON b.room_id=r.id
+                          LEFT JOIN room_categories rc ON r.category_id=rc.id
+                          WHERE p.shift_id=%s
+                          ORDER BY p.created_at DESC, p.id DESC""", (shift_id,)) or []
+        except Exception as _e:
+            log_error("CashierFrame._refund_dialog load", _e)
+            messagebox.showerror("Помилка", f"Не вдалось завантажити операції зміни:\n{_e}"); return
+
+        # скільки вже повернено по кожному платежу (маркер [p#ID] у примітці повернення)
+        refunded = {}
+        for r in rows:
+            a = float(r['amount'] or 0)
+            if a < 0:
+                m = _re.search(r'\[p#(\d+)\]', r['note'] or '')
+                if m:
+                    refunded[int(m.group(1))] = refunded.get(int(m.group(1)), 0.0) + (-a)
+        items = []
+        for r in rows:
+            a = float(r['amount'] or 0)
+            if a <= 0: continue
+            done = refunded.get(int(r['id']), 0.0)
+            kind = self._rf_kind(r['note'], r['cat_name'], r['booking_id'] is not None)
+            t = r['cat']
+            ts = t.strftime('%d.%m %H:%M') if hasattr(t, 'strftime') else str(t)[5:16]
+            items.append(dict(id=int(r['id']), bid=r['booking_id'], amt=a, done=done,
+                              left=round(a - done, 2), method=r['method'] or 'cash',
+                              note=r['note'], ts=ts, guest=r['guest'], room=str(r['room_number']),
+                              room_id=r['room_id'], kind=kind, bstatus=r['bstatus']))
+        if not items:
+            messagebox.showinfo("Повернення коштів", "У поточній зміні ще немає операцій, за які можна повернути кошти."); return
+
+        METHOD_UA = {'cash': 'готівка', 'card': 'картка', 'transfer': 'переказ', 'online': 'переказ'}
+        win = dlg_win(self, "↩ Повернення коштів", "1000x640")
+        def _fit_to_screen(_try=[0]):
+            # Вікно не вище за видиму область екрана (мінус заголовок і панель завдань),
+            # інакше нижні кнопки опиняються за краєм екрана. Одразу після створення вікно
+            # ще не розкладене (geometry() = 1x1), тому чекаємо справжнього розміру.
+            try:
+                win.update_idletasks()
+                w_, h_ = win.winfo_width(), win.winfo_height()
+                if (w_ < 50 or h_ < 50) and _try[0] < 15:
+                    _try[0] += 1
+                    win.after(40, _fit_to_screen); return
+                sh, sw = win.winfo_screenheight(), win.winfo_screenwidth()
+                x_, y_ = win.winfo_x(), win.winfo_y()
+                nh, nw = min(h_, sh - 120), min(w_, sw - 20)
+                y_ = max(0, min(y_, sh - nh - 80))
+                x_ = max(0, min(x_, sw - nw - 10))
+                if (nw, nh) != (w_, h_) or y_ != win.winfo_y():
+                    win.geometry(f"{nw}x{nh}+{x_}+{y_}")
+            except Exception as _eg:
+                log_error("CashierFrame._refund_dialog fit", _eg)
+        win.after(40, _fit_to_screen)
+        outer = card(win); outer.pack(fill='both', expand=True, padx=12, pady=12)
+        lbl(outer, "↩  Повернення коштів", 16, True).pack(anchor='w', padx=14, pady=(12, 0))
+        lbl(outer, "Оберіть операцію, за яку повертаєте гроші (усе, що проходило по касі цієї зміни)",
+            11, color=C['text2']).pack(anchor='w', padx=14, pady=(0, 6))
+
+        # ── фільтри ──
+        FILTERS = {'Усе': None, '🛏 Номери': ('room', 'other'), '🛁 Бані': ('bath',), '🌿 Бесідки': ('gaz',),
+                   '🛎 Послуги': ('svc',), '🍽 Ресторан': ('rest',), '🔒 Залоги': ('dep',)}
+        fr = tk.Frame(outer, bg=C['card']); fr.pack(fill='x', padx=14, pady=(0, 6))
+        filt_var = ctk.StringVar(value='Усе')
+        seg = ctk.CTkSegmentedButton(fr, values=list(FILTERS.keys()), variable=filt_var,
+                                     command=lambda v: refill())
+        seg.pack(side='left')
+        q_var = ctk.StringVar()
+        e_q = ctk.CTkEntry(fr, textvariable=q_var, placeholder_text="🔍 номер, гість, примітка…", width=240)
+        e_q.pack(side='right')
+
+        # Нижня частина (форма повернення + кнопки) закріплена знизу й пакується ПЕРШОЮ:
+        # коли вікно низьке, стискається таблиця, а кнопки лишаються на місці.
+        bottom = tk.Frame(outer, bg=C['card']); bottom.pack(side='bottom', fill='x')
+
+        cols = ('ts', 'kind', 'room', 'guest', 'amt', 'done', 'left', 'meth', 'note')
+        tf, tv = mktree(outer, cols, 5, [90, 100, 80, 150, 80, 80, 90, 80, 230])
+        for c_, h_ in zip(cols, ['Час', 'Тип', 'Кімн.', 'Гість', 'Сплачено', 'Повернено', 'Можна повернути', 'Метод', 'Примітка']):
+            tv.heading(c_, text=h_)
+        tv.tag_configure('full', foreground=C['text2'])
+        tf.pack(fill='both', expand=True, padx=14, pady=(0, 8))
+        by_iid = {}
+
+        def refill(*_):
+            tv.delete(*tv.get_children()); by_iid.clear()
+            allowed = FILTERS.get(filt_var.get())
+            q = (q_var.get() or '').strip().lower()
+            for it in items:
+                if allowed and it['kind'] not in allowed: continue
+                blob = f"{it['room']} {it['guest']} {it['note']} {self._RF_KIND_LABEL[it['kind']]}".lower()
+                if q and not all(w in blob for w in q.split()): continue
+                iid = tv.insert('', 'end', tags=('full',) if it['left'] <= 0.5 else (), values=(
+                    it['ts'], self._RF_KIND_LABEL[it['kind']], it['room'], it['guest'],
+                    f"{it['amt']:.0f}₴", f"{it['done']:.0f}₴" if it['done'] else "—",
+                    f"{max(it['left'], 0):.0f}₴", METHOD_UA.get(it['method'], it['method']), it['note']))
+                by_iid[iid] = it
+            sel_state(None)
+        q_var.trace_add('write', refill)
+
+        # ── панель повернення ──
+        pan = tk.Frame(bottom, bg=C['card2']); pan.pack(fill='x', padx=14, pady=(0, 6))
+        sel_lbl = lbl(pan, "Оберіть рядок зі списку вище", 12, True, C['text2'])
+        sel_lbl.pack(anchor='w', padx=12, pady=(10, 4))
+        r1 = tk.Frame(pan, bg=C['card2']); r1.pack(fill='x', padx=12, pady=2)
+        lbl(r1, "Сума повернення (₴):", 11).pack(side='left')
+        e_amt = ent(r1, "0", w=110); e_amt.pack(side='left', padx=(8, 18))
+        meth_var = ctk.StringVar(value='cash')
+        for val, txt, clr in (('cash', '💵 Готівка', C['green']), ('card', '💳 Картка', C['accent']),
+                              ('transfer', '🏦 Переказ', '#9b59b6')):
+            ctk.CTkRadioButton(r1, text=txt, variable=meth_var, value=val, fg_color=clr,
+                               text_color=C['text'], font=('Segoe UI', 11)).pack(side='left', padx=6)
+        r2 = tk.Frame(pan, bg=C['card2']); r2.pack(fill='x', padx=12, pady=2)
+        lbl(r2, "Причина:", 11).pack(side='left')
+        e_reason = ent(r2, "наприклад: гість скасував / помилкова оплата", w=520)
+        e_reason.pack(side='left', padx=8)
+        clean_var = ctk.BooleanVar(value=False)
+        clean_cb = ctk.CTkCheckBox(pan, text="", variable=clean_var, fg_color=C['accent'],
+                                   text_color=C['text'], font=('Segoe UI', 11, 'bold'))
+        warn_lbl = lbl(pan, "", 10, color=C['yellow'])
+        warn_lbl.pack(anchor='w', padx=12, pady=(2, 0))
+        st = {'it': None, 'touched': False}
+
+        def _can_clean(it):
+            return (it is not None and it['kind'] in ('room', 'bath', 'gaz')
+                    and it['bstatus'] == 'checkedin' and it['room_id'] is not None)
+
+        def sel_state(it):
+            st['it'] = it; st['touched'] = False
+            clean_cb.pack_forget()
+            warn_lbl.configure(text="")
+            if it is None:
+                sel_lbl.configure(text="Оберіть рядок зі списку вище", text_color=C['text2'])
+                e_amt.delete(0, 'end'); return
+            sel_lbl.configure(text=f"{self._rf_title(it['kind'], it['room'])} · {it['guest']} · сплачено {it['amt']:.0f}₴",
+                              text_color=C['text'])
+            e_amt.delete(0, 'end'); e_amt.insert(0, f"{max(it['left'], 0):g}")
+            meth_var.set(it['method'] if it['method'] in ('cash', 'card', 'transfer') else
+                         ('transfer' if it['method'] == 'online' else 'cash'))
+            if it['left'] <= 0.5:
+                warn_lbl.configure(text="⚠ За цією операцією вже повернено все"); return
+            if it['done'] > 0:
+                warn_lbl.configure(text=f"ℹ Уже повернено {it['done']:.0f}₴ з {it['amt']:.0f}₴")
+            if _can_clean(it):
+                obj = {'bath': 'баню', 'gaz': 'бесідку'}.get(it['kind'], 'номер')
+                clean_cb.configure(text=f"🧹 Звільнити {obj} і одразу відправити на прибирання")
+                clean_var.set(it['done'] == 0)     # повне повернення за нову оплату — за замовчуванням ТАК
+                clean_cb.pack(anchor='w', padx=12, pady=(4, 2))
+                clean_cb.configure(command=lambda: st.update(touched=True))
+
+        def on_pick(_e=None):
+            sel = tv.selection()
+            sel_state(by_iid.get(sel[0]) if sel else None)
+        tv.bind('<<TreeviewSelect>>', on_pick)
+
+        def on_amt(*_):
+            it = st['it']
+            if not it or st['touched'] or not _can_clean(it): return
+            try:
+                a = float(e_amt.get().replace(',', '.'))
+                clean_var.set(a >= it['left'] - 0.5 and it['done'] == 0)
+            except Exception:
+                pass
+        e_amt.bind('<KeyRelease>', on_amt)
+
+        def do_refund():
+            it = st['it']
+            if not it:
+                messagebox.showwarning("Повернення", "Спочатку оберіть операцію зі списку", parent=win); return
+            if it['left'] <= 0.5:
+                messagebox.showwarning("Повернення", "За цією операцією вже повернено повну суму", parent=win); return
+            try:
+                amt = round(float(e_amt.get().replace(',', '.').strip()), 2)
+            except Exception:
+                messagebox.showerror("Повернення", "Введіть коректну суму", parent=win); return
+            if amt <= 0:
+                messagebox.showerror("Повернення", "Сума має бути більшою за 0", parent=win); return
+            if amt > it['left'] + 0.01:
+                messagebox.showerror("Повернення", f"Можна повернути не більше {it['left']:.0f}₴", parent=win); return
+            reason = (e_reason.get() or '').strip()
+            if reason.startswith("наприклад"): reason = ''
+            meth = meth_var.get()
+            do_clean = _can_clean(it) and clean_var.get()
+            what = f"{self._rf_title(it['kind'], it['room'])} — {it['guest']}"
+            msg = f"Повернути {amt:.0f}₴ ({METHOD_UA.get(meth, meth)})\nза: {what}?"
+            if do_clean:
+                msg += "\n\n🧹 Гостя буде виселено, а об'єкт відправлено на прибирання."
+            if not messagebox.askyesno("Підтвердіть повернення", msg, parent=win):
+                return
+            marker = f" [p#{it['id']}]"
+            if it['kind'] == 'dep':
+                head = f"Повернення залогу: {reason or 'без причини'}"
+            else:
+                head = f"Повернення: {self._rf_title(it['kind'], it['room'])} — {reason or 'без причини'}"
+            note = head[:250 - len(marker)] + marker
+            try:
+                _qr("""INSERT INTO payments (booking_id,amount,method,note,shift_id,created_at)
+                       VALUES (%s,%s,%s,%s,%s,NOW())""",
+                    (it['bid'], -amt, meth, note, shift_id), fetch=None)
+            except Exception as _e:
+                log_error("CashierFrame._refund_dialog insert", _e)
+                messagebox.showerror("Помилка", f"Повернення не збережено:\n{_e}", parent=win); return
+
+            clean_note = ""
+            if do_clean:
+                try:
+                    from app.modules.logic import update_booking_status
+                    update_booking_status(it['bid'], 'checkedout')
+                    _mark_booking_event_time(it['bid'], 'виселення')
+                    _qr("UPDATE rooms SET status='cleaning' WHERE id=%s", (it['room_id'],), fetch=None)
+                    _now = _dtr.datetime.now()
+                    _cl_append({'room': it['room'], 'cleaner': '—',
+                                'started': _now.strftime('%d.%m.%Y %H:%M'), 'finished': '',
+                                'new_status': 'cleaning', 'note': 'Повернення коштів — авто-запис',
+                                'logged_at': _now.strftime('%d.%m.%Y %H:%M:%S')})
+                    clean_note = "\n🧹 Відправлено на прибирання."
+                except Exception as _e2:
+                    log_error("CashierFrame._refund_dialog cleanup", _e2)
+                    clean_note = f"\n⚠ Гроші повернено, але статус не змінено: {_e2}"
+            messagebox.showinfo("✅ Повернення збережено", f"Повернено {amt:.0f}₴ — {what}{clean_note}", parent=win)
+            try: win.destroy()
+            except Exception: pass
+            # повна перебудова каси, щоб оновились і картки, і підсумок «Готівка в касі»
+            self._current_built_sid = -1
+            self._rebuild()
+
+        bf = tk.Frame(bottom, bg=C['card']); bf.pack(fill='x', padx=14, pady=(2, 12))
+        btn(bf, "↩ Повернути", do_refund, C['red'], 170, height=36).pack(side='left')
+        btn(bf, "Закрити", win.destroy, C['gray'], 110, height=36).pack(side='left', padx=8)
+        refill()
 
     def _add_transfer(self):
         """Діалог додавання переміщення коштів."""
@@ -21966,6 +23615,15 @@ def _open_sauna_checkin_dlg(parent, room, on_save=None, booking=None):
                             on_change=lambda: _update_total())
 
     # Оплата
+    # 🎁 Безкоштовне проживання (окрема картка над розрахунком)
+    fs_card_h = card(sc); fs_card_h.pack(fill='x', padx=12, pady=5)
+    lbl(fs_card_h, "🎁  Безкоштовне відвідування", 13, True).pack(anchor='w', padx=12, pady=(10,0))
+    _fs0_h = _free_stay_map([booking.get('id')]) if (booking and booking.get('id')) else {}
+    _fs_fr_h, free_var_h, e_free_cm_h = _free_stay_widget(
+        fs_card_h, init_on=bool(_fs0_h), init_comment=(list(_fs0_h.values())[0] if _fs0_h else ''),
+        on_change=lambda: _update_total(), visit=True)
+    _fs_fr_h.pack(fill='x', padx=12, pady=(6,10))
+
     p_card = card(sc); p_card.pack(fill='x', padx=12, pady=5)
     lbl(p_card, "💰  Розрахунок", 13, True).pack(anchor='w', padx=12, pady=(10,5))
     pf = tk.Frame(p_card, bg=C['card']); pf.pack(fill='x', padx=12, pady=(0,6))
@@ -22003,6 +23661,9 @@ def _open_sauna_checkin_dlg(parent, room, on_save=None, booking=None):
         try: h = float(e_hours.get() or 0)
         except: h = 0
         base = default_price * h
+        try:
+            if free_var_h.get(): base = 0.0   # 🎁 безкоштовне проживання
+        except Exception: pass
         # Додаємо вибрані додаткові послуги до суми
         try:
             _f = _get_obj_svcs  # noqa — буде доступна після _build_services_block
@@ -22013,10 +23674,18 @@ def _open_sauna_checkin_dlg(parent, room, on_save=None, booking=None):
             _disc_h = max(float(e_discount_h.get() or 0), 0.0)
         except (NameError, Exception):
             _disc_h = 0.0
+        try:
+            if free_var_h.get(): _disc_h = 0.0
+        except Exception: pass
         total = max(base + svc_total - _disc_h, 0.0)
         svc_str = f" + {svc_total:.0f}₴ послуги" if svc_total > 0 else ""
         disc_str = f" − {_disc_h:.0f}₴ знижка" if _disc_h > 0 else ""
-        lbl_total.configure(text=f"{total:.0f}₴  ({h:.1f}г × {default_price:.0f}₴{svc_str}{disc_str})")
+        try: _free_now_h = bool(free_var_h.get())
+        except Exception: _free_now_h = False
+        if _free_now_h:
+            lbl_total.configure(text=f"{total:.0f}₴  (🎁 безкоштовно{svc_str})")
+        else:
+            lbl_total.configure(text=f"{total:.0f}₴  ({h:.1f}г × {default_price:.0f}₴{svc_str}{disc_str})")
         _topay = max(0.0, total - _adv_amount)
         if lbl_topay is not None:
             lbl_topay.configure(text=f"{_topay:.0f}₴", text_color=C['green'] if _topay > 0 else C['text2'])
@@ -22149,6 +23818,12 @@ def _open_sauna_checkin_dlg(parent, room, on_save=None, booking=None):
         if discount_h > 0 and not discount_comment_h:
             messagebox.showerror("","Вкажіть коментар (причину) знижки"); return
         total = max(price_per_hour * h - discount_h, 0.0)
+        _free_on_h = bool(free_var_h.get())
+        _free_cm_h = e_free_cm_h.get().strip()
+        if _free_on_h and not _free_cm_h:
+            messagebox.showerror("","Вкажіть коментар до безкоштовного відвідування"); return
+        if _free_on_h:
+            total = 0.0; discount_h = 0.0
         try: dep = float(e_dep.get() or 0)
         except: dep = 0.0
 
@@ -22196,6 +23871,7 @@ def _open_sauna_checkin_dlg(parent, room, on_save=None, booking=None):
                 bid = b_row['id'] if b_row else None
             if bid:
                 _mark_booking_event_time(bid, 'заселення')
+        _save_free_stay(bid, _free_on_h, _free_cm_h)
 
         # Рахуємо вже сплачений аванс — він записаний на СТАРЕ бронювання (booking['id'])
         # bid тут — нове бронювання (щойно створене), аванс треба шукати по оригінальному bid
@@ -22266,7 +23942,7 @@ def _open_sauna_checkin_dlg(parent, room, on_save=None, booking=None):
             f"  Годин   : {h:.1f}",
             f"  Ціна/год: {price_per_hour:.0f}₴",
         ] + ([f"  Знижка  : -{discount_h:.0f}₴ ({discount_comment_h})"] if discount_h > 0 else []) + [
-            f"  Баня    : {total:.0f}₴",
+            (f"  Баня    : БЕЗКОШТОВНО ({_free_cm_h})" if _free_on_h else f"  Баня    : {total:.0f}₴"),
         ]
         if _adv_paid_ci > 0:
             lines += [
@@ -22387,6 +24063,12 @@ def _open_sauna_booking_dlg(parent, room, on_save=None):
                              lambda: e_hours2.get(), _set_hours_bk,
                              on_change=lambda: _upd())
 
+    # ── 🎁 Безкоштовне проживання ───────────────────────
+    fs_card_b = card(sc); fs_card_b.pack(fill='x', padx=12, pady=5)
+    lbl(fs_card_b, "🎁  Безкоштовне відвідування", 13, True).pack(anchor='w', padx=12, pady=(10,0))
+    _fs_fr_b, free_var_b, e_free_cm_b = _free_stay_widget(fs_card_b, on_change=lambda: _upd(), visit=True)
+    _fs_fr_b.pack(fill='x', padx=12, pady=(6,10))
+
     # ── Оплата ──────────────────────────────────────────
     p_card = card(sc); p_card.pack(fill='x', padx=12, pady=5)
     lbl(p_card, "💰  Оплата", 13, True).pack(anchor='w', padx=12, pady=(10,5))
@@ -22427,7 +24109,10 @@ def _open_sauna_booking_dlg(parent, room, on_save=None):
         try:
             h = float(e_hours2.get() or 0)
             total = default_price * h
-            lbl_total2.configure(text=f"{total:.0f}₴  ({h:.2f}г × {default_price:.0f}₴)")
+            if free_var_b.get():
+                lbl_total2.configure(text="0₴  (🎁 безкоштовно)")
+            else:
+                lbl_total2.configure(text=f"{total:.0f}₴  ({h:.2f}г × {default_price:.0f}₴)")
         except Exception:
             lbl_total2.configure(text="?")
         try: _tfx2.refresh_end()
@@ -22450,6 +24135,12 @@ def _open_sauna_booking_dlg(parent, room, on_save=None):
             messagebox.showerror("","Невірна дата/час заселення або виселення.\nФормат: ДД.ММ.РРРР та ГГ:ХХ"); return
 
         total   = default_price * h
+        _free_on_b = bool(free_var_b.get())
+        _free_cm_b = e_free_cm_b.get().strip()
+        if _free_on_b and not _free_cm_b:
+            messagebox.showerror("","Вкажіть коментар до безкоштовного відвідування"); return
+        if _free_on_b:
+            total = 0.0
         water_amt = 0.0
         try: water_amt = float(e_water.get() or 0)
         except Exception: pass
@@ -22505,6 +24196,7 @@ def _open_sauna_booking_dlg(parent, room, on_save=None):
         except Exception as _e:
             log_error("sauna_booking: помилка запису", _e)
             messagebox.showerror("❌ Помилка", f"Не вдалося зберегти бронювання:\n{_e}"); return
+        _save_free_stay(bid, _free_on_b, _free_cm_b)
 
         extra_str = ""
         if water_amt > 0: extra_str += f"\nВведено коштів: {water_amt:.0f}₴"
@@ -22514,7 +24206,7 @@ def _open_sauna_booking_dlg(parent, room, on_save=None):
             f"Баня {room['number']} заброньована!\n"
             f"Гість: {name}  📞 {phone}\n"
             f"Дата: {start_dt.strftime('%d.%m.%Y')}  {start_dt.strftime('%H:%M')} – {end_dt.strftime('%H:%M')}\n"
-            f"Сума: {total:.0f}₴{extra_str}")
+            + (f"Сума: БЕЗКОШТОВНО ({_free_cm_b}){extra_str}" if _free_on_b else f"Сума: {total:.0f}₴{extra_str}"))
         win.destroy()
         if on_save: on_save()
 
@@ -23007,7 +24699,7 @@ class ReportsFrame(tk.Frame):
             self.e_to.pack(side='left',padx=(0,8))
             self.rep_type=ctk.StringVar(value='Дохід')
             ctk.CTkOptionMenu(cf,
-                values=['Дохід','Завантаженість','Послуги','Ресторан','Платежі','Заїзди','Виїзди','Прибирання','Зміни','X-звіт','Z-звіт'],
+                values=['Дохід','Завантаженість','Послуги','Ресторан','Платежі','Заїзди','Виїзди','Переселення','Прибирання','Зміни','X-звіт','Z-звіт'],
                 variable=self.rep_type,width=160,fg_color=C['card2'],button_color=C['accent']).pack(side='left',padx=8)
             btn(cf,"📊 Показати",self._show,width=130).pack(side='left',padx=5,pady=8)
             btn(cf,"📥 Excel",self._export_excel_report,'#27ae60',100).pack(side='left',padx=5,pady=8)
@@ -23142,6 +24834,28 @@ class ReportsFrame(tk.Frame):
                         rows = [dict(zip(_c2, r)) for r in _cur_es.fetchall()]
                 cols = ['name','category','orders','qty','revenue']
                 headers = ['Послуга','Категорія','Замовлень','К-сть','Дохід']
+            elif rt == 'Переселення':
+                from app.utils.db import query as _qmx
+                _ensure_booking_moves_table()
+                rows = []
+                for r in (_qmx(
+                        "SELECT m.booking_id, m.from_room_number, m.to_room_number, m.reason, m.moved_by, "
+                        "m.moved_at, g.name AS guest_name FROM booking_moves m "
+                        "LEFT JOIN bookings b ON b.id=m.booking_id LEFT JOIN guests g ON g.id=b.guest_id "
+                        "WHERE m.moved_at >= %s AND m.moved_at < %s ORDER BY m.moved_at",
+                        (df - timedelta(days=1), dt + timedelta(days=2))) or []):
+                    r = dict(r); ts = r.get('moved_at')
+                    try:
+                        if getattr(ts, 'tzinfo', None) is not None:
+                            ts = ts.astimezone(_kyiv_tz()).replace(tzinfo=None)
+                    except Exception: pass
+                    if ts is None or not (df <= ts.date() <= dt): continue
+                    rows.append({'when': ts.strftime('%d.%m.%Y %H:%M'), 'booking': r.get('booking_id'),
+                                 'guest_name': _fix_mojibake(str(r.get('guest_name') or '—')),
+                                 'from_room': r.get('from_room_number'), 'to_room': r.get('to_room_number'),
+                                 'reason': r.get('reason') or '', 'moved_by': r.get('moved_by') or ''})
+                cols = ['when','booking','guest_name','from_room','to_room','reason','moved_by']
+                headers = ['Дата/час','Бронювання','Гість','З номера','У номер','Причина','Хто переселив']
             elif rt == 'Ресторан':
                 from app.utils.db import get_conn as _gc_er
                 with _gc_er() as _c_er:
@@ -23763,34 +25477,74 @@ class ReportsFrame(tk.Frame):
             widths = [80, 150, 110, 70, 70, 100, 180, 100]
         elif rt=='Послуги':
             rows = []
+            self._svc_report_err = None
             try:
-                from app.utils.db import get_conn as _gc_svc
-                with _gc_svc() as _c_svc:
-                    with _c_svc.cursor() as _cur_svc:
-                        _cur_svc.execute("""
-                            SELECT
-                                COALESCE(NULLIF(TRIM(REGEXP_REPLACE(p.note, '^Послуга: *', '')), ''), '—') AS name,
-                                '—'          AS category,
-                                COUNT(*)     AS orders,
-                                COUNT(*)     AS qty,
-                                COALESCE(SUM(p.amount), 0) AS revenue,
-                                COALESCE(p.shift_id, (
-                                    SELECT s3.id FROM shifts s3
-                                    WHERE s3.opened_at <= p.created_at
-                                      AND (s3.closed_at IS NULL OR s3.closed_at >= p.created_at)
-                                    ORDER BY s3.opened_at DESC LIMIT 1)) AS shift_id
-                            FROM payments p
-                            WHERE p.created_at::date BETWEEN %s AND %s
-                              AND p.amount > 0
-                              AND COALESCE(p.note,'') LIKE 'Послуга:%%'
-                            GROUP BY 1, 6
-                            ORDER BY revenue DESC
-                        """, (df, dt))
-                        _rc_svc = [d[0] for d in _cur_svc.description]
-                        rows = [dict(zip(_rc_svc, r)) for r in _cur_svc.fetchall()]
+                from app.utils.db import query as _qsv
+                import datetime as _dtm
+                _lo = df - _dtm.timedelta(days=1); _hi = dt + _dtm.timedelta(days=2)
+                _shifts = _load_shifts_kyiv()
+
+                def _kyiv_naive(ts):
+                    if ts is None: return None
+                    try:
+                        if getattr(ts, 'tzinfo', None) is not None:
+                            ts = ts.astimezone(_kyiv_tz()).replace(tzinfo=None)
+                    except Exception: pass
+                    return ts
+
+                def _in_range(ts):
+                    ts = _kyiv_naive(ts)
+                    if ts is None: return False
+                    d0 = ts.date() if hasattr(ts, 'date') else ts
+                    return df <= d0 <= dt
+
+                _agg = {}
+                def _add(name, cat, qty, total, ts, sid=None):
+                    sh = _shift_for_ts(_shifts, ts)
+                    key = (name, cat, sh['id'] if sh else sid)
+                    a = _agg.setdefault(key, {'orders': 0, 'qty': 0.0, 'revenue': 0.0})
+                    a['orders'] += 1; a['qty'] += qty; a['revenue'] += total
+
+                # 1) Усі замовлені послуги (номери, бані, бесідки): service_orders
+                for r in (_qsv(
+                        "SELECT sv.name AS sname, so.note AS note, sv.category AS category, "
+                        "so.quantity AS qty, so.total AS total, so.created_at AS created_at "
+                        "FROM service_orders so LEFT JOIN services sv ON sv.id = so.service_id "
+                        "WHERE so.created_at >= %s AND so.created_at < %s "
+                        "AND COALESCE(so.note,'') NOT LIKE 'deposit%%' "
+                        "AND COALESCE(so.note,'') NOT LIKE 'fine%%'", (_lo, _hi)) or []):
+                    r = dict(r)
+                    tot = float(r.get('total') or 0)
+                    if tot <= 0 or not _in_range(r.get('created_at')):
+                        continue
+                    nm = _fix_mojibake(str(r.get('sname') or (r.get('note') or '').strip() or '—'))
+                    cat = r.get('category')
+                    _add(nm, _svc_cat_label(cat) if cat else '—',
+                         float(r.get('qty') or 1), tot, r.get('created_at'))
+
+                # 2) Платежі «Послуга:…» без бронювання (service_order для них не створюється)
+                for r in (_qsv(
+                        "SELECT p.note AS note, p.amount AS amount, p.shift_id AS shift_id, "
+                        "p.created_at AS created_at FROM payments p "
+                        "WHERE p.created_at >= %s AND p.created_at < %s AND p.amount > 0 "
+                        "AND p.booking_id IS NULL AND COALESCE(p.note,'') LIKE 'Послуга:%%'",
+                        (_lo, _hi)) or []):
+                    r = dict(r)
+                    if not _in_range(r.get('created_at')):
+                        continue
+                    nm = (r.get('note') or '').split(':', 1)[-1].strip() or '—'
+                    _add(_fix_mojibake(nm), '—', 1.0, float(r.get('amount') or 0),
+                         r.get('created_at'), sid=r.get('shift_id'))
+
+                for (nm, cat, sid), a in _agg.items():
+                    rows.append({'name': nm, 'category': cat, 'orders': a['orders'],
+                                 'qty': a['qty'], 'revenue': a['revenue'], 'shift_id': sid})
+                rows.sort(key=lambda x: -x['revenue'])
             except Exception as _esv:
                 log_error("report_services_by_shift", _esv)
-                rows = report_services(df,dt) or []
+                self._svc_report_err = str(_esv)
+                try: rows = report_services(df,dt) or []
+                except Exception: rows = []
             cols=['name','category','orders','qty','revenue']
             headers=['Послуга','Категорія','Замовлень','К-сть','Дохід']
             widths=[220,120,90,70,110]
@@ -24222,6 +25976,38 @@ class ReportsFrame(tk.Frame):
                     ['Зміна','Кімн.','Прибиральник','Початок','Кінець','Статус','Нотатка'], _rows_pr)
             self._do_print_report_fn = _print_cleaning_report
             return
+        elif rt=='Переселення':
+            rows = []
+            try:
+                from app.utils.db import query as _qmv
+                _ensure_booking_moves_table()
+                _tzk = _kyiv_tz()
+                for r in (_qmv(
+                        "SELECT m.id, m.booking_id, m.from_room_number, m.to_room_number, m.reason, "
+                        "m.moved_by, m.moved_at, g.name AS guest_name, b.price_per_day AS price "
+                        "FROM booking_moves m LEFT JOIN bookings b ON b.id=m.booking_id "
+                        "LEFT JOIN guests g ON g.id=b.guest_id "
+                        "WHERE m.moved_at >= %s AND m.moved_at < %s ORDER BY m.moved_at DESC",
+                        (df - timedelta(days=1), dt + timedelta(days=2))) or []):
+                    r = dict(r); ts = r.get('moved_at')
+                    try:
+                        if getattr(ts, 'tzinfo', None) is not None:
+                            ts = ts.astimezone(_tzk).replace(tzinfo=None)
+                    except Exception: pass
+                    if ts is None or not (df <= ts.date() <= dt): continue
+                    rows.append({'when': ts.strftime('%d.%m.%Y %H:%M'),
+                                 'booking': f"#{r.get('booking_id')}",
+                                 'guest_name': _fix_mojibake(str(r.get('guest_name') or '—')),
+                                 'from_room': f"№{r.get('from_room_number')}",
+                                 'to_room': f"№{r.get('to_room_number')}",
+                                 'reason': r.get('reason') or '—',
+                                 'moved_by': r.get('moved_by') or '—'})
+            except Exception as _emv:
+                log_error("report_relocations", _emv)
+                self._svc_report_err = str(_emv)
+            cols=['when','booking','guest_name','from_room','to_room','reason','moved_by']
+            headers=['Дата/час','Бронювання','Гість','З номера','У номер','Причина','Хто переселив']
+            widths=[130,100,200,90,90,260,150]
         else:
             rows=[]; cols=[]; headers=[]; widths=[]
 
@@ -24244,6 +26030,9 @@ class ReportsFrame(tk.Frame):
 
         if not rows:
             lbl(self.result,"Немає даних за вказаний період",13,color=C['text2']).pack(pady=30)
+            if rt in ('Послуги','Переселення') and getattr(self, '_svc_report_err', None):
+                lbl(self.result, f"⚠ Помилка запиту: {self._svc_report_err}", 11,
+                    color=C['red']).pack(padx=20, pady=(0,20))
             return
 
         # Таблиця — формат 1С: панель пошуку/керування + компактна сітка.
@@ -25244,6 +27033,36 @@ class ReportsFrame(tk.Frame):
                 FROM rooms r
             """, fetch='one') or {}
 
+        # ── Повернення ДОХОДУ (кнопка «Повернення коштів», повернення за незвані ночі) ──
+        # Раніше звіт рахував лише платежі з amount > 0, тому такі повернення в X/Z взагалі
+        # не з'являлись, а готівка в касі не зменшувалась. Повернення залогів тут НЕ беремо —
+        # вони вже показані в розділі «Залоги».
+        if shift_id:
+            _rsql, _rsql_p, _rarg = "shift_id = %s", "p.shift_id = %s", (shift_id,)
+        elif shift_start:
+            _rsql, _rsql_p, _rarg = "created_at > %s", "p.created_at > %s", (shift_start,)
+        else:
+            _rsql, _rsql_p, _rarg = "DATE(created_at) = %s", "DATE(p.created_at) = %s", (today,)
+        _ret_filter = ("COALESCE(note,'') NOT LIKE 'Повернення залогу%%' "
+                       "AND COALESCE(note,'') NOT LIKE 'deposit_returned%%'")
+        try:
+            inc_ret_rows = query(f"""
+                SELECT COALESCE(method,'cash') AS method, COUNT(*) AS cnt,
+                       COALESCE(SUM(-amount),0) AS total
+                FROM payments WHERE {_rsql} AND amount < 0 AND {_ret_filter}
+                GROUP BY 1""", _rarg) or []
+        except Exception as _eir:
+            log_error("_show_xz_report: повернення доходу", _eir)
+            inc_ret_rows = []
+        ret_by = {'cash': 0.0, 'card': 0.0, 'transfer': 0.0}
+        inc_ret_cnt = 0
+        for _rr in inc_ret_rows:
+            _m = str(_rr.get('method') or 'cash').lower()
+            _k = 'cash' if _m == 'cash' else ('card' if _m == 'card' else 'transfer')
+            ret_by[_k] += float(_rr.get('total') or 0)
+            inc_ret_cnt += int(_rr.get('cnt') or 0)
+        inc_ret_total = sum(ret_by.values())
+
         # Підрахунок по методах (для розбивки — залоги виключені)
         cash_payments  = sum(float(r['total'] or 0) for r in pay_rows
                              if r['method']=='cash'
@@ -25254,19 +27073,23 @@ class ReportsFrame(tk.Frame):
         xz_dep      = float(xz_dep_row.get('dep') or 0)
         xz_ret_cnt  = int(xz_ret_row.get('cnt') or 0)
         xz_dep_cnt  = int(xz_dep_row.get('cnt') or 0)
-        # Фізична готівка в касі = відкриття + оплати готівкою (БЕЗ залогів) - переміщення.
-        # _sr_ret_cash НЕ віднімаємо: cash_in вже виключає залоги і їх повернення.
-        # Якщо є повернення доходу (не залогів) — вони вже мають від'ємний знак у payments
-        # і НЕ потрапляють до cash_in (умова amount>0), тому додатково знімати нічого.
+        # Фізична готівка в касі = відкриття + оплати готівкою (БЕЗ залогів)
+        #                          − повернення доходу готівкою − переміщення.
+        # (cash_in рахує лише amount>0, тож повернення доходу треба віднімати окремо;
+        #  повернення залогів тут не беремо — залоги в готівку не входять.)
         if _sr_cash_in is not None:
-            cash_total = _opening_cash_sr + _sr_cash_in - transfers_total
+            cash_total = _opening_cash_sr + _sr_cash_in - ret_by['cash'] - transfers_total
         else:
-            cash_total = _opening_cash_sr + cash_payments - transfers_total
+            cash_total = _opening_cash_sr + cash_payments - ret_by['cash'] - transfers_total
         # Залоги — окремо від готівки
         xz_dep_total   = xz_dep + _opening_dep_sr
         xz_dep_balance = max(xz_dep_total - xz_ret, 0)
-        # grand_total = все прийнято (без залогів, без переміщень)
-        grand_total = cash_payments + card_total + transfer_total
+        # grand_total_gross = усе прийнято (без залогів, без переміщень), до повернень;
+        # grand_total       = те саме МІНУС повернення доходу (це йде в картки, друк, Z-підсумок).
+        grand_total_gross = cash_payments + card_total + transfer_total
+        card_total     -= ret_by['card']          # безнал — теж нетто
+        transfer_total -= ret_by['transfer']
+        grand_total = grand_total_gross - inc_ret_total
         tx_count    = sum(int(r['cnt']) for r in pay_rows)
         # Відвідувачі
         _visitors_total   = int(visitors_row.get('cnt') or 0)
@@ -25285,7 +27108,7 @@ class ReportsFrame(tk.Frame):
         _rooms_r = float(cat_rev_row.get('rooms_r') or 0)
         _bani_r  = float(cat_rev_row.get('bani_r')  or 0)
         _besid_r = float(cat_rev_row.get('besid_r') or 0)
-        room_rev = max(grand_total - svc_rev - rest_total, 0)
+        room_rev = max(grand_total_gross - svc_rev - rest_total, 0)
         rest_cnt    = int(rest.get('cnt') or 0)
 
         # Hotels (джерело бронювання) — рахуємо окремо, незалежно від того,
@@ -25477,7 +27300,42 @@ class ReportsFrame(tk.Frame):
             method_names_ua = {'cash':'💵 Готівка','card':'💳 Картка','transfer':'🏦 Переказ','online':'🌐 Онлайн'}
             for r in pay_rows:
                 _ln(method_names_ua.get(r['method'], r['method']), f"{int(r['cnt'])} транз.", f"{float(r['total'] or 0):.2f}₴")
-            _ln("ПІДСУМОК КАСА", f"{tx_count} транз.", f"{grand_total:.2f}₴", total=True)
+            if inc_ret_total > 0:
+                _ln("↩️ Повернення коштів", f"{inc_ret_cnt} транз.", f"-{inc_ret_total:.2f}₴")
+            _ln("ПІДСУМОК КАСА" + (" (за мінусом повернень)" if inc_ret_total > 0 else ""),
+                f"{tx_count} транз.", f"{grand_total:.2f}₴", total=True)
+
+            # ── ↩️ ПОВЕРНЕННЯ КОШТІВ (по кожній операції) ──
+            if inc_ret_total > 0:
+                _grp("↩️ ПОВЕРНЕННЯ КОШТІВ")
+                try:
+                    import re as _re_rt
+                    _ret_det = _qtbl(f"""
+                        SELECT p.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Kyiv' AS cat,
+                               p.amount, COALESCE(p.method,'cash') AS method, COALESCE(p.note,'') AS note,
+                               COALESCE(g.name,'') AS guest, COALESCE(r.number,'') AS room
+                        FROM payments p
+                        LEFT JOIN bookings b ON p.booking_id = b.id
+                        LEFT JOIN guests g ON b.guest_id = g.id
+                        LEFT JOIN rooms r ON b.room_id = r.id
+                        WHERE {_rsql_p} AND p.amount < 0
+                          AND COALESCE(p.note,'') NOT LIKE 'Повернення залогу%%'
+                          AND COALESCE(p.note,'') NOT LIKE 'deposit_returned%%'
+                        ORDER BY p.created_at""", _rarg) or []
+                except Exception as _e_rd:
+                    log_error("_show_xz_report: деталі повернень", _e_rd)
+                    _ret_det = []
+                _meth_ret_ua = {'cash': 'готівка', 'card': 'картка', 'transfer': 'переказ', 'online': 'переказ'}
+                for _rd in _ret_det:
+                    _t = _rd.get('cat')
+                    _hhmm = _t.strftime('%H:%M') if hasattr(_t, 'strftime') else str(_t)[11:16]
+                    _txt = _re_rt.sub(r'\s*\[p#\d+\]', '', str(_rd.get('note') or '')).strip() or 'Повернення'
+                    _g = str(_rd.get('guest') or '').strip()
+                    if _g and _g not in _txt:
+                        _txt += f" · {_g}"
+                    _ln(f"{_hhmm}  {_txt}"[:80], _meth_ret_ua.get(str(_rd.get('method')), str(_rd.get('method'))),
+                        f"-{abs(float(_rd.get('amount') or 0)):.2f}₴")
+                _ln("ПІДСУМОК ПОВЕРНЕНЬ", f"{inc_ret_cnt} транз.", f"-{inc_ret_total:.2f}₴", total=True)
 
             # ── 🔒 ЗАЛОГИ ──
             _grp("🔒 ЗАЛОГИ")
@@ -25581,7 +27439,10 @@ class ReportsFrame(tk.Frame):
             # ── 📊 ЗАГАЛЬНИЙ ПІДСУМОК ──
             _grp("📊 ЗАГАЛЬНИЙ ПІДСУМОК")
             _ln("Загальний дохід за категоріями", "—", f"{_cat_total:.2f}₴", grand=True)
-            _ln("Отримано в касу (без залогів)", "—", f"{grand_total:.2f}₴", grand=True)
+            if inc_ret_total > 0:
+                _ln("↩️ Повернення коштів", f"{inc_ret_cnt} транз.", f"-{inc_ret_total:.2f}₴", grand=True)
+            _ln("Отримано в касу (без залогів" + (", за мінусом повернень)" if inc_ret_total > 0 else ")"),
+                "—", f"{grand_total:.2f}₴", grand=True)
 
             # ── Друк і Excel-вигрузка саме ЦІЄЇ зміни ──
             def _do_print_shift_table(on_close=None, auto_print=False):
@@ -26665,6 +28526,7 @@ class ReportsFrame(tk.Frame):
                 f"  {'Готівка':<30} {cash_total:>10.2f}₴",
                 f"  {'Картка':<30} {card_total:>10.2f}₴",
                 f"  {'Переказ':<30} {transfer_total:>10.2f}₴",
+                *([f"  {'Повернення коштів':<30} {-inc_ret_total:>10.2f}₴"] if inc_ret_total > 0 else []),
                 f"  {'РАЗОМ ОТРИМАНО':<30} {grand_total:>10.2f}₴",
                 f"  {'Транзакцій':<30} {tx_count:>10}",
                 f"{'─'*52}",
@@ -26766,6 +28628,8 @@ class ReportsFrame(tk.Frame):
                 _add("📋 Аванс при бронюванні", f"{adv_total:.2f}₴", color='f39c12')
             if xz_dep > 0:
                 _add("🔒 Залоги прийнято", f"{xz_dep:.2f}₴",   color='e67e22')
+            if inc_ret_total > 0:
+                _add("↩️ Повернення коштів", f"-{inc_ret_total:.2f}₴", color='e74c3c')
             _add("✅ РАЗОМ ОТРИМАНО",    f"{grand_total:.2f}₴", bold=True, color='117A65')
             _add("🔢 Транзакцій",        str(tx_count))
 
