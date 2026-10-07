@@ -979,6 +979,218 @@ def _save_db_cfg_shared(cfg, legacy_path):
 # прожиті ночі. Через це той самий гість, що прострочив виїзд, показував
 # РІЗНИЙ борг залежно від того, у якому вікні дивишся. Тепер ВСІ місця
 # викликають саме цю функцію.
+# ── Історія змін ціни категорії ───────────────────────────────────────────
+# Ціна категорії діє З ДАТИ ЗМІНИ: ночі, оплачені за старою ціною, не перераховуються.
+# Продовження і прострочені ночі, що припадають на дату зміни або пізніше, — за новою ціною.
+# Історія: hotel_settings, key='price_history':
+#   {"<category_id>": [{"date": "2026-10-07", "old": 950, "new": 1100}, ...]}
+# Заселення з індивідуальною ціною (не дорівнює «старій» ціні запису) змін не зазнають.
+import time as _ph_time
+_price_hist = {'t': 0.0, 'v': None}
+_room_cat_cache = {'t': 0.0, 'v': {}}
+
+
+def _get_price_history(force=False):
+    import json as _j
+    if (not force) and _price_hist['v'] is not None and _ph_time.time() - _price_hist['t'] < 30:
+        return _price_hist['v']
+    data = _price_hist['v'] or {}
+    try:
+        from app.utils.db import query as _q
+        row = _q("SELECT value FROM hotel_settings WHERE key='price_history'", fetch='one')
+        data = (_j.loads(row['value']) if row and row.get('value') else {}) or {}
+    except Exception:
+        pass            # лишаємо останнє відоме значення
+    _price_hist['t'] = _ph_time.time(); _price_hist['v'] = data
+    return data
+
+
+def _record_price_change(cat_id, old_price, new_price, eff_date=None):
+    """Записує зміну ціни категорії з датою набуття чинності (за замовчуванням — сьогодні)."""
+    import json as _j
+    from app.utils.db import query as _q
+    eff = (eff_date or date.today()).isoformat()
+    data = dict(_get_price_history(force=True) or {})
+    lst = list(data.get(str(cat_id), []))
+    lst.append({'date': eff, 'old': float(old_price), 'new': float(new_price)})
+    data[str(cat_id)] = lst
+    _q("""INSERT INTO hotel_settings(key,value,updated_at) VALUES('price_history',%s,now())
+          ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()""",
+       (_j.dumps(data, ensure_ascii=False), ), fetch=None)
+    _price_hist['t'] = _ph_time.time(); _price_hist['v'] = data
+
+
+def _room_category_map():
+    if _room_cat_cache['v'] and _ph_time.time() - _room_cat_cache['t'] < 60:
+        return _room_cat_cache['v']
+    m = _room_cat_cache['v'] or {}
+    try:
+        from app.utils.db import query as _q
+        m = {int(r['id']): r['category_id'] for r in (_q("SELECT id, category_id FROM rooms", fetch='all') or [])}
+    except Exception:
+        pass
+    _room_cat_cache['t'] = _ph_time.time(); _room_cat_cache['v'] = m
+    return m
+
+
+_cat_price_cache = {'t': 0.0, 'v': {}}
+
+
+def _invalidate_price_caches():
+    """Скидає кеші цін/категорій (викликати після зміни ціни категорії)."""
+    _cat_price_cache['t'] = 0.0
+    _room_cat_cache['t'] = 0.0
+    _price_hist['t'] = 0.0
+
+
+def _category_price_map(force=False):
+    """{category_id: (поточна_ціна, погодинна_категорія)} — ПОТОЧНІ ціни з таблиці категорій
+    (Налаштування → Категорії). Кеш 30 с."""
+    if (not force) and _cat_price_cache['v'] and _ph_time.time() - _cat_price_cache['t'] < 30:
+        return _cat_price_cache['v']
+    m = _cat_price_cache['v'] or {}
+    try:
+        from app.utils.db import query as _q
+        rows = None
+        for _tbl in ('room_categories', 'categories'):
+            try:
+                rows = _q(f"SELECT id, base_price, description FROM {_tbl}", fetch='all')
+                if rows is not None:
+                    break
+            except Exception:
+                continue
+        if rows is not None:
+            m = {int(r['id']): (float(r.get('base_price') or 0),
+                                '[tariff:hour]' in str(r.get('description') or ''))
+                 for r in rows}
+    except Exception:
+        pass
+    _cat_price_cache['t'] = _ph_time.time(); _cat_price_cache['v'] = m
+    return m
+
+
+def _category_price_now(cat_id, fallback=0.0):
+    """Поточна ціна/ніч категорії (з категорій цін); fallback — якщо категорію не знайдено."""
+    try:
+        v = _category_price_map().get(int(cat_id))
+        if v and v[0] > 0:
+            return float(v[0])
+    except Exception:
+        pass
+    return float(fallback or 0)
+
+
+def _night_price(cat_id, stored_price, night_date):
+    """Ціна ночі продовження/прострочення — ЗАВЖДИ поточна ціна категорії
+    (Налаштування → Категорії). stored_price — лише запасний варіант: категорію не знайдено
+    або це погодинний тариф (баня/сауна)."""
+    stored = float(stored_price or 0)
+    try:
+        cur, hourly = _category_price_map().get(int(cat_id), (0.0, False))
+    except Exception:
+        cur, hourly = 0.0, False
+    if hourly or cur <= 0:
+        return stored
+    return cur
+
+
+def _extra_nights_cost(booking, start_date, n, stored_price=None):
+    """Вартість n ночей, що починаються зі start_date (продовження / прострочення),
+    з урахуванням змін ціни категорії по даті."""
+    price0 = float(booking.get('price_per_day') or 0) if stored_price is None else float(stored_price or 0)
+    n = int(round(n or 0))
+    if n <= 0:
+        return 0.0
+    try:
+        cat = _room_category_map().get(int(booking.get('room_id')))
+    except Exception:
+        cat = None
+    if hasattr(start_date, 'date') and callable(getattr(start_date, 'date')):
+        start_date = start_date.date()          # datetime → date
+    if cat is None or not isinstance(start_date, date):
+        return price0 * n
+    return sum(_night_price(cat, price0, start_date + timedelta(days=i)) for i in range(n))
+
+
+_sync_prices_state = {'t': 0.0}
+
+
+def _sync_booking_prices_with_categories(force=False):
+    """«Ціна/ніч» активних броней (заброньовані + заселені) ЗАВЖДИ дорівнює ціні їхньої
+    категорії з Налаштування → Категорії. Змінили ціну в категорії — ціна/ніч у всіх
+    списках оновлюється, а «Сума всього» зсувається на різницю цін × заплановані ночі
+    (знижки, залог, ручні правки суми та суми продовжень зберігаються).
+    Погодинні категорії (баня/сауна) не чіпаємо. Безпечно викликати часто (тротлінг 15 с)."""
+    if (not force) and _ph_time.time() - _sync_prices_state['t'] < 15:
+        return 0
+    _sync_prices_state['t'] = _ph_time.time()
+    n = 0
+    try:
+        from app.utils.db import query as _q
+        for _tbl in ('room_categories', 'categories'):
+            try:
+                rows = _q(f"""
+                    UPDATE bookings b
+                    SET total_amount = CASE WHEN COALESCE(b.total_amount, 0) > 0
+                            THEN b.total_amount
+                                 + (rc.base_price - COALESCE(b.price_per_day, 0))
+                                   * GREATEST(b.check_out - b.check_in, 1)
+                            ELSE b.total_amount END,
+                        price_per_day = rc.base_price
+                    FROM rooms r JOIN {_tbl} rc ON rc.id = r.category_id
+                    WHERE b.room_id = r.id
+                      AND b.status IN ('confirmed', 'checkedin')
+                      AND rc.base_price > 0
+                      AND POSITION('[tariff:hour]' IN COALESCE(rc.description, '')) = 0
+                      AND ABS(COALESCE(b.price_per_day, 0) - rc.base_price) > 0.004
+                    RETURNING b.id""", (), fetch='all')
+                n = len(rows or [])
+                break
+            except Exception:
+                continue
+    except Exception as _e:
+        try: log_error("_sync_booking_prices_with_categories", _e)
+        except Exception: pass
+    return n
+
+
+def _room_night_price(room, fallback=None):
+    """Актуальна ціна/ніч номера — З КАТЕГОРІЙ ЦІН (Налаштування → Категорії),
+    а не зі збереженої копії в номері/броні."""
+    cid = room.get('category_id')
+    if cid is None:
+        try:
+            cid = _room_category_map().get(int(room.get('id')))
+        except Exception:
+            cid = None
+    fb = fallback if fallback is not None else (room.get('base_price') or room.get('price_per_day') or 0)
+    if cid is None:
+        return float(fb or 0)
+    return _category_price_now(cid, fb)
+
+
+def _booking_checkin_price(b, fallback=0.0):
+    """Ціна/ніч для ЗАСЕЛЕННЯ за бронею. Ночі ще не прожиті, тож беремо ПОТОЧНУ ціну
+    категорії — але лише якщо бронь була зроблена за ціною категорії (поточною або однією
+    з попередніх). Індивідуальна (погоджена вручну) ціна лишається без змін."""
+    stored = float(b.get('price_per_day') or fallback or 0)
+    try:
+        cid = _room_category_map().get(int(b.get('room_id') or 0))
+        if cid is None:
+            return stored
+        cur, hourly = _category_price_map().get(int(cid), (0.0, False))
+        if hourly or cur <= 0 or abs(cur - stored) < 0.005:
+            return stored
+        known = set()
+        for ch in _get_price_history().get(str(cid), []):
+            known.add(float(ch.get('old') or 0)); known.add(float(ch.get('new') or 0))
+        if any(abs(stored - k) < 0.005 for k in known):
+            return cur
+    except Exception:
+        pass
+    return stored
+
+
 def calc_stay_financials(booking, payments, svc_total=None):
     """booking: dict з check_in, check_out, price_per_day, total_amount,
     status (з таблиці bookings). payments: список dict з amount, note
@@ -1020,7 +1232,7 @@ def calc_stay_financials(booking, payments, svc_total=None):
     if ci and booking.get('status') == 'checkedin':
         n_actual = max((_dt_calc.date.today() - ci).days, 0)
         overdue_nights = max(n_actual - n_planned, 0)
-    total = total_planned + price * overdue_nights
+    total = total_planned + (_extra_nights_cost(booking, co, overdue_nights) if overdue_nights > 0 else 0.0)
 
     # 🎁 Безкоштовне проживання: весь період до виселення не оплачується,
     # борг за проживання не рахується (послуги/штрафи — як звичайно).
@@ -12144,6 +12356,7 @@ def _open_checkout_dlg(parent, bid, on_close=None):
     from app.modules.logic import get_booking, get_balance, update_booking_status
     import datetime as _dt
 
+    _sync_booking_prices_with_categories()   # ціна/ніч — з категорій цін
     b   = get_booking(bid)
     if not b: return
 
@@ -12202,7 +12415,13 @@ def _open_checkout_dlg(parent, bid, on_close=None):
     actual_units = booked_units if is_hourly_booking else actual_nights
     early = (not is_hourly_booking) and actual_nights < booked_nights
 
-    living_total = price * actual_units
+    def _extra_cost(k):
+        """Вартість k ночей ПІСЛЯ запланованого виїзду — за ціною на дату (зміни ціни категорії)."""
+        if is_hourly_booking or k <= 0:
+            return price * max(k, 0)
+        return _extra_nights_cost(b, checkout_plan, k, stored_price=price)
+
+    living_total = price * min(actual_units, booked_units) + _extra_cost(actual_units - booked_units)
     living_paid  = living_income
     debt         = max(living_total - living_income, 0)
     overpaid     = max(living_income - living_total, 0)
@@ -12308,7 +12527,7 @@ def _open_checkout_dlg(parent, bid, on_close=None):
         for w in fin_frame.winfo_children(): w.destroy()
         n = _get_n()
         full_total   = price * booked_units
-        used_total   = price * n
+        used_total   = price * min(n, booked_units) + _extra_cost(n - booked_units)
         refund_units = booked_units - n
         refund_amt   = price * refund_units if refund_units > 0 else 0
         debt         = max(used_total - living_income, 0)
@@ -12357,8 +12576,8 @@ def _open_checkout_dlg(parent, bid, on_close=None):
         refund_nights = booked_units - n if n < booked_units else 0
         refund_amt    = price * refund_nights if refund_nights > 0 else 0
         overdue_n     = max(n - booked_units, 0)
-        overdue_amt   = price * overdue_n
-        total_due     = price * n
+        overdue_amt   = _extra_cost(overdue_n)
+        total_due     = price * min(n, booked_units) + overdue_amt
         debt          = max(total_due - living_paid, 0)
         try: extra = float(e_extra.get() or 0)
         except: extra = 0.0
@@ -12500,7 +12719,7 @@ def _open_checkin_existing(parent, b, room, on_save=None):
 
     bal    = get_balance(b['id'])
     nights = (b['check_out'] - b['check_in']).days
-    price  = float(b.get('price_per_day', room.get('base_price',0)) or 0)
+    price  = _booking_checkin_price(b, room.get('base_price', 0))   # ціна — з категорій цін
     total  = price * nights
     # Якщо total_amount не встановлено — показати повну суму як борг
     stored_total = float(b.get('total_amount') or 0)
@@ -12727,6 +12946,8 @@ def _open_checkin_existing(parent, b, room, on_save=None):
         total_with_dep = _tot_eff + dep
         query("UPDATE bookings SET total_amount=%s WHERE id=%s",
               (total_with_dep, b['id']), fetch=None)
+        if abs(price - float(b.get('price_per_day') or 0)) > 0.005:
+            query("UPDATE bookings SET price_per_day=%s WHERE id=%s", (price, b['id']), fetch=None)
         _save_free_stay(b['id'], _free_on, _free_cm)
 
         # Записати оплату ТІЛЬКИ залишку (total - вже сплачений аванс - інші платежі)
@@ -14935,33 +15156,10 @@ def _ensure_booking_moves_table():
         log_error("booking_moves_table", _e)
 
 
-def _room_current_price(room_id, fallback=0.0):
-    """Актуальна ціна за ніч для номера: категорія (room_categories.base_price)
-    → rooms.price_per_day → rooms.base_price. Якщо нічого не знайдено — fallback."""
-    from app.utils.db import query as _qrp
-    for _sql in (
-        "SELECT rc.base_price AS p FROM rooms r "
-        "JOIN room_categories rc ON rc.id=r.category_id WHERE r.id=%s",
-        "SELECT price_per_day AS p FROM rooms WHERE id=%s",
-        "SELECT base_price AS p FROM rooms WHERE id=%s",
-    ):
-        try:
-            _r = _qrp(_sql, (room_id,), fetch='one')
-            if _r:
-                _v = float((_r.get('p') if hasattr(_r, 'get') else _r[0]) or 0)
-                if _v > 0:
-                    return _v
-        except Exception:
-            continue
-    return fallback
-
-
 def _open_relocate_dlg(parent, bid, on_done=None, user=None):
-    """Переселення гостя в інший номер. Дати лишаються без змін. Якщо новий
-    номер дорожчий — гість доплачує різницю в ціні за решту ночей (від сьогодні
-    до виїзду); при переселенні в дешевший/рівний номер доплати немає.
-    Факт фіксується в журналі booking_moves (звіт «Переселення»)
-    і в нотатках бронювання."""
+    """Переселення гостя в інший номер (форс-мажор). Оплати, ціна й дати
+    лишаються без змін — змінюється тільки номер. Факт фіксується в журналі
+    booking_moves (звіт «Переселення») і в нотатках бронювання."""
     from app.utils.db import query
     from app.modules.logic import get_booking
     import datetime as _dt
@@ -15008,13 +15206,13 @@ def _open_relocate_dlg(parent, bid, on_done=None, user=None):
     if not items:
         messagebox.showinfo("Переселення", "Немає вільних номерів для переселення."); return
 
-    win = dlg_win(parent, "🔁 Переселення", "480x680")
+    win = dlg_win(parent, "🔁 Переселення", "480x520")
     sc = ctk.CTkScrollableFrame(win, fg_color=C['bg']); sc.pack(fill='both', expand=True, padx=10, pady=10)
     h = card(sc); h.pack(fill='x', pady=5)
     lbl(h, f"🔁  Переселення — №{old_num}", 15, True, C['accent']).pack(anchor='w', padx=12, pady=(10,3))
     lbl(h, f"👤 {b.get('guest_name','')}   📅 {b['check_in']} → {b['check_out']}", 11,
         color=C['text2']).pack(anchor='w', padx=12, pady=(0,4))
-    lbl(h, "Дати залишаються без змін. Якщо новий номер дорожчий — доплата різниці за решту ночей.", 10,
+    lbl(h, "Оплати, ціна й дати залишаються без змін — змінюється лише номер.", 10,
         color=C['text2']).pack(anchor='w', padx=12, pady=(0,10))
 
     f1 = card(sc); f1.pack(fill='x', pady=4)
@@ -15030,85 +15228,18 @@ def _open_relocate_dlg(parent, bid, on_done=None, user=None):
     e_reason = ent(f2, "Наприклад: прорвало трубу, немає світла…", w=420)
     e_reason.pack(padx=12, pady=(0,10))
 
-    # ── Доплата за дорожчий номер ──
-    old_price = float(b.get('price_per_day') or 0)
-    _co = b['check_out']
-    if isinstance(_co, _dt.datetime): _co = _co.date()
-    elif not isinstance(_co, _dt.date):
-        try: _co = _dt.date.fromisoformat(str(_co)[:10])
-        except Exception: _co = _dt.date.today()
-    rem_nights = max((_co - _dt.date.today()).days, 0)
-    is_free = bool(b.get('free_stay'))
-    _price_cache = {}
-
-    def _find_item():
+    def _do():
         nm = new_var.get().strip()
         it = by_name.get(nm)
         if not it:
             # ServicePicker чистить назви від кракозябр — шукаємо без урахування цього
             it = next((i for i in items if _fix_mojibake(i['name']) == nm), None)
-        return it
-
-    def _new_price(it):
-        if it['id'] not in _price_cache:
-            _price_cache[it['id']] = _room_current_price(it['id'], 0.0)
-        return _price_cache[it['id']]
-
-    f3 = card(sc); f3.pack(fill='x', pady=4)
-    lbl(f3, "💰 Доплата за різницю в ціні:", 12, True).pack(anchor='w', padx=12, pady=(8,3))
-    lbl_sur = lbl(f3, "Оберіть новий номер", 11, color=C['text2'])
-    lbl_sur.pack(anchor='w', padx=12, pady=(0,4))
-    _sr = tk.Frame(f3, bg=C['card']); _sr.pack(fill='x', padx=12, pady=(0,4))
-    lbl(_sr, "Сума доплати, ₴:", 11, color=C['text2']).pack(side='left', padx=(0,6))
-    e_sur = ent(_sr, "0", w=90); e_sur.pack(side='left')
-    _mr = tk.Frame(f3, bg=C['card']); _mr.pack(fill='x', padx=12, pady=(0,10))
-    lbl(_mr, "Оплата:", 11, color=C['text2']).pack(side='left', padx=(0,6))
-    meth_var = ctk.StringVar(value='cash')
-    for _v, _t, _c in [('cash','💵 Готівка',C['green']),('card','💳 Картка',C['accent']),('transfer','🏦 Переказ','#9b59b6')]:
-        ctk.CTkRadioButton(_mr, text=_t, variable=meth_var, value=_v,
-                           fg_color=_c, text_color=C['text'], font=('Segoe UI',11)).pack(side='left', padx=5)
-
-    def _put_sur(v):
-        e_sur.delete(0, 'end'); e_sur.insert(0, f"{v:.0f}")
-
-    def _upd_sur(*a):
-        it = _find_item()
-        if not it:
-            lbl_sur.configure(text="Оберіть новий номер", text_color=C['text2']); _put_sur(0); return
-        np_ = _new_price(it)
-        diff = np_ - old_price
-        if is_free:
-            lbl_sur.configure(text="🎁 Безкоштовне проживання — доплати немає", text_color=C['text2']); _put_sur(0)
-        elif np_ <= 0:
-            lbl_sur.configure(text="Ціну нового номера не визначено — введіть доплату вручну", text_color=C['yellow']); _put_sur(0)
-        elif diff > 0.01 and rem_nights > 0:
-            amt = diff * rem_nights
-            lbl_sur.configure(text=f"({np_:.0f}₴ − {old_price:.0f}₴) × {rem_nights} н = {amt:.0f}₴", text_color=C['yellow'])
-            _put_sur(amt)
-        elif diff > 0.01:
-            lbl_sur.configure(text="Новий номер дорожчий, але ночей до виїзду не лишилось — доплати немає", text_color=C['text2']); _put_sur(0)
-        else:
-            lbl_sur.configure(text=f"Новий номер не дорожчий ({np_:.0f}₴ ≤ {old_price:.0f}₴) — доплати немає", text_color=C['text2']); _put_sur(0)
-
-    try: new_var.trace_add('write', _upd_sur)
-    except Exception: pass
-
-    def _do():
-        it = _find_item()
         if not it:
             messagebox.showerror("", "Оберіть новий номер"); return
-        try:
-            surcharge = float((e_sur.get() or '0').replace(',', '.').replace(' ', ''))
-            if surcharge < 0: raise ValueError
-        except Exception:
-            messagebox.showerror("", "Невірна сума доплати"); return
-        new_price = _new_price(it)
         reason = e_reason.get().strip()
         if reason.startswith("Наприклад"): reason = ""
-        _msg = f"Переселити {b.get('guest_name','')}\nз №{old_num} у №{it['number']}?"
-        if surcharge > 0:
-            _msg += f"\n\n💰 Доплата: {surcharge:.0f}₴ ({ {'cash':'готівка','card':'картка','transfer':'переказ'}.get(meth_var.get(),'') })"
-        if not messagebox.askyesno("Переселити?", _msg):
+        if not messagebox.askyesno("Переселити?",
+                f"Переселити {b.get('guest_name','')}\nз №{old_num} у №{it['number']}?"):
             return
         try:
             who = (user or {}).get('full_name') or (user or {}).get('username') or ''
@@ -15121,18 +15252,6 @@ def _open_relocate_dlg(parent, bid, on_done=None, user=None):
             if _chk.get('st') not in ('free', 'cleaning'):
                 messagebox.showerror("", "Цей номер уже зайнятий. Оберіть інший."); return
             query("UPDATE bookings SET room_id=%s WHERE id=%s", (it['id'], bid), fetch=None)
-            if surcharge > 0:
-                # total_amount накопичується (старі ночі за старою ціною + доплата);
-                # price_per_day → ціна нового номера (для прострочення/продовження).
-                query("UPDATE bookings SET total_amount = CASE WHEN total_amount IS NULL "
-                      "THEN price_per_day*GREATEST(check_out-check_in,1)+%s ELSE total_amount+%s END, "
-                      "price_per_day=CASE WHEN %s>0 THEN %s ELSE price_per_day END WHERE id=%s",
-                      (surcharge, surcharge, new_price, new_price, bid), fetch=None)
-                query("INSERT INTO payments(booking_id,amount,method,note,shift_id,created_at) "
-                      "VALUES(%s,%s,%s,%s,%s,NOW())",
-                      (bid, surcharge, meth_var.get(),
-                       f"Доплата за переселення №{old_num}→№{it['number']} "
-                       f"({old_price:.0f}₴→{new_price:.0f}₴)", sid), fetch=None)
             query("UPDATE rooms SET status='occupied' WHERE id=%s", (it['id'],), fetch=None)
             query("UPDATE rooms SET status='cleaning' WHERE id=%s", (old_rid,), fetch=None)
             try:
@@ -15158,8 +15277,7 @@ def _open_relocate_dlg(parent, bid, on_done=None, user=None):
         except Exception as _e:
             log_error("relocate", _e)
             messagebox.showerror("Помилка", str(_e)); return
-        messagebox.showinfo("✅", f"Гостя переселено: №{old_num} → №{it['number']}"
-                            + (f"\nДоплата: {surcharge:.0f}₴" if surcharge > 0 else ""))
+        messagebox.showinfo("✅", f"Гостя переселено: №{old_num} → №{it['number']}")
         win.destroy()
         if on_done: on_done()
 
@@ -15349,6 +15467,7 @@ class CheckedinFrame(tk.Frame):
         try:
             from app.modules.logic import get_bookings
             srch = self.e_srch.get().strip() if hasattr(self, 'e_srch') else None
+            _sync_booking_prices_with_categories()   # «Ціна/ніч» — з категорій цін
             data = get_bookings(status='checkedin', search=srch or None) or []
             # Офлайн-fallback (вимкнено — OFFLINE_FALLBACK_ENABLED=False,
             # щоб не підставляти застарілі/чужі дані з локального кешу)
@@ -15489,7 +15608,7 @@ class CheckedinFrame(tk.Frame):
                     overdue_nights = max(actual_nights - nights, 0)
                 except Exception:
                     overdue_nights = 0
-                overdue_amt = price_night * overdue_nights
+                overdue_amt = _extra_nights_cost(b, _ci_date + timedelta(days=nights), overdue_nights) if overdue_nights > 0 else 0.0
                 total_live_base = total + overdue_amt
                 # Сплачено = ціна×діб - аванс - доплата + залог
                 # Сплачено = аванс + доплата + залог (всі реально отримані гроші від гостя)
@@ -16505,6 +16624,7 @@ class BookingsFrame(tk.Frame):
             from app.modules.logic import get_bookings
             from app.utils.db import query
             srch = self.e_srch.get().strip() if hasattr(self, 'e_srch') else None
+            _sync_booking_prices_with_categories()   # «Ціна/ніч» — з категорій цін
             data = get_bookings(status='confirmed', search=srch or None) or []
             # Офлайн-fallback (вимкнено — OFFLINE_FALLBACK_ENABLED=False)
             if not data and OFFLINE_FALLBACK_ENABLED:
@@ -16719,7 +16839,7 @@ class BookingsFrame(tk.Frame):
             return
 
         nights    = (b['check_out'] - b['check_in']).days
-        price     = float(b.get('price_per_day') or 0)
+        price     = _booking_checkin_price(b)   # ціна — з категорій цін
         room_total= price * nights
 
         win = dlg_win(self, "✅ Заселення", "500x580")
@@ -16874,6 +16994,8 @@ class BookingsFrame(tk.Frame):
             # Встановити total_amount = проживання + залог
             query("UPDATE bookings SET total_amount=%s WHERE id=%s",
                   (total_with_dep, bid), fetch=None)
+            if abs(price - float(b.get('price_per_day') or 0)) > 0.005:
+                query("UPDATE bookings SET price_per_day=%s WHERE id=%s", (price, bid), fetch=None)
             _save_free_stay(bid, _free_on, _free_cm)
 
             # Платіж — доплата при заселенні (проживання мінус вже сплачений аванс)
@@ -16982,6 +17104,7 @@ class BookingDlg(ctk.CTkToplevel):
         rooms=get_rooms() or []
         self.room_map={}
         for r in rooms:
+            r['base_price'] = _room_night_price(r)   # ціна — з категорій цін
             k=f"№{r['number']} — {r.get('cat_name','') or ''} ({r.get('base_price') or 0}₴/ніч)"
             self.room_map[k]=r
         f=row_frm(b2)
@@ -18572,6 +18695,65 @@ class BookingDetailDlg(ctk.CTkToplevel):
         e_disc.bind('<KeyRelease>', _upd_todopl)
         _free_chk.configure(command=_upd_todopl)
         _upd_todopl()
+
+        # ── Зміна «Ціна/добу» тягне за собою «Суму всього» ──
+        # Раніше ціну можна було змінити, а «Сума всього» (bookings.total_amount) лишалась
+        # по СТАРІЙ ціні: борг за заплановані ночі рахувався від неї, а продовження брало
+        # вже нову ціну — звідси розбіжність. Тепер сума зсувається на різницю цін × ночі
+        # (ручні правки суми, знижки та суми продовжень зберігаються).
+        _pr_state = {'price0': float(b.get('price_per_day') or 0), 'total0': _total_val, 'manual': False}
+
+        def _units_now():
+            """Кількість діб (або годин для бані/сауни) за поточними полями дат; None — якщо не розібрати."""
+            try:
+                import datetime as _dtu
+                _ci_u = _dtu.date.fromisoformat(e_ci.get().strip())
+                _co_u = _dtu.date.fromisoformat(e_co.get().strip())
+                if _is_hourly_edit:
+                    _t1 = _dtu.datetime.strptime(e_ci_time.get().strip() or '14:00', '%H:%M').time()
+                    _t2 = _dtu.datetime.strptime(e_co_time.get().strip() or '12:00', '%H:%M').time()
+                    _d = (_dtu.datetime.combine(_co_u, _t2) - _dtu.datetime.combine(_ci_u, _t1)).total_seconds() / 3600.0
+                    return max(_d, 1)
+                return max((_co_u - _ci_u).days, 1)
+            except Exception:
+                return None
+
+        def _set_total_text(v):
+            e_total.delete(0, 'end'); e_total.insert(0, f"{max(v, 0.0):.2f}")
+            _upd_todopl()
+
+        def _on_price_edit(*_):
+            if _pr_state['manual']:
+                return          # суму вже правили вручну — не перезаписуємо
+            try:
+                _p_new = float((e_price.get() or '0').replace(',', '.'))
+            except ValueError:
+                return
+            _u = _units_now()
+            if _u is None:
+                return
+            _set_total_text(_pr_state['total0'] + (_p_new - _pr_state['price0']) * _u)
+
+        def _on_total_manual(*_):
+            _pr_state['manual'] = True
+
+        def _recalc_total_by_price():
+            """Кнопка: «Сума всього» = ціна/добу × кількість діб (для старих записів із застарілою сумою)."""
+            try:
+                _p = float((e_price.get() or '0').replace(',', '.'))
+            except ValueError:
+                return
+            _u = _units_now()
+            if _u is None:
+                return
+            _pr_state['manual'] = True
+            _set_total_text(_p * _u)
+
+        e_price.bind('<KeyRelease>', _on_price_edit)
+        e_total.bind('<KeyRelease>', _on_total_manual)
+        ctk.CTkButton(pf, text="↻ ціна×доби", command=_recalc_total_by_price, width=100, height=26,
+                      fg_color=C['card2'], hover_color=C['accent'],
+                      font=('Segoe UI', 10)).grid(row=1, column=2, padx=(0, 8), pady=3, sticky='w')
 
         # ── Внести доплату зараз — реальний платіж, а не лише розрахунок.
         # Введена сума при збереженні запишеться в payments і одразу
@@ -24762,29 +24944,25 @@ def _open_extend_room_dlg(parent, bid, on_save=None):
     from app.modules.logic import get_booking
     import datetime as _dt
 
+    _sync_booking_prices_with_categories()   # ціна/ніч — з категорій цін
     b = get_booking(bid)
     if not b: return
-    # Ціна заселення (зафіксована в броні) — лише для довідки.
-    price_old = float(b.get('price_per_day') or 0)
-
-    # Продовження рахуємо за АКТУАЛЬНОЮ ціною номера (категорія → rooms),
-    # а не за ціною, що діяла на момент заселення. Якщо не вдалося
-    # дізнатись — лишається ціна з броні.
-    price = _room_current_price(b.get('room_id'), price_old)
+    price = float(b.get('price_per_day') or 0)
 
     _co0 = b['check_out']
     if isinstance(_co0, _dt.datetime): _co0 = _co0.date()
     _FMT = '%d.%m.%Y'
+    # Ціна продовження — за діючою на дату кожної ночі (зміна ціни категорії діє з дати зміни)
+    _cat_ext = _room_category_map().get(int(b.get('room_id') or 0))
+    if _cat_ext is not None:
+        price = _night_price(_cat_ext, price, _co0)
 
     win = dlg_win(parent, "📅 Продовжити проживання", "420x420")
     sc = tk.Frame(win, bg=C['bg']); sc.pack(fill='both', expand=True, padx=20, pady=15)
 
     hdr = card(sc); hdr.pack(fill='x', pady=(0,10))
     lbl(hdr, f"📅  Продовжити — №{b.get('room_number','')}", 15, True, C['green']).pack(anchor='w', padx=12, pady=(10,3))
-    _price_txt = f"{price:.0f}₴/ніч"
-    if abs(price - price_old) > 0.01:
-        _price_txt = f"нова ціна {price:.0f}₴/ніч (було {price_old:.0f}₴)"
-    lbl(hdr, f"👤 {b.get('guest_name','')}  |  Виїзд: {b['check_out']}  |  {_price_txt}", 11, color=C['text2']).pack(anchor='w', padx=12, pady=(0,10))
+    lbl(hdr, f"👤 {b.get('guest_name','')}  |  Виїзд: {b['check_out']}  |  {price:.0f}₴/ніч", 11, color=C['text2']).pack(anchor='w', padx=12, pady=(0,10))
 
     p_card = card(sc); p_card.pack(fill='x', pady=5)
     pf = tk.Frame(p_card, bg=C['card']); pf.pack(fill='x', padx=12, pady=10)
@@ -24818,7 +24996,10 @@ def _open_extend_room_dlg(parent, bid, on_save=None):
 
     def _sum(n):
         n = max(n, 0)
-        lbl_sum.configure(text=f"{price*n:.0f}₴  ({n:.0f}н × {price:.0f}₴)")
+        _d1s = _parse(e_from.get()) or _co0
+        _cost = _extra_nights_cost(b, _d1s, n)
+        _per = (_cost / n) if n else price
+        lbl_sum.configure(text=f"{_cost:.0f}₴  ({n:.0f}н × {_per:.0f}₴)")
 
     def _hl_quick(n):
         for b_ in qbtns:
@@ -24896,14 +25077,14 @@ def _open_extend_room_dlg(parent, bid, on_save=None):
                     f"Поточний виїзд: {_co0.strftime(_FMT)}, а ви вибрали початок {d1.strftime(_FMT)}.\n"
                     f"Виїзд буде змінено на {d2.strftime(_FMT)}, оплата — за {n} ноч.\n\nПродовжити?"):
                 return
-        amount = price * n
+        amount = _extra_nights_cost(b, d1, n)
         new_co = d2
         query("UPDATE bookings SET check_out=%s, total_amount=COALESCE(total_amount,0)+%s WHERE id=%s",
               (new_co, amount, bid), fetch=None)
         query("""INSERT INTO payments(booking_id,amount,method,note,shift_id,created_at)
                   VALUES(%s,%s,%s,%s,%s,NOW())""",
               (bid, amount, meth_var.get(),
-               f"Продовження проживання ({d1.strftime(_FMT)}–{d2.strftime(_FMT)}) × {price:.0f}₴",
+               f"Продовження проживання ({d1.strftime(_FMT)}–{d2.strftime(_FMT)})",
                get_current_shift_id()), fetch=None)
         messagebox.showinfo("✅", f"Продовжено на {n} ніч. Оплачено {amount:.0f}₴. Новий виїзд: {new_co}")
         win.destroy()
@@ -31164,11 +31345,27 @@ class SettingsFrame(tk.Frame):
             except ValueError:
                 messagebox.showerror("","Місць має бути цілим числом"); return
 
+            # Зміна ціни діє З ДАТИ ЗМІНИ: чинні заселення (оплачені за старою ціною) не
+            # перераховуються; продовження та прострочені ночі від цієї дати — за новою ціною.
+            # Для цього запам'ятовуємо дату зміни (_record_price_change).
+            _old_p = 0.0
+            _rec_hist = False
+            try:
+                if cat and tariff_var.get() != 'hour':
+                    _old_p = float(cat.get('base_price') or 0)
+                    _rec_hist = _old_p > 0 and abs(_old_p - _price_val) > 0.005
+            except Exception:
+                pass
+
             def _do_save():
                 save_category({'name':flds['name'].get().strip(),
                                'description': desc.replace('[tariff:hour]','').replace('[tariff:night]','').strip() + f' [tariff:{tariff_var.get()}]',
                                'base_price':_price_val,
                                'capacity':_cap_val}, cat['id'] if cat else None)
+                if _rec_hist:
+                    _record_price_change(cat['id'], _old_p, _price_val)
+                _invalidate_price_caches()
+                _sync_booking_prices_with_categories(force=True)
 
             def _on_success(_r):
                 try: self._load_cats(); win.destroy()
