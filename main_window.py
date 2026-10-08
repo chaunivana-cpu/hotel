@@ -3069,15 +3069,142 @@ def card(p, **kw):
 
 
 def _tile_place_badge(owner, badge):
-    """Ставить бейдж прострочення на плитку: у «повній» плитці — угорі праворуч,
-    у компактній (дрібні плитки) — внизу праворуч, щоб не закривати номер."""
+    """Ставить бейдж прострочення у ВЕРХНІЙ ЛІВИЙ кут плитки (і в повній, і в компактній).
+    Повний текст бейджа показується підказкою при наведенні (_dash_tip_bind)."""
     try:
-        if getattr(owner, '_tile_compact', False):
-            badge.place(relx=1.0, rely=1.0, anchor='se', x=0, y=0)
-        else:
-            badge.place(relx=1.0, rely=0.0, anchor='ne', x=0, y=0)
+        badge.place(relx=0.0, rely=0.0, anchor='nw', x=0, y=0)
     except Exception:
         pass
+
+
+def _tile_to_date(x):
+    """date / datetime / 'РРРР-ММ-ДД...' → date або None."""
+    import datetime as _d
+    try:
+        if x is None: return None
+        if isinstance(x, _d.datetime): return x.date()
+        if isinstance(x, _d.date): return x
+        return _d.date.fromisoformat(str(x)[:10])
+    except Exception:
+        return None
+
+
+def _tile_dates_info(ci, co, notes=None):
+    """(коротко, повно) для плитки: '08.10–12.10' та 'Заїзд: 08.10.2026\nВиїзд: 12.10.2026'.
+    Погодинні бані: check_out неточний — показуємо лише дату заїзду."""
+    import re as _re
+    d1, d2 = _tile_to_date(ci), _tile_to_date(co)
+    if not d1 and not d2:
+        return '', ''
+    is_bath = bool(_re.search(r'баня:', str(notes or ''), _re.I))
+    if is_bath or not d2 or not d1 or d1 == d2:
+        d = d1 or d2
+        return d.strftime('%d.%m'), f"Дата: {d.strftime('%d.%m.%Y')}"
+    short = f"{d1.strftime('%d.%m')}–{d2.strftime('%d.%m')}"
+    if d1.year != d2.year:
+        short = f"{d1.strftime('%d.%m.%y')}–{d2.strftime('%d.%m.%y')}"
+    return short, f"Заїзд: {d1.strftime('%d.%m.%Y')}\nВиїзд: {d2.strftime('%d.%m.%Y')}"
+
+
+def _tile_dt_place(lbl):
+    """Дати — знизу плитки по центру (порожній текст — ховаємо)."""
+    try:
+        if lbl.cget('text'):
+            lbl.place(relx=0.5, rely=1.0, anchor='s', x=0, y=-1)
+            lbl.lift()
+        else:
+            lbl.place_forget()
+    except Exception:
+        pass
+
+
+def _tile_overdue_texts(ov):
+    """(коротко для кута плитки, повно для підказки) за записом прострочення."""
+    dl = ov.get('days_late', 0) or 0
+    if ov.get('late_short'):
+        short = f"!{ov['late_short']}"
+    elif dl > 0:
+        short = f"!+{dl}д"
+    else:
+        short = "!сьог."
+    if ov.get('late_long'):
+        head = f"Прострочено {ov['late_long']}"
+    elif dl > 0:
+        head = f"Прострочено +{dl} дн."
+    else:
+        head = "Виїзд сьогодні"
+    lines = [head]
+    nm = (ov.get('guest_name') or '').strip()
+    if nm:
+        lines.append(f"Гість: {nm}")
+    _, full_dates = _tile_dates_info(ov.get('check_in'), ov.get('check_out'), ov.get('notes'))
+    if full_dates:
+        lines.append(full_dates)
+    return short, "\n".join(lines)
+
+
+def _dash_tip_bind(widget, get_text):
+    """Підказка біля віджета при наведенні (повний текст). get_text() викликається в момент показу."""
+    st = {'tip': None, 'job': None}
+
+    def _hide(_e=None):
+        j = st['job']
+        if j:
+            try: widget.after_cancel(j)
+            except Exception: pass
+            st['job'] = None
+        t = st['tip']
+        if t is not None:
+            try: t.destroy()
+            except Exception: pass
+            st['tip'] = None
+
+    def _show():
+        st['job'] = None
+        try:
+            txt = get_text()
+            if not txt or not widget.winfo_exists():
+                return
+            tip = tk.Toplevel(widget)
+            tip.wm_overrideredirect(True)
+            try: tip.attributes('-topmost', True)
+            except Exception: pass
+            tk.Label(tip, text=txt, justify='left', bg='#11131f', fg='white',
+                     font=('Segoe UI', 10), padx=10, pady=6, bd=1, relief='solid').pack()
+            tip.update_idletasks()
+            tw, th = tip.winfo_reqwidth(), tip.winfo_reqheight()
+            x = widget.winfo_rootx()
+            y = widget.winfo_rooty() + widget.winfo_height() + 4
+            sw, sh = widget.winfo_screenwidth(), widget.winfo_screenheight()
+            x = max(0, min(x, sw - tw - 4))
+            if y + th > sh - 4:
+                y = max(0, widget.winfo_rooty() - th - 4)
+            tip.wm_geometry(f"+{x}+{y}")
+            st['tip'] = tip
+        except Exception:
+            pass
+
+    def _enter(_e=None):
+        _hide()
+        try: st['job'] = widget.after(120, _show)
+        except Exception: pass
+
+    widget.bind('<Enter>', _enter, add='+')
+    widget.bind('<Leave>', _hide, add='+')
+    widget.bind('<ButtonPress>', _hide, add='+')
+    widget.bind('<Destroy>', _hide, add='+')
+
+
+def _tile_make_badge(owner, cell, ov):
+    """Створює бейдж прострочення в лівому верхньому куті плитки + підказку з повним текстом."""
+    short, full = _tile_overdue_texts(ov)
+    bg = '#cc0000' if (ov.get('days_late', 0) or 0) > 0 else '#cc8800'
+    b = tk.Label(cell, text=short, bg=bg, fg='white',
+                 font=('Segoe UI', getattr(owner, '_badge_sz', 10), 'bold'), padx=3, pady=0)
+    b._is_overdue_badge = True   # щоб оновлення могло його прибрати
+    _tile_place_badge(owner, b)
+    _dash_tip_bind(b, lambda t=full: t)
+    return b
 
 
 def _tile_lines_needed(font, text, width):
@@ -9691,6 +9818,7 @@ class DashboardFrame(tk.Frame):
                 _shared_conn_cm = None
 
             try:
+                _bk_rows = []   # (room_id, status, check_in, check_out, notes) — для дат на плитках
                 # Статуси номерів — завжди з БД напряму (не кеш) для актуальності
                 try:
                     if _shared_conn is None:
@@ -9706,6 +9834,14 @@ class DashboardFrame(tk.Frame):
                             _dcur.execute(
                                 "SELECT DISTINCT room_id FROM bookings WHERE status='checkedin'")
                             checkedin_room_ids = {row[0] for row in _dcur.fetchall()}
+                            try:
+                                _dcur.execute(
+                                    "SELECT room_id, status, check_in, check_out, notes FROM bookings "
+                                    "WHERE status='checkedin' OR (status='confirmed' AND check_out >= %s) "
+                                    "ORDER BY check_in", (today,))
+                                _bk_rows = list(_dcur.fetchall())
+                            except Exception as _e_bk:
+                                log_error("Dashboard: дати бронювань для плиток", _e_bk)
                 except Exception as _e_dst:
                     if not OFFLINE_FALLBACK_ENABLED:
                         raise
@@ -9719,6 +9855,14 @@ class DashboardFrame(tk.Frame):
                     _sq_ci = _sqlite_select(
                         "SELECT DISTINCT room_id FROM bookings WHERE status='checkedin'")
                     checkedin_room_ids = {int(r['room_id']) for r in _sq_ci}
+                    try:
+                        _sq_bk = _sqlite_select(
+                            "SELECT room_id, status, check_in, check_out FROM bookings "
+                            "WHERE status='checkedin' OR (status='confirmed' AND check_out >= ?) "
+                            "ORDER BY check_in", (str(today),))
+                        _bk_rows = [(int(x['room_id']), x['status'], x['check_in'], x['check_out'], None) for x in _sq_bk]
+                    except Exception:
+                        _bk_rows = []
                 for r in rooms:
                     rid_r = int(r.get('id'))  # кеш дає рядок, psycopg2 — int
                     if rid_r in checkedin_room_ids:
@@ -9732,6 +9876,24 @@ class DashboardFrame(tk.Frame):
                             r['status'] = db_statuses[rid_r]
                         elif r.get('status') not in ('cleaning', 'repair', 'blocked', 'occupied'):
                             r['status'] = db_statuses.get(rid_r, 'free') or 'free'
+                # ── Дати «з — по» для плиток (проживання або найближча бронь) ──
+                _by_room_bk = {}
+                for _bk in _bk_rows:
+                    try:
+                        _k = int(_bk[0]); _cur_bk = _by_room_bk.get(_k)
+                        if _cur_bk is None or (_cur_bk[1] != 'checkedin' and _bk[1] == 'checkedin'):
+                            _by_room_bk[_k] = _bk
+                    except Exception:
+                        continue
+                for r in rooms:
+                    _b = _by_room_bk.get(int(r.get('id')))
+                    if _b and r.get('status') in ('checkedin', 'confirmed', 'occupied'):
+                        _sd, _fd = _tile_dates_info(_b[2], _b[3], _b[4])
+                        _lbl_st = 'Проживає' if _b[1] == 'checkedin' else 'Заброньовано'
+                        r['tile_dates'] = _sd
+                        r['tile_tip'] = f"{_lbl_st}\n{_fd}" if _fd else ''
+                    else:
+                        r['tile_dates'] = ''; r['tile_tip'] = ''
             except Exception as _sync_err:
                 log_error("Dashboard: помилка синхронізації статусів", _sync_err)
 
@@ -10184,10 +10346,17 @@ class DashboardFrame(tk.Frame):
                 num_l = tk.Label(cell, text=f"№{r['number']}", bg=color, fg='white',
                          font=('Segoe UI',12,'bold'), padx=6, pady=6)
                 num_l.pack()
-                st_l  = tk.Label(cell, text=STATUS_UA.get(r['status'],''), bg=color, fg='white',
-                         font=('Segoe UI',10,'bold'), padx=4, pady=3)
+                st_l  = tk.Label(cell, text=('' if r.get('tile_dates') else STATUS_UA.get(r['status'],'')),
+                         bg=color, fg='white', font=('Segoe UI',10,'bold'), padx=4, pady=3)
                 st_l.pack()
                 self._tile_refs[rid] = (cell, num_l, st_l)
+                # ── Дати «з — по» знизу плитки (+ повний текст у підказці) ──
+                cell._tip_text = r.get('tile_tip', '')
+                dt_l = tk.Label(cell, text=r.get('tile_dates', ''), bg=color, fg='#f4f4f4',
+                                font=('Segoe UI', getattr(self, '_dt_sz', 8)), padx=0, pady=0)
+                cell._dt_lbl = dt_l
+                _tile_dt_place(dt_l)
+                _dash_tip_bind(dt_l, lambda c=cell: getattr(c, '_tip_text', ''))
                 self._tile_order.append(rid)
                 # ── Бейдж прострочення прямо на плитці ──
                 _ov_info = _overdue_by_room.get(str(r.get('number','')))
@@ -10195,14 +10364,7 @@ class DashboardFrame(tk.Frame):
                 # гість виселився але booking.status міг не оновитись миттєво
                 _room_is_free = r.get('status') in ('free', 'cleaning', 'repair')
                 if _ov_info and not _room_is_free:
-                    _dl = _ov_info.get('days_late', 0)
-                    _badge_bg = '#cc0000' if _dl > 0 else '#cc8800'
-                    _badge_txt = (f"!{_ov_info['late_short']}" if _ov_info.get('late_short')
-                                  else (f"!+{_dl}д" if _dl > 0 else "!сьогодні"))
-                    _badge = tk.Label(cell, text=_badge_txt, bg=_badge_bg, fg='white',
-                                      font=('Segoe UI', getattr(self, '_badge_sz', 10), 'bold'), padx=4, pady=0)
-                    _badge._is_overdue_badge = True   # щоб оновлення могло його прибрати
-                    _tile_place_badge(self, _badge)
+                    _tile_make_badge(self, cell, _ov_info)
 
             def _on_rf_configure(e):
                 self._grid_canvas.configure(scrollregion=self._grid_canvas.bbox('all'))
@@ -10242,6 +10404,7 @@ class DashboardFrame(tk.Frame):
                     full = (th >= 58 and tw >= 100)         # «повна» плитка: номер + статус
                     self._tile_compact = not full
                     self._badge_sz = 10 if full else (9 if th >= 46 else 8)
+                    self._dt_sz = 9 if full else (8 if th >= 46 else 7)
 
                     old_rows = getattr(self, '_tile_rows', 0)
                     for ci in range(max(cols, getattr(self, '_tile_ncols', 0)) + 1):
@@ -10285,15 +10448,21 @@ class DashboardFrame(tk.Frame):
                             num_.pack(side='top', expand=True)
                         else:
                             wrap_w = tw - 10
-                            avail = th - 8 - 12                         # знизу — запас під бейдж
+                            avail = th - 8 - 16                         # знизу — запас під дати
                             sz = _fit(txt, wrap_w, avail, (11, 10, 9, 8, 7))
                             num_.configure(font=('Segoe UI', sz, 'bold'), wraplength=wrap_w,
                                            justify='center', padx=1, pady=0)
-                            num_.pack(side='top', expand=True, fill='both', pady=(0, 8))
+                            num_.pack(side='top', expand=True, fill='both', pady=(0, 14))
                         for w_ in cell_.winfo_children():
                             if getattr(w_, '_is_overdue_badge', False):
                                 w_.configure(font=('Segoe UI', self._badge_sz, 'bold'), padx=4, pady=0)
                                 _tile_place_badge(self, w_)
+                        _dtl = getattr(cell_, '_dt_lbl', None)
+                        if _dtl is not None:
+                            try:
+                                _dtl.configure(font=('Segoe UI', self._dt_sz))
+                                _tile_dt_place(_dtl)
+                            except Exception: pass
                 except Exception as _e_rl:
                     log_error("Dashboard._relayout_tiles", _e_rl)
             self._relayout_tiles = _relayout_tiles
@@ -10400,7 +10569,13 @@ class DashboardFrame(tk.Frame):
                     try:
                         cell.configure(bg=new_color)
                         num_l.configure(bg=new_color)
-                        st_l.configure(bg=new_color, text=STATUS_UA.get(r['status'],''))
+                        st_l.configure(bg=new_color,
+                                       text=('' if r.get('tile_dates') else STATUS_UA.get(r['status'],'')))
+                        _dtl2 = getattr(cell, '_dt_lbl', None)
+                        if _dtl2 is not None:
+                            cell._tip_text = r.get('tile_tip', '')
+                            _dtl2.configure(bg=new_color, text=r.get('tile_dates', ''))
+                            _tile_dt_place(_dtl2)
                         # Оновлюємо/видаляємо бейдж прострочення
                         for _w in cell.winfo_children():
                             if isinstance(_w, tk.Label) and getattr(_w, '_is_overdue_badge', False):
@@ -10408,14 +10583,7 @@ class DashboardFrame(tk.Frame):
                         _ov2 = _overdue_by_room2.get(str(r.get('number','')))
                         _room_is_free2 = r.get('status') in ('free', 'cleaning', 'repair')
                         if _ov2 and not _room_is_free2:
-                            _dl2 = _ov2.get('days_late', 0)
-                            _bb2 = '#cc0000' if _dl2 > 0 else '#cc8800'
-                            _bt2 = (f"!{_ov2['late_short']}" if _ov2.get('late_short')
-                                    else (f"!+{_dl2}д" if _dl2 > 0 else "!сьогодні"))
-                            _b2  = tk.Label(cell, text=_bt2, bg=_bb2, fg='white',
-                                            font=('Segoe UI', getattr(self, '_badge_sz', 10), 'bold'), padx=4, pady=0)
-                            _b2._is_overdue_badge = True
-                            _tile_place_badge(self, _b2)
+                            _tile_make_badge(self, cell, _ov2)
                     except Exception: pass
             # Оновлюємо overlay
             if hasattr(self, '_overdue_tile_overlay'):
@@ -11610,7 +11778,8 @@ class RoomsFrame(tk.Frame):
             lbl(c_,label,13,True).pack(anchor='w',padx=12,pady=(8,3))
             rf=tk.Frame(c_,bg=C['card']); rf.pack(fill='x',padx=12,pady=(0,10))
             lbl(rf,"Залог:",11,color=C['text2']).pack(side='left')
-            e=ent(rf,str(int(cur_dep)) if cur_dep else "0",w=110); e.pack(side='left',padx=8)
+            e=ent(rf,"0",w=110); e.pack(side='left',padx=8)
+            e.insert(0, str(int(cur_dep)) if cur_dep else "0")   # реальний текст, не placeholder
             lbl(rf,"₴",11,color=C['text2']).pack(side='left')
             entries[key]=(e,sql_pat)
 
@@ -30355,10 +30524,13 @@ class GuestDatabaseFrame(tk.Frame):
             lbl(edit_win, "✏️  Редагувати гостя", 15, True).pack(anchor='w', padx=20, pady=(12,4))
             _f = tk.Frame(edit_win, bg=C['bg']); _f.pack(fill='x', padx=20, pady=6)
             lbl(_f, "ПІБ:", 11, color=C['text2']).grid(row=0, column=0, sticky='w', pady=4)
-            _name_e = ent(_f, row['name'], w=260); _name_e.grid(row=0, column=1, padx=(8,0), pady=4)
+            _name_e = ent(_f, 'ПІБ гостя', w=260); _name_e.grid(row=0, column=1, padx=(8,0), pady=4)
+            _name_e.insert(0, row['name'] if row['name'] and row['name'] != '—' else '')   # реальний текст, не placeholder
             lbl(_f, "Телефон:", 11, color=C['text2']).grid(row=1, column=0, sticky='w', pady=4)
             _ph_val = row['phone'] if row['phone'] != '—' else ''
-            _phone_e = ent(_f, _ph_val, w=260); _phone_e.grid(row=1, column=1, padx=(8,0), pady=4)
+            _phone_e = ent(_f, 'Телефон', w=260); _phone_e.grid(row=1, column=1, padx=(8,0), pady=4)
+            if _ph_val: _phone_e.insert(0, _ph_val)                                       # реальний текст, не placeholder
+            edit_win.after(150, lambda: (_name_e.focus_set(), _name_e.select_range(0, 'end')))
             _err = lbl(edit_win, '', 10, color='#e74c3c'); _err.pack()
             def _save():
                 new_name  = _name_e.get().strip()
@@ -31366,7 +31538,8 @@ class SettingsFrame(tk.Frame):
             rf.pack(fill='x', padx=12, pady=(0, 12))
             lbl(rf, "💛 Залог (₴):", 12, True).pack(side='left', padx=(0, 10))
             cur_val = _fetch_dep(kws)
-            e = ent(rf, str(int(cur_val)) if cur_val else "0", w=130)
+            e = ent(rf, "0", w=130)
+            e.insert(0, str(int(cur_val)) if cur_val else "0")   # реальний текст, не placeholder
             e.pack(side='left')
             lbl(rf, "₴", 12).pack(side='left', padx=(4, 12))
             _entries[key] = e
