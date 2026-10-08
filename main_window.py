@@ -238,25 +238,34 @@ class OfflineSyncManager:
             # Крок 1: TCP-пінг timeout=2с — достатньо для VPS (пінг зазвичай <300мс).
             # 0.5с було занадто мало — на віддаленому сервері (~100-200мс пінг)
             # socket таймаутив навіть коли сервер онлайн → хибне "Офлайн-режим".
-            with _sockco.create_connection((host_co, port_co), timeout=2): pass
+            # Таймаути збільшено (було 2с/3с): на віддалений VPS у логах трапляються
+            # конекти по 10-19с, і з 2с/3с проба помилково показувала «Офлайн-режим»,
+            # хоча сервер працював і програма отримувала дані.
+            with _sockco.create_connection((host_co, port_co), timeout=6): pass
             # Крок 2: повноцінне підключення тільки якщо TCP пройшов
             import psycopg2 as _pg2co
             _c2 = _pg2co.connect(host=host_co, port=port_co,
                 dbname=_cfg_co.get('dbname', _cfg_co.get('database', 'hotel')),
                 user=_cfg_co.get('user', 'hotel'), password=_cfg_co.get('password', ''),
-                connect_timeout=3)
+                connect_timeout=10)
             _c2.close()
+            self._fail_streak = 0
             was_online = self._online
             self._online = True
             if not was_online and self._on_status_change:
                 try: self._on_status_change(True)
                 except Exception: pass
         except Exception:
-            was_online = self._online
-            self._online = False
-            if was_online and self._on_status_change:
-                try: self._on_status_change(False)
-                except Exception: pass
+            # Одна невдала проба ≠ офлайн: мережа до сервера може «блимати».
+            # Перемикаємось в офлайн лише після 3 невдач поспіль (~45с при
+            # циклі 15с), а наступна ж успішна проба одразу повертає онлайн.
+            self._fail_streak = getattr(self, '_fail_streak', 0) + 1
+            if self._fail_streak >= 3:
+                was_online = self._online
+                self._online = False
+                if was_online and self._on_status_change:
+                    try: self._on_status_change(False)
+                    except Exception: pass
         return self._online
 
     def is_online(self) -> bool:
@@ -408,7 +417,14 @@ class OfflineSyncManager:
             self._log('shift_close_sync', 'Черга порожня, PG доступний — sync OK')
             return True
 
-        if not self.check_online():
+        _ok_now = self.check_online()
+        if not _ok_now:
+            # Не вірити кешу/одній невдалій пробі: перед тим як лякати
+            # користувача «Сервер недоступний» — ще 1 свіжа проба.
+            self._last_check = 0.0
+            if self.check_online():
+                _ok_now = True
+        if not _ok_now:
             # PG недоступний — показуємо попередження, але не блокуємо закриття
             _logging.getLogger('hotel').warning("[OfflineSync] PG недоступний при закритті зміни!")
             try:
@@ -8323,6 +8339,12 @@ class HotelApp(ctk.CTk):
                 self._db_lbl.configure(text=" 🗄 БД: ping вимкнено", text_color=C['yellow'])
             except Exception:
                 pass
+            # ВАЖЛИВО: лічильник збоїв скидається лише всередині _ping() при успіху, а
+            # тут _ping() не викликається — тож раніше бейдж лишався «ping вимкнено»
+            # НАЗАВЖДИ, навіть коли зв'язок давно відновився. Тепер перед наступною
+            # спробою (за хвилину) «відкриваємо» одну пробу: вдалась — індикатор знову
+            # зелений, ні — знову «вимкнено» і ще хвилина очікування.
+            self._ping_timeout_count = 2
             if getattr(self, '_db_check_running', False):
                 self.after(60000, self._check_db_status)
             return
@@ -12927,6 +12949,7 @@ def _open_checkin_existing(parent, b, room, on_save=None):
         # Оновити ім'я/телефон гостя якщо змінено
         new_name  = e_name.get().strip()
         new_phone = e_phone.get().strip()
+        if not _confirm_guest_not_blacklisted(win, new_name or b.get('guest_name', ''), new_phone or b.get('phone', '') or b.get('guest_phone', '')): return
         if new_name or new_phone:
             try:
                 query("UPDATE guests SET name=COALESCE(NULLIF(%s,''), name), "
@@ -13851,6 +13874,8 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
             messagebox.showerror("", "Вкажіть коментар до безкоштовного проживання"); return
         if _free_on:
             total = 0.0; discount = 0.0; discount_comment = ''
+
+        if not _confirm_guest_not_blacklisted(win, name, phone): return
 
         # Створити/знайти гостя
         passport_info = _format_doc_info(doc_type_var.get(), pseries, pnum)
@@ -16977,6 +17002,7 @@ class BookingsFrame(tk.Frame):
             if _block_if_room_occupied(b['room_id'], exclude_bid=b['id']): return
             try: dep = float(e_dep.get() or 0)
             except: dep = 0.0
+            if not _confirm_guest_not_blacklisted(win, b.get('guest_name', ''), b.get('phone', '') or b.get('guest_phone', '')): return
             passport_info = _format_doc_info(doc_type_var.get(), e_series.get().strip(), e_pnum.get().strip())
             _free_on = bool(free_var_d.get())
             _free_cm = e_free_cm_d.get().strip()
@@ -17247,6 +17273,7 @@ class BookingDlg(ctk.CTkToplevel):
         _free_cm = self.e_free_comment.get().strip()
         if _free_on and not _free_cm:
             messagebox.showerror("", "Вкажіть коментар до безкоштовного проживання"); return
+        if not _confirm_guest_not_blacklisted(self, name, self.fields['phone'].get().strip()): return
         gid=self.guest_id or save_guest({'name':name,'phone':self.fields['phone'].get().strip()})
         rc=self.room_var.get()
         rid=self.room_map[rc]['id']
@@ -24546,6 +24573,7 @@ def _open_sauna_booking_dlg(parent, room, on_save=None):
         phone = e_phone.get().strip()
         if not name:  messagebox.showerror("","Введіть ім'я"); return
         if not phone: messagebox.showerror("","Введіть телефон"); return
+        if not _confirm_guest_not_blacklisted(win, name, phone): return
         try:
             start_dt = _tfx2.start(); end_dt = _tfx2.end()
             if end_dt <= start_dt: raise ValueError("Виселення раніше заселення")
@@ -29646,6 +29674,144 @@ def _run_test_mode_cleanup(on_done=None, on_error=None):
 # НАЛАШТУВАННЯ
 # ══════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════
+# ПОМІТКИ ГОСТЕЙ (чорний список, увага, VIP)
+# ══════════════════════════════════════════════════════
+# {ключ: (назва, колір тексту, колір фону рядка, пріоритет)}
+_GUEST_MARKS = {
+    'blacklist': ('⛔ Чорний список', '#ff6b6b', '#3a1010', 3),
+    'warning':   ('⚠️ Увага',         '#f39c12', '#3a2a10', 2),
+    'vip':       ('⭐ VIP',           '#f1c40f', '#2a2a14', 1),
+}
+_guest_mark_cols_ok = {'v': False}
+_blacklist_cache = {'t': 0.0, 'v': []}
+
+
+def _ensure_guest_mark_cols():
+    """Колонки помітки гостя в таблиці guests (створює, якщо немає)."""
+    if _guest_mark_cols_ok['v']:
+        return True
+    try:
+        from app.utils.db import query as _q
+        for _col, _typ in (('mark', 'TEXT'), ('mark_comment', 'TEXT'), ('mark_by', 'TEXT'),
+                           ('mark_at', 'TIMESTAMP'), ('doc_info', 'TEXT')):
+            _q(f"ALTER TABLE guests ADD COLUMN IF NOT EXISTS {_col} {_typ}", fetch=None)
+        _guest_mark_cols_ok['v'] = True
+    except Exception as _e:
+        try: log_error("_ensure_guest_mark_cols", _e)
+        except Exception: pass
+    return _guest_mark_cols_ok['v']
+
+
+def _set_guest_mark(ids, mark, comment='', by=''):
+    """Ставить (mark='blacklist'|'warning'|'vip') або знімає (mark=None/'') помітку гостя."""
+    ids = [int(i) for i in (ids or [])]
+    if not ids or not _ensure_guest_mark_cols():
+        return False
+    from app.utils.db import query as _q
+    ph = ','.join(['%s'] * len(ids))
+    if mark:
+        _q(f"UPDATE guests SET mark=%s, mark_comment=%s, mark_by=%s, mark_at=NOW() WHERE id IN ({ph})",
+           (mark, comment or None, by or None) + tuple(ids), fetch=None)
+    else:
+        _q(f"UPDATE guests SET mark=NULL, mark_comment=NULL, mark_by=NULL, mark_at=NULL WHERE id IN ({ph})",
+           tuple(ids), fetch=None)
+    _blacklist_cache['t'] = 0.0
+    return True
+
+
+def _blacklisted_guests():
+    """Гості з міткою «Чорний список» (кеш 20 с)."""
+    import time as _t
+    if _blacklist_cache['v'] is not None and _t.time() - _blacklist_cache['t'] < 20 and _blacklist_cache['t'] > 0:
+        return _blacklist_cache['v']
+    rows = []
+    try:
+        if _ensure_guest_mark_cols():
+            from app.utils.db import query as _q
+            rows = _q("SELECT id, name, phone, mark_comment FROM guests WHERE mark='blacklist'", fetch='all') or []
+    except Exception:
+        rows = _blacklist_cache['v'] or []
+    _blacklist_cache['t'] = _t.time(); _blacklist_cache['v'] = rows
+    return rows
+
+
+def _blacklist_match(name, phone):
+    """Повертає запис гостя з чорного списку, якщо ім'я/телефон збігаються, інакше None."""
+    import re as _re
+    def _dg(x): return _re.sub(r'\D', '', str(x or ''))
+    pd = _dg(phone)
+    nm = ' '.join(str(name or '').lower().split())
+    for g in _blacklisted_guests():
+        gd = _dg(g.get('phone'))
+        gn = ' '.join(str(g.get('name') or '').lower().split())
+        if pd and gd and len(pd) >= 7 and pd[-9:] == gd[-9:]:
+            return g
+        if nm and gn and len(nm) > 5 and nm == gn:
+            return g
+    return None
+
+
+def _confirm_guest_not_blacklisted(parent, name, phone):
+    """True — можна продовжувати. Якщо гість у чорному списку — питає підтвердження."""
+    try:
+        hit = _blacklist_match(name, phone)
+    except Exception:
+        hit = None
+    if not hit:
+        return True
+    return messagebox.askyesno(
+        "⛔ ЧОРНИЙ СПИСОК",
+        f"Гість «{hit.get('name') or name}» ({hit.get('phone') or 'без телефону'}) "
+        f"занесений у чорний список.\n\nПричина: {hit.get('mark_comment') or '—'}\n\n"
+        "Все одно продовжити?", icon='warning', default='no', parent=parent)
+
+
+def _guest_mark_dlg(parent, ids, name, cur_mark='', cur_comment='', on_done=None):
+    """Діалог встановлення/зняття помітки гостя."""
+    win = dlg_win(parent, "🚩 Помітка гостя", "460x430")
+    f = card(win); f.pack(fill='both', expand=True, padx=15, pady=15)
+    lbl(f, "🚩  Помітка гостя", 15, True).pack(anchor='w', padx=12, pady=(10, 2))
+    lbl(f, str(name), 12, color=C['text2']).pack(anchor='w', padx=12, pady=(0, 8))
+    var = tk.StringVar(value=cur_mark or '')
+    for val, txt, clr in [('', '✅ Без помітки', C['text']),
+                          ('blacklist', _GUEST_MARKS['blacklist'][0], _GUEST_MARKS['blacklist'][1]),
+                          ('warning', _GUEST_MARKS['warning'][0], _GUEST_MARKS['warning'][1]),
+                          ('vip', _GUEST_MARKS['vip'][0], _GUEST_MARKS['vip'][1])]:
+        ctk.CTkRadioButton(f, text=txt, variable=var, value=val, font=('Segoe UI', 12),
+                           text_color=clr, fg_color=C['accent']).pack(anchor='w', padx=20, pady=3)
+    lbl(f, "Коментар (причина):", 11, color=C['text2']).pack(anchor='w', padx=12, pady=(10, 2))
+    e_c = ent(f, "причина (обов'язково для чорного списку та «Увага»)", w=380)
+    e_c.pack(padx=12, pady=(0, 6))
+    if cur_comment:
+        e_c.insert(0, str(cur_comment))
+    st = lbl(f, "", 10, color=C['red']); st.pack(anchor='w', padx=12)
+
+    def _save():
+        mk = var.get()
+        cm = e_c.get().strip()
+        if cm == "причина (обов'язково для чорного списку та «Увага»)":
+            cm = ''
+        if mk in ('blacklist', 'warning') and not cm:
+            st.configure(text="❌ Вкажіть коментар (причину)"); return
+        try:
+            _by = ''
+            _u = getattr(parent, 'user', None)
+            if isinstance(_u, dict):
+                _by = _u.get('full_name') or _u.get('username') or ''
+            _set_guest_mark(ids, mk or None, cm, _by)
+        except Exception as _e:
+            st.configure(text=f"❌ Помилка: {_e}"); return
+        win.destroy()
+        if on_done:
+            try: on_done()
+            except Exception: pass
+
+    br = tk.Frame(f, bg=C['card']); br.pack(pady=10)
+    btn(br, "💾 Зберегти", _save, C['accent'], 150, height=38).pack(side='left', padx=6)
+    btn(br, "✖ Скасувати", win.destroy, C['card2'], 130, height=38).pack(side='left', padx=6)
+
+
 class GuestDatabaseFrame(tk.Frame):
     def __init__(self, parent, user):
         super().__init__(parent, bg=C['bg'])
@@ -29665,6 +29831,13 @@ class GuestDatabaseFrame(tk.Frame):
         refresh_btn(tb, self._load, side='left', padx=4, pady=8)
         _gp_btn = btn(tb, '🖨 Друк ▾', lambda: self._print_popup(_gp_btn), '#2980b9', 120, height=32)
         _gp_btn.pack(side='left', padx=8, pady=8)
+        btn(tb, '➕ Додати гостя', self._add_guest_dlg, C['green'], 150, height=32).pack(side='left', padx=4, pady=8)
+        btn(tb, '🚩 Помітка', self._mark_selected, '#c0392b', 120, height=32).pack(side='left', padx=4, pady=8)
+        lbl(tb, 'Показати:', 11, color=C['text2']).pack(side='left', padx=(12, 3))
+        self._mark_var = tk.StringVar(value='Усі')
+        ctk.CTkOptionMenu(tb, values=['Усі', '⛔ Чорний список', '⚠️ Увага', '⭐ VIP', 'З помітками', 'Без помітки'],
+                          variable=self._mark_var, width=170, fg_color=C['card2'], button_color=C['accent'],
+                          command=lambda v: self._filter()).pack(side='left', pady=8)
         self._total_lbl = lbl(tb, '', 11, color=C['text2']); self._total_lbl.pack(side='right', padx=15)
         sf = ctk.CTkFrame(self, fg_color=C['card']); sf.pack(fill='x', padx=15, pady=3)
         lbl(sf, '🔍', 13).pack(side='left', padx=(10,2), pady=8)
@@ -29683,12 +29856,13 @@ class GuestDatabaseFrame(tk.Frame):
         btn(sf, '☑ Всі',  self._select_all,   C['card2'],  80, height=32).pack(side='right', padx=4, pady=8)
         btn(sf, '☐ Зняти', self._deselect_all, C['card2'],  80, height=32).pack(side='right', padx=4, pady=8)
         self._count_lbl = lbl(sf, '', 11, color=C['text2']); self._count_lbl.pack(side='right', padx=8)
-        cols = ('check','num','name','phone','passport','visits')
-        ff, self._tree = mktree(self, cols, 16, [30,45,300,150,260,80])
+        cols = ('check','num','name','mark','phone','passport','visits')
+        ff, self._tree = mktree(self, cols, 16, [30,45,270,230,150,240,80])
         for c in ('check','num'): self._tree.column(c, anchor='center', stretch=False)
-        for c in ('name','phone','passport'): self._tree.column(c, anchor='w')
+        for c in ('name','mark','phone','passport'): self._tree.column(c, anchor='w')
         self._tree.heading('check', text='✓'); self._tree.heading('num', text='#')
         self._tree.heading('name', text='ПІБ гостя', command=lambda: self._sort('name'))
+        self._tree.heading('mark', text='Помітка', command=lambda: self._sort('mark'))
         self._tree.heading('phone', text='Телефон', command=lambda: self._sort('phone'))
         self._tree.heading('passport', text='Паспорт', command=lambda: self._sort('passport'))
         self._tree.heading('visits', text='Візитів', command=lambda: self._sort('visits'))
@@ -29709,14 +29883,15 @@ class GuestDatabaseFrame(tk.Frame):
     def _load_bg(self):
         try:
             from app.utils.db import query
+            _ensure_guest_mark_cols()
             rows = query("""
-                SELECT g.id AS guest_id, g.name,
+                SELECT g.id AS guest_id, g.name, g.mark, g.mark_comment,
                     COALESCE(NULLIF(trim(g.phone),''),'—') AS phone,
                     COALESCE(NULLIF(trim(g.phone),''),'')  AS phone_key,
                     COALESCE(
                         (SELECT trim(regexp_replace(substring(b2.notes FROM E'Паспорт: ([^\\n]+)'),E'\\s+',' ','g'))
                          FROM bookings b2 WHERE b2.guest_id=g.id AND b2.notes LIKE '%%Паспорт%%'
-                         ORDER BY b2.check_in DESC LIMIT 1),'—') AS passport,
+                         ORDER BY b2.check_in DESC LIMIT 1),NULLIF(trim(g.doc_info),''),'—') AS passport,
                     COUNT(b.id) AS visits,
                     MIN(b.check_in) AS first_visit, MAX(b.check_in) AS last_visit,
                     COALESCE(SUM(b.check_out-b.check_in),0) AS total_nights,
@@ -29725,7 +29900,7 @@ class GuestDatabaseFrame(tk.Frame):
                 FROM guests g
                 LEFT JOIN bookings b ON b.guest_id=g.id
                 LEFT JOIN rooms r ON b.room_id=r.id
-                GROUP BY g.id,g.name,g.phone ORDER BY MAX(b.check_in) DESC NULLS LAST,g.id
+                GROUP BY g.id,g.name,g.phone,g.mark,g.mark_comment,g.doc_info ORDER BY MAX(b.check_in) DESC NULLS LAST,g.id
             """) or []
             from collections import defaultdict
             import re as _re_merge
@@ -29776,12 +29951,17 @@ class GuestDatabaseFrame(tk.Frame):
                 firsts = [str(x['first_visit']) for x in grp if x['first_visit'] and str(x['first_visit']) not in ('—','None','')]
                 lasts  = [str(x['last_visit'])  for x in grp if x['last_visit']  and str(x['last_visit'])  not in ('—','None','')]
                 rooms = ', '.join(sorted({rm.strip() for x in grp for rm in str(x['rooms_list'] or '').split(',') if rm.strip() and rm.strip()!='—'})) or '—'
-                merged.append({'guest_id':int(best['guest_id']),'all_ids':all_ids,'name':str(best['name'] or '—'),
+                _mk = max((x for x in grp if x.get('mark') in _GUEST_MARKS),
+                          key=lambda x: _GUEST_MARKS[x['mark']][3], default=None)
+                merged.append({'mark': (_mk['mark'] if _mk else ''), 'mark_comment': ((_mk.get('mark_comment') or '') if _mk else ''),
+                    'guest_id':int(best['guest_id']),'all_ids':all_ids,'name':str(best['name'] or '—'),
                     'phone':str(best['phone'] or '—'),'passport':passport,'visits':str(tv),
                     'first_visit':min(firsts) if firsts else '—','last_visit':max(lasts) if lasts else '—',
                     'total_nights':str(tn),'total_paid':f"{tp:.0f}₴",'rooms_list':rooms})
             for r in no_key:
-                merged.append({'guest_id':int(r['guest_id']),'all_ids':[int(r['guest_id'])],
+                merged.append({'mark': (r.get('mark') if r.get('mark') in _GUEST_MARKS else ''),
+                    'mark_comment': (r.get('mark_comment') or ''),
+                    'guest_id':int(r['guest_id']),'all_ids':[int(r['guest_id'])],
                     'name':str(r['name'] or '—'),'phone':'—','passport':str(r['passport'] or '—'),
                     'visits':str(r['visits'] or 0),'first_visit':str(r['first_visit'] or '—'),
                     'last_visit':str(r['last_visit'] or '—'),'total_nights':str(r['total_nights'] or 0),
@@ -29812,9 +29992,17 @@ class GuestDatabaseFrame(tk.Frame):
         def _vis_ok(r):
             v = int(r['visits'] or 0)
             return (vf=='всі' or (vf=='1' and v==1) or (vf=='2+' and v>=2) or (vf=='5+' and v>=5))
+        try: mf = self._mark_var.get()
+        except Exception: mf = 'Усі'
+        def _mark_ok(r):
+            m = r.get('mark') or ''
+            if mf == 'Усі': return True
+            if mf == 'З помітками': return bool(m)
+            if mf == 'Без помітки': return not m
+            return m and _GUEST_MARKS[m][0] == mf
         self._filtered = [r for r in self._all_rows if
-                         (not q or any(q in str(r[k]).lower() for k in ('name','phone','passport','rooms_list')))
-                         and _vis_ok(r)]
+                         (not q or any(q in str(r.get(k, '')).lower() for k in ('name','phone','passport','rooms_list','mark_comment')))
+                         and _vis_ok(r) and _mark_ok(r)]
         def _sk(r):
             v = r.get(self._sort_col,'')
             try: return (0, float(str(v).replace('₴','')))
@@ -29830,20 +30018,129 @@ class GuestDatabaseFrame(tk.Frame):
         for i, r in enumerate(self._filtered):
             gid = r['guest_id']; v = int(r['visits'] or 0)
             tag = 'vip' if v>=5 else ('repeat' if v>=2 else ('odd' if i%2 else 'even'))
+            _m = r.get('mark') or ''
+            if _m in _GUEST_MARKS:
+                tag = 'mk_' + _m
+                _mt = _GUEST_MARKS[_m][0] + (f" · {str(r.get('mark_comment') or '')[:28]}" if r.get('mark_comment') else '')
+            else:
+                _mt = ''
             self._tree.insert('','end',iid=f'g{gid}',tags=(tag,),values=[
-                '☑' if self._checks.get(gid) else '☐', i+1, r['name'], r['phone'], r['passport'], r['visits']])
+                '☑' if self._checks.get(gid) else '☐', i+1, r['name'], _mt, r['phone'], r['passport'], r['visits']])
         self._tree.tag_configure('even',   background=C['card'])
         self._tree.tag_configure('odd',    background=C['card2'])
         self._tree.tag_configure('repeat', background='#1a3a1a')
         self._tree.tag_configure('vip',    background='#1a2a3a')
+        for _mk_key, (_ml, _mfg, _mbg, _mp) in _GUEST_MARKS.items():
+            self._tree.tag_configure('mk_' + _mk_key, background=_mbg, foreground=_mfg)
         self._tree.tag_configure('det_hdr',background='#222233')
         self._tree.tag_configure('det',    background=C['bg'])
         try: self._count_lbl.configure(text=f"Знайдено: {len(self._filtered)}")
         except Exception: pass
         try:
             rep = sum(1 for r in self._all_rows if int(r['visits'] or 0) >= 2)
-            self._total_lbl.configure(text=f"Всього: {len(self._all_rows)} | Постійних: {rep}")
+            _bl = sum(1 for r in self._all_rows if r.get('mark') == 'blacklist')
+            self._total_lbl.configure(text=f"Всього: {len(self._all_rows)} | Постійних: {rep}"
+                                           + (f" | ⛔ ЧС: {_bl}" if _bl else ""))
         except Exception: pass
+
+    def _mark_selected(self):
+        """🚩 Помітка для позначених (☑) гостей або для виділеного рядка."""
+        sel = [r for r in self._filtered if self._checks.get(r['guest_id'])]
+        if not sel:
+            try:
+                for iid in self._tree.selection():
+                    if iid.startswith('g') and iid[1:].isdigit():
+                        r = next((x for x in self._filtered if x['guest_id'] == int(iid[1:])), None)
+                        if r: sel.append(r)
+            except Exception:
+                pass
+        if not sel:
+            messagebox.showinfo('Помітка', 'Позначте гостей галочками (☑) або виберіть рядок у таблиці.', parent=self)
+            return
+        ids = []
+        for r in sel:
+            for gid in r.get('all_ids', [r['guest_id']]):
+                if gid not in ids: ids.append(gid)
+        name = sel[0]['name'] if len(sel) == 1 else f"{len(sel)} гостей"
+        cur_m = sel[0].get('mark', '') if len(sel) == 1 else ''
+        cur_c = sel[0].get('mark_comment', '') if len(sel) == 1 else ''
+        _guest_mark_dlg(self, ids, name, cur_m, cur_c, on_done=self._load)
+
+    def _add_guest_dlg(self):
+        """➕ Додати гостя в базу вручну (з можливістю одразу поставити помітку)."""
+        win = dlg_win(self, "➕ Додати гостя", "480x560")
+        f = card(win); f.pack(fill='both', expand=True, padx=15, pady=15)
+        lbl(f, "➕  Новий гість", 15, True).pack(anchor='w', padx=12, pady=(10, 6))
+        g = tk.Frame(f, bg=C['card']); g.pack(fill='x', padx=12)
+        lbl(g, "ПІБ *", 11, color=C['text2']).grid(row=0, column=0, sticky='w', pady=5)
+        e_n = ent(g, "Іванов Іван Іванович", w=290); e_n.grid(row=0, column=1, padx=8, pady=5)
+        lbl(g, "Телефон", 11, color=C['text2']).grid(row=1, column=0, sticky='w', pady=5)
+        e_p = ent(g, "+380...", w=290); e_p.grid(row=1, column=1, padx=8, pady=5)
+        lbl(g, "Документ", 11, color=C['text2']).grid(row=2, column=0, sticky='w', pady=5)
+        e_d = ent(g, "паспорт: серія і номер / ID", w=290); e_d.grid(row=2, column=1, padx=8, pady=5)
+
+        lbl(f, "🚩 Помітка:", 12, True).pack(anchor='w', padx=12, pady=(12, 2))
+        var = tk.StringVar(value='')
+        for val, txt, clr in [('', '✅ Без помітки', C['text']),
+                              ('blacklist', _GUEST_MARKS['blacklist'][0], _GUEST_MARKS['blacklist'][1]),
+                              ('warning', _GUEST_MARKS['warning'][0], _GUEST_MARKS['warning'][1]),
+                              ('vip', _GUEST_MARKS['vip'][0], _GUEST_MARKS['vip'][1])]:
+            ctk.CTkRadioButton(f, text=txt, variable=var, value=val, font=('Segoe UI', 12),
+                               text_color=clr, fg_color=C['accent']).pack(anchor='w', padx=20, pady=2)
+        e_c = ent(f, "коментар (обов'язково для чорного списку та «Увага»)", w=400)
+        e_c.pack(padx=12, pady=(8, 4))
+        st = lbl(f, "", 10, color=C['red']); st.pack(anchor='w', padx=12)
+
+        def _ph(e, ph):
+            v = e.get().strip()
+            return '' if v == ph else v
+
+        def _save():
+            name = _ph(e_n, "Іванов Іван Іванович")
+            phone = _ph(e_p, "+380...")
+            doc = _ph(e_d, "паспорт: серія і номер / ID")
+            cm = _ph(e_c, "коментар (обов'язково для чорного списку та «Увага»)")
+            mk = var.get()
+            if not name:
+                st.configure(text="❌ Введіть ПІБ"); return
+            if mk in ('blacklist', 'warning') and not cm:
+                st.configure(text="❌ Вкажіть коментар (причину) помітки"); return
+            try:
+                from app.utils.db import query as _q
+                import re as _re
+                if phone:
+                    _dg = _re.sub(r'\D', '', phone)[-9:]
+                    dup = None
+                    if len(_dg) >= 7:
+                        for r in self._all_rows:
+                            if _re.sub(r'\D', '', str(r.get('phone') or ''))[-9:] == _dg:
+                                dup = r; break
+                    if dup and not messagebox.askyesno(
+                            "Гість вже є", f"Гість з таким телефоном уже є в базі:\n«{dup['name']}» ({dup['phone']}).\n\nВсе одно додати?",
+                            parent=win):
+                        return
+                _ensure_guest_mark_cols()
+                _row = _q("INSERT INTO guests (name, phone) VALUES (%s,%s) RETURNING id",
+                          (name, phone or ''), fetch='one')
+                gid = (_row['id'] if isinstance(_row, dict) else _row[0]) if _row else None
+                if not gid:
+                    _r2 = _q("SELECT id FROM guests WHERE name=%s AND COALESCE(phone,'')=%s ORDER BY id DESC LIMIT 1",
+                             (name, phone or ''), fetch='one')
+                    gid = (_r2['id'] if isinstance(_r2, dict) else _r2[0]) if _r2 else None
+                if doc and gid:
+                    _q("UPDATE guests SET doc_info=%s WHERE id=%s", (doc, gid), fetch=None)
+                if mk and gid:
+                    _by = (self.user.get('full_name') or self.user.get('username') or '') if isinstance(self.user, dict) else ''
+                    _set_guest_mark([gid], mk, cm, _by)
+            except Exception as _e:
+                log_error("GuestDatabaseFrame._add_guest_dlg", _e)
+                st.configure(text=f"❌ Не вдалося зберегти: {_e}"); return
+            win.destroy()
+            self._load()
+
+        br = tk.Frame(f, bg=C['card']); br.pack(pady=10)
+        btn(br, "💾 Додати", _save, C['green'], 150, height=38).pack(side='left', padx=6)
+        btn(br, "✖ Скасувати", win.destroy, C['card2'], 130, height=38).pack(side='left', padx=6)
 
     def _sort(self, col):
         if self._sort_col == col: self._sort_rev = not self._sort_rev
@@ -29915,6 +30212,10 @@ class GuestDatabaseFrame(tk.Frame):
         hdr_f = ctk.CTkFrame(win, fg_color=C['card'], corner_radius=10)
         hdr_f.pack(fill='x', padx=14, pady=(14,6))
         lbl(hdr_f, f"👤  {row['name']}", 20, True, C['accent']).pack(anchor='w', padx=16, pady=(12,4))
+        if row.get('mark') in _GUEST_MARKS:
+            _mi = _GUEST_MARKS[row['mark']]
+            lbl(hdr_f, f"{_mi[0]}" + (f"  —  {row.get('mark_comment')}" if row.get('mark_comment') else ''),
+                12, True, _mi[1]).pack(anchor='w', padx=16, pady=(0,6))
         info_row = tk.Frame(hdr_f, bg=C['card']); info_row.pack(fill='x', padx=16, pady=(0,12))
         for i, (ico, label, val) in enumerate([
             ('📞','Телефон',   row['phone']),
@@ -30137,6 +30438,10 @@ class GuestDatabaseFrame(tk.Frame):
                 _mb.showerror("Помилка", str(_de), parent=win)
 
         btn(_btn_row, "✏️  Редагувати", _edit_guest, C['accent'],  150, height=36).pack(side='left', padx=6)
+        btn(_btn_row, "🚩  Помітка",
+            lambda: _guest_mark_dlg(win, row['all_ids'], row['name'], row.get('mark', ''), row.get('mark_comment', ''),
+                                    on_done=lambda: (win.destroy(), self._load())),
+            '#c0392b', 130, height=36).pack(side='left', padx=6)
         btn(_btn_row, "🖨  Друкувати", lambda: self._print_guest_card(row), '#2980b9', 140, height=36).pack(side='left', padx=6)
         btn(_btn_row, "🗑  Видалити",   _delete_guest, '#c0392b',  130, height=36).pack(side='left', padx=6)
         btn(_btn_row, "✕  Закрити",    win.destroy,   C['card2'],  120, height=36).pack(side='left', padx=6)
@@ -30396,11 +30701,13 @@ class GuestDatabaseFrame(tk.Frame):
 
     def _do_export(self, data, fname):
         try:
-            headers = ['#','ПІБ гостя','Телефон','Паспорт','Візитів','Перший','Останній','Ночей','Сплачено','Кімнати']
-            col_w = [5,28,16,16,8,13,13,7,12,28]
+            headers = ['#','ПІБ гостя','Телефон','Паспорт','Візитів','Перший','Останній','Ночей','Сплачено','Кімнати','Помітка','Коментар до помітки']
+            col_w = [5,28,16,16,8,13,13,7,12,28,18,30]
             rows = [[i+1,r['name'],r['phone'],r['passport'],int(r['visits'] or 0),
                      r['first_visit'],r['last_visit'],int(r['total_nights'] or 0),
-                     r['total_paid'],r['rooms_list']] for i,r in enumerate(data)]
+                     r['total_paid'],r['rooms_list'],
+                     (_GUEST_MARKS[r['mark']][0] if r.get('mark') in _GUEST_MARKS else ''),
+                     r.get('mark_comment') or ''] for i,r in enumerate(data)]
             SettingsFrame._make_xlsx(rows, headers, fname, col_widths=col_w)
             self.after(0, lambda f=fname: __import__('tkinter.messagebox',fromlist=['showinfo']).showinfo('✅ Готово',f'Збережено {len(data)} записів:\n{f}'))
         except Exception as _e:
