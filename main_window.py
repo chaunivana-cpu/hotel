@@ -3198,8 +3198,12 @@ def _dash_tip_bind(widget, get_text):
 def _tile_make_badge(owner, cell, ov):
     """Створює бейдж прострочення в лівому верхньому куті плитки + підказку з повним текстом."""
     short, full = _tile_overdue_texts(ov)
-    bg = '#cc0000' if (ov.get('days_late', 0) or 0) > 0 else '#cc8800'
-    b = tk.Label(cell, text=short, bg=bg, fg='white',
+    # «Прозорий» бейдж: у Tk немає справжньої прозорості, тому фон = колір плитки,
+    # а виділяє його лише колір тексту (жовтий — виїзд сьогодні, білий — прострочено).
+    try: bg = cell.cget('bg')
+    except Exception: bg = '#cc0000'
+    _fg = '#ffffff' if (ov.get('days_late', 0) or 0) > 0 else '#ffe14d'
+    b = tk.Label(cell, text=short, bg=bg, fg=_fg,
                  font=('Segoe UI', getattr(owner, '_badge_sz', 10), 'bold'), padx=3, pady=0)
     b._is_overdue_badge = True   # щоб оновлення могло його прибрати
     _tile_place_badge(owner, b)
@@ -10437,22 +10441,24 @@ class DashboardFrame(tk.Frame):
                         cell_.pack_propagate(False)
                         txt = num_.cget('text')
                         num_.pack_forget(); st_.pack_forget()
+                        _has_bdg = any(getattr(_w0, '_is_overdue_badge', False) for _w0 in cell_.winfo_children())
+                        _bd = (self._badge_sz + 7) if _has_bdg else 0   # висота смужки під бейдж угорі
                         if full:
                             st_.configure(font=('Segoe UI', 10, 'bold'), pady=1)
                             st_.pack(side='bottom', pady=(0, 3))
-                            wrap_w = tw - 6 - 40                        # запас під бейдж угорі праворуч
-                            avail = th - 6 - 22
+                            wrap_w = tw - 6 - (8 if _has_bdg else 40)
+                            avail = th - 6 - 22 - _bd
                             sz = _fit(txt, wrap_w, avail, (12, 11, 10, 9))
                             num_.configure(font=('Segoe UI', sz, 'bold'), wraplength=wrap_w,
                                            justify='center', padx=2, pady=0)
-                            num_.pack(side='top', expand=True)
+                            num_.pack(side='top', expand=True, pady=(_bd, 0))
                         else:
                             wrap_w = tw - 10
-                            avail = th - 8 - 16                         # знизу — запас під дати
+                            avail = th - 8 - 16 - _bd                   # знизу — запас під дати
                             sz = _fit(txt, wrap_w, avail, (11, 10, 9, 8, 7))
                             num_.configure(font=('Segoe UI', sz, 'bold'), wraplength=wrap_w,
                                            justify='center', padx=1, pady=0)
-                            num_.pack(side='top', expand=True, fill='both', pady=(0, 14))
+                            num_.pack(side='top', expand=True, fill='both', pady=(_bd, 14))
                         for w_ in cell_.winfo_children():
                             if getattr(w_, '_is_overdue_badge', False):
                                 w_.configure(font=('Segoe UI', self._badge_sz, 'bold'), padx=4, pady=0)
@@ -10585,6 +10591,11 @@ class DashboardFrame(tk.Frame):
                         if _ov2 and not _room_is_free2:
                             _tile_make_badge(self, cell, _ov2)
                     except Exception: pass
+            # бейджі могли з'явитись/зникнути — перераховуємо розкладку, щоб назва плитки не накладалась на бейдж
+            try:
+                self._tile_cols = None
+                self._relayout_tiles(self._grid_canvas.winfo_width(), self._grid_canvas.winfo_height())
+            except Exception: pass
             # Оновлюємо overlay
             if hasattr(self, '_overdue_tile_overlay'):
                 try:
@@ -31023,6 +31034,7 @@ class SettingsFrame(tk.Frame):
         btn(tb,"🧹 Прибирання",lambda:self._cleaning_dlg(p),C['yellow'],140).pack(side='left',padx=4)
         btn(tb,"📤 Експорт Excel",self._rooms_export_excel,C['accent'],150).pack(side='left',padx=4)
         btn(tb,"📥 Імпорт Excel",lambda:self._rooms_import_excel(p),C['green'],150).pack(side='left',padx=4)
+        btn(tb,"🖨 Друк",lambda:self._rooms_print(),'#2980b9',110).pack(side='left',padx=4)
         refresh_btn(tb, lambda:self._load_rooms(), side='left', padx=4, pady=6)
 
         # ── Фільтр (шукає одразу по всіх колонках: номер, категорія, статус тощо) ──
@@ -31050,6 +31062,24 @@ class SettingsFrame(tk.Frame):
         ff2.pack(fill='x')
         # Дані завантажуємо після рендеру UI через after()
         self.after(50, lambda: (self._load_rooms(), self._load_cleaning_log()))
+
+    def _rooms_print(self):
+        """Друк списку номерів (А4): у тому порядку й з тим фільтром, що зараз видно в таблиці."""
+        import datetime as _dtr
+        try:
+            rows=[]
+            for iid in self.rooms_t.get_children(''):
+                v=list(self.rooms_t.item(iid,'values'))
+                if len(v)>=6: rows.append([str(v[1]),str(v[2]),str(v[3]),str(v[4]),str(v[5])])
+            if not rows:
+                messagebox.showinfo("","Немає номерів для друку"); return
+            _open_report_print("Список номерів",
+                               f"Станом на {_dtr.datetime.now().strftime('%d.%m.%Y %H:%M')} · всього: {len(rows)}",
+                               ['Кімн.','Категорія','Пов.','Статус','Ціна/ніч'],
+                               rows, landscape=False)
+        except Exception as _ex:
+            log_error("SettingsFrame._rooms_print", _ex)
+            messagebox.showerror("Помилка друку", str(_ex))
 
     def _rooms_export_excel(self):
         """Експортує список номерів у .xlsx."""
@@ -31177,7 +31207,21 @@ class SettingsFrame(tk.Frame):
     def _load_rooms(self):
         from app.modules.logic import get_rooms
         self.rooms_t.delete(*self.rooms_t.get_children())
-        for r in (get_rooms() or []):
+        def _rank(r):
+            # порядок: бані → альтанки/бесідки → номери → золоті → рожеві
+            _txt=(str(r.get('cat_name','') or '')+' '+str(r.get('number','') or '')).lower()
+            _num=str(r.get('number','') or '').lower()
+            if 'бан' in _txt or 'sauna' in _txt: return 0
+            if any(k in _txt for k in ('альтанк','бесідк','беседк')): return 1
+            if 'рожев' in _num: return 5
+            if 'золот' in _num: return 4
+            if 'будиноч' in _txt: return 2
+            return 3
+        def _numkey(r):
+            m=_re_room_sort.search(r'\d+(?:/\d+)*',str(r.get('number','') or ''))
+            return tuple(int(x) for x in m.group(0).split('/')) if m else (999999,)
+        _rooms_sorted=sorted(get_rooms() or [],key=lambda r:(_rank(r),_numkey(r),str(r.get('number',''))))
+        for r in _rooms_sorted:
             self.rooms_t.insert('','end',iid=r['id'],
                 values=(r['id'],r['number'],r.get('cat_name','—'),r.get('floor',1),
                         STATUS_UA.get(r.get('status',''),''),f"{float(r.get('base_price') or 0):.0f}₴"))
@@ -31644,6 +31688,91 @@ class SettingsFrame(tk.Frame):
         for c,h in zip(('id','name','desc','price','cap'),['ID','Назва','Опис','Ціна/ніч','Місць']):
             self.cats_t.heading(c,text=h)
         ff.pack(fill='both',expand=True); self.after(60, self._load_cats)
+        def _on_dbl_cat(event):
+            if self.cats_t.identify_region(event.x,event.y)!='cell': return
+            iid=self.cats_t.identify_row(event.y)
+            if not iid: return
+            _cols=list(self.cats_t['columns'])
+            try: col_name=_cols[int(self.cats_t.identify_column(event.x)[1:])-1]
+            except Exception: return
+            if col_name in ('name','desc','price','cap'):
+                self._cat_inline_edit(iid,col_name)
+        self.cats_t.bind('<Double-ButtonRelease-1>',_on_dbl_cat)
+
+    def _cat_inline_edit(self,iid,col_name):
+        """Редагування назви / опису / ціни / місць прямо в таблиці категорій (двічі клік по комірці)."""
+        from app.modules.logic import get_categories, save_category
+        try:
+            cat=next((c for c in (get_categories() or []) if str(c['id'])==str(iid)),None)
+        except Exception as _ex:
+            messagebox.showerror("Помилка",str(_ex)); return
+        if not cat: messagebox.showerror("Помилка","Категорію не знайдено. Натисніть 🔄"); return
+        _raw_desc=cat.get('description','') or ''
+        _clean=_raw_desc.replace('[tariff:hour]','').replace('[tariff:night]','').strip()
+        if col_name=='name': _cur_val=str(cat.get('name') or '')
+        elif col_name=='desc': _cur_val=_clean
+        elif col_name=='price': _cur_val='%g'%float(cat.get('base_price') or 0)
+        else: _cur_val=str(int(cat.get('capacity') or 0))
+        bb=self.cats_t.bbox(iid,col_name)
+        if not bb: return
+        x,y,w,h=bb
+        ed=tk.Entry(self.cats_t,bg=C['card2'],fg=C['text'],insertbackground=C['text'],relief='flat',
+                    font=('Segoe UI',10),justify='center',highlightthickness=1,
+                    highlightbackground=C['accent'],highlightcolor=C['accent'])
+        ed.place(x=x,y=y,width=w,height=h)
+        ed.insert(0,_cur_val); ed.select_range(0,'end'); ed.focus_set()
+        _done=[False]
+        def _close():
+            if _done[0]: return
+            _done[0]=True
+            try: ed.destroy()
+            except Exception: pass
+        def _commit(_e=None):
+            if _done[0]: return 'break'
+            txt=ed.get().strip()
+            if txt==_cur_val: _close(); return 'break'
+            _name=str(cat.get('name') or ''); _price=float(cat.get('base_price') or 0)
+            _cap=int(cat.get('capacity') or 2); _desc=_clean
+            try:
+                if col_name=='name':
+                    if not txt: raise ValueError("Введіть назву")
+                    _name=_fix_mojibake(txt)
+                elif col_name=='desc': _desc=txt
+                elif col_name=='price':
+                    try: _price=float(txt.replace(',','.').replace('₴','').strip() or 0)
+                    except ValueError: raise ValueError("Ціна має бути числом")
+                    if _price<0: raise ValueError("Ціна не може бути від'ємною")
+                else:
+                    try: _cap=int(txt or 2)
+                    except ValueError: raise ValueError("Місць має бути цілим числом")
+                    if _cap<=0: raise ValueError("Місць має бути більше нуля")
+            except ValueError as _ve:
+                messagebox.showwarning("",str(_ve)); ed.focus_set(); return 'break'
+            _close()
+            # тариф береться з тегу в описі (як у діалозі); якщо тегу нема — за назвою
+            if '[tariff:hour]' in _raw_desc: _tar='hour'
+            elif '[tariff:night]' in _raw_desc: _tar='night'
+            else: _tar='hour' if any(k in str(cat.get('name') or '').lower() for k in ['баня','бані','альтанк','sauna']) else 'night'
+            _old_p=float(cat.get('base_price') or 0)
+            _rec_hist=(col_name=='price' and _tar!='hour' and _old_p>0 and abs(_old_p-_price)>0.005)
+            try:
+                self.config(cursor='watch'); self.update_idletasks()
+                save_category({'name':_name,'description':_desc+f' [tariff:{_tar}]',
+                               'base_price':_price,'capacity':_cap},cat['id'])
+                if _rec_hist: _record_price_change(cat['id'],_old_p,_price)
+                if col_name=='price':
+                    _invalidate_price_caches()
+                    _sync_booking_prices_with_categories(force=True)
+            except Exception as _ex:
+                messagebox.showerror("Помилка збереження",str(_ex)); return 'break'
+            finally:
+                try: self.config(cursor='')
+                except Exception: pass
+            _tl='⏱год' if _tar=='hour' else '🌙ніч'
+            self.cats_t.item(iid,values=(cat['id'],_name,_desc,f"{_price:.0f}₴ ({_tl})",_cap))
+            return 'break'
+        ed.bind('<Return>',_commit); ed.bind('<KP_Enter>',_commit); ed.bind('<FocusOut>',_commit)
+        ed.bind('<Escape>',lambda e:(_close(),'break')[1])
 
     def _cats_export_excel(self):
         """Експортує список категорій у .xlsx."""
@@ -32051,9 +32180,96 @@ class SettingsFrame(tk.Frame):
             if iid and str(iid).startswith('cat__'):
                 self.svcs_t.item(iid,open=not self.svcs_t.item(iid,'open'))
         self.svcs_t.bind('<ButtonRelease-1>',_on_click)
+        _EDITABLE={'name':'name','price':'price','unit':'unit','qty':'quantity'}
+        def _inline_edit(iid,col_name):
+            from app.utils.db import get_conn as _gc_ie
+            db_col=_EDITABLE[col_name]
+            try:
+                with _gc_ie() as _c:
+                    with _c.cursor() as _cur:
+                        _cur.execute(f"SELECT {db_col} FROM services WHERE id=%s",(int(iid),))
+                        _r=_cur.fetchone()
+            except Exception as _ex:
+                messagebox.showerror("Помилка",str(_ex)); return
+            if not _r: return
+            _cur_val=_r[0]
+            if col_name=='price': _cur_val=('%g'%float(_cur_val or 0))
+            elif col_name=='qty': _cur_val=str(int(float(_cur_val or 0)))
+            else: _cur_val=str(_cur_val or '')
+            bb=self.svcs_t.bbox(iid,col_name)
+            if not bb: return
+            x,y,w,h=bb
+            ed=tk.Entry(self.svcs_t,bg=C['card2'],fg=C['text'],insertbackground=C['text'],
+                        relief='flat',font=('Segoe UI',10),
+                        justify='left' if col_name=='name' else 'center',
+                        highlightthickness=1,highlightbackground=C['accent'],highlightcolor=C['accent'])
+            ed.place(x=x,y=y,width=w,height=h)
+            ed.insert(0,_cur_val); ed.select_range(0,'end'); ed.focus_set()
+            _done=[False]
+            def _close():
+                if _done[0]: return
+                _done[0]=True
+                try: ed.destroy()
+                except Exception: pass
+            def _commit(_e=None):
+                if _done[0]: return 'break'
+                txt=ed.get().strip()
+                if txt==_cur_val: _close(); return 'break'
+                try:
+                    if col_name=='name':
+                        if not txt: raise ValueError("Назва не може бути порожньою")
+                        val=_fix_mojibake(txt)
+                    elif col_name=='price':
+                        val=float(txt.replace(',','.').replace('₴','').strip() or 0)
+                        if val<0: raise ValueError("Ціна не може бути від'ємною")
+                    elif col_name=='qty':
+                        val=int(float(txt.replace(',','.') or 0))
+                        if val<0: raise ValueError("Кількість не може бути від'ємною")
+                    else:
+                        val=txt or 'шт'
+                except ValueError as _ve:
+                    msg=str(_ve)
+                    if msg.startswith('could not convert') or msg.startswith('invalid literal'):
+                        msg="Введіть число"
+                    messagebox.showwarning("",msg); ed.focus_set(); return 'break'
+                _close()
+                try:
+                    with _gc_ie() as _c:
+                        with _c.cursor() as _cur:
+                            _cur.execute(f"UPDATE services SET {db_col}=%s WHERE id=%s",(val,int(iid)))
+                            _cur.execute("""SELECT COALESCE(s.quantity,0),
+                                CASE WHEN COALESCE(s.quantity,0)=0 THEN NULL
+                                     ELSE GREATEST(0, COALESCE(s.quantity,0) - COALESCE(
+                                        (SELECT SUM(roi.quantity) FROM restaurant_order_items roi
+                                         JOIN restaurant_orders ro ON ro.id=roi.order_id
+                                         WHERE roi.service_id=s.id AND ro.status NOT IN ('cancelled')),0)) END
+                                FROM services s WHERE s.id=%s""",(int(iid),))
+                            _q,_stk=_cur.fetchone()
+                        _c.commit()
+                except Exception as _ex:
+                    messagebox.showerror("Помилка збереження",str(_ex)); return 'break'
+                vals=list(self.svcs_t.item(iid,'values'))
+                _cols=list(self.svcs_t['columns'])
+                if col_name=='name': vals[_cols.index('name')]=val
+                elif col_name=='price': vals[_cols.index('price')]=f"{float(val):.0f}₴" if float(val)==int(val) else f"{float(val):.2f}₴"
+                elif col_name=='unit': vals[_cols.index('unit')]=val
+                _qi=int(float(_q or 0))
+                vals[_cols.index('qty')]=_qi if _qi>0 else '—'
+                vals[_cols.index('stock')]='—' if _stk is None else (f"⚠️{int(_stk)}" if int(_stk)<5 else str(int(_stk)))
+                self.svcs_t.item(iid,values=vals)
+                return 'break'
+            ed.bind('<Return>',_commit); ed.bind('<KP_Enter>',_commit)
+            ed.bind('<FocusOut>',_commit)
+            ed.bind('<Escape>',lambda e:(_close(),'break')[1])
         def _on_dbl(event):
+            if self.svcs_t.identify_region(event.x,event.y)!='cell': return
             iid=self.svcs_t.identify_row(event.y)
             if not iid or str(iid).startswith('cat__'): return
+            _cols=list(self.svcs_t['columns'])
+            try: col_name=_cols[int(self.svcs_t.identify_column(event.x)[1:])-1]
+            except Exception: col_name=None
+            if col_name in _EDITABLE:
+                _inline_edit(iid,col_name); return
             vals=self.svcs_t.item(iid,'values')
             if vals: self._open_svc_card(iid,vals)
         self.svcs_t.bind('<Double-ButtonRelease-1>',_on_dbl)
@@ -32642,44 +32858,76 @@ class SettingsFrame(tk.Frame):
 
 
     def _dedup_services(self, parent_win=None):
-        """Видалити дублікати послуг — залишити запис з меншим ID для кожної назви+ціна."""
+        """Видалити дублікати послуг (однакові назва+ціна): лишається запис з меншим ID.
+        Усі посилання на дублікати (service_orders, restaurant_order_items та будь-які інші
+        таблиці з FK на services — шукаються автоматично) ПЕРЕНОСЯТЬСЯ на запис, що лишається,
+        тому історія замовлень не втрачається і помилка foreign key не виникає."""
         try:
             from app.utils.db import get_conn as _gc_dd
+            total_del=0
+            _mir_sql=[]; _mir_par=[]
             with _gc_dd() as _c:
                 with _c.cursor() as _cur:
                     _cur.execute("""
-                        SELECT LOWER(TRIM(name)), price, COUNT(*) as cnt, MIN(id) as keep_id
+                        SELECT LOWER(TRIM(name)), price, COUNT(*) AS cnt, MIN(id) AS keep_id
                         FROM services
+                        WHERE name NOT LIKE '__cat_placeholder_%%'
                         GROUP BY LOWER(TRIM(name)), price
                         HAVING COUNT(*) > 1
                     """)
                     dupes=_cur.fetchall()
                     if not dupes:
-                        messagebox.showinfo("\u2705","\u0414\u0443\u0431\u043b\u0456\u043a\u0430\u0442\u0456\u0432 \u043d\u0435 \u0437\u043d\u0430\u0439\u0434\u0435\u043d\u043e"); return
-                    total_del=0
-                    _mir_ops=[]
+                        messagebox.showinfo("✅","Дублікатів не знайдено"); return
+                    # всі зовнішні ключі, що посилаються на services(id)
+                    _cur.execute("""
+                        SELECT DISTINCT kcu.table_schema, kcu.table_name, kcu.column_name
+                        FROM information_schema.table_constraints tc
+                        JOIN information_schema.key_column_usage kcu
+                          ON tc.constraint_name=kcu.constraint_name AND tc.table_schema=kcu.table_schema
+                        JOIN information_schema.constraint_column_usage ccu
+                          ON ccu.constraint_name=tc.constraint_name AND ccu.table_schema=tc.table_schema
+                        WHERE tc.constraint_type='FOREIGN KEY' AND ccu.table_name='services'
+                    """)
+                    _fks=[(sc,t,col) for sc,t,col in _cur.fetchall()]
+                    # на випадок, якщо FK не оголошені, але таблиці є
+                    _known={(t,col) for _,t,col in _fks}
+                    for _t,_col in (('service_orders','service_id'),('restaurant_order_items','service_id')):
+                        if (_t,_col) not in _known: _fks.append(('public',_t,_col))
                     for name_low,price,cnt,keep_id in dupes:
-                        _cur.execute("""DELETE FROM restaurant_order_items
-                            WHERE service_id IN (
-                                SELECT id FROM services
-                                WHERE LOWER(TRIM(name))=%s AND price=%s AND id<>%s
-                            )""",(name_low,price,keep_id))
-                        _cur.execute("""DELETE FROM services
-                            WHERE LOWER(TRIM(name))=%s AND price=%s AND id<>%s
-                        """,(name_low,price,keep_id))
-                        _mir_ops.append((name_low,price,keep_id))
+                        _cond="id IN (SELECT id FROM services WHERE LOWER(TRIM(name))=%s AND price=%s AND id<>%s)"
+                        _sub="(SELECT id FROM services WHERE LOWER(TRIM(name))=%s AND price=%s AND id<>%s)"
+                        _cur.execute("SELECT id, COALESCE(quantity,0), COALESCE(barcode,'') FROM services "
+                                     "WHERE LOWER(TRIM(name))=%s AND price=%s",(name_low,price))
+                        _grp=_cur.fetchall()
+                        _best_qty=max(float(r[1] or 0) for r in _grp)
+                        _bc_new=next((r[2] for r in sorted(_grp) if r[2]),'')
+                        for _sc,_tb,_col in _fks:
+                            try:
+                                _cur.execute("SAVEPOINT sp_dd")
+                                _q=f'UPDATE "{_sc}"."{_tb}" SET "{_col}"=%s WHERE "{_col}" IN {_sub}'
+                                _cur.execute(_q,(keep_id,name_low,price,keep_id))
+                                _cur.execute("RELEASE SAVEPOINT sp_dd")
+                                _mir_sql.append(f'UPDATE "{_tb}" SET "{_col}"=%s WHERE "{_col}" IN {_sub}')
+                                _mir_par+= [keep_id,name_low,price,keep_id]
+                            except Exception:
+                                _cur.execute("ROLLBACK TO SAVEPOINT sp_dd")
+                        _cur.execute("DELETE FROM services WHERE LOWER(TRIM(name))=%s AND price=%s AND id<>%s",
+                                     (name_low,price,keep_id))
+                        _mir_sql.append("DELETE FROM services WHERE LOWER(TRIM(name))=%s AND price=%s AND id<>%s")
+                        _mir_par+=[name_low,price,keep_id]
+                        # зберігаємо найбільшу кількість і штрих-код з видалених копій
+                        _cur.execute("UPDATE services SET quantity=GREATEST(COALESCE(quantity,0),%s),"
+                                     "barcode=COALESCE(NULLIF(barcode,''),%s) WHERE id=%s",
+                                     (_best_qty,_bc_new or None,keep_id))
                         total_del+=cnt-1
                 _c.commit()
-                for _nl,_pr,_kid in _mir_ops:
-                    _mirror_ref_write(_c,
-                        "DELETE FROM restaurant_order_items WHERE service_id IN ("
-                        "SELECT id FROM services WHERE LOWER(TRIM(name))=%s AND price=%s AND id<>%s); "
-                        "DELETE FROM services WHERE LOWER(TRIM(name))=%s AND price=%s AND id<>%s",
-                        (_nl,_pr,_kid)*2)
-            self._load_svcs()
-            messagebox.showinfo("\U0001f9f9 \u0413\u043e\u0442\u043e\u0432\u043e",f"\u0412\u0438\u0434\u0430\u043b\u0435\u043d\u043e {total_del} \u0434\u0443\u0431\u043b\u0456\u043a\u0430\u0442\u0456\u0432")
+                if _mir_sql:
+                    _mirror_ref_write(_c,"; ".join(_mir_sql),tuple(_mir_par))
+            try: self._load_svcs()
+            except Exception: pass
+            messagebox.showinfo("🧹 Готово",f"Видалено {total_del} дублікатів")
         except Exception as e:
-            messagebox.showerror("\u041f\u043e\u043c\u0438\u043b\u043a\u0430",str(e))
+            messagebox.showerror("Помилка",str(e))
 
     def _open_svc_card(self, svc_id, vals):
         """Картка товару: назва, категорія, ціна, кількість, штрих-код."""
