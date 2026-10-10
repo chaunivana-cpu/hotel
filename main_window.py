@@ -6452,6 +6452,11 @@ _DLG_GEOM_CACHE: dict = _load_geom_cache()
 def _dlg_save_geom(win, key):
     """Зберігає розмір вікна у кеш і JSON при кожній зміні."""
     try:
+        try:
+            if win.state() == 'zoomed':
+                return                  # розгорнуте вікно — це не розмір, який виставив користувач
+        except Exception:
+            pass
         geom = win.geometry()          # "WxH+X+Y"
         size_part = geom.split('+')[0]  # тільки "WxH"
         if 'x' in size_part:
@@ -6558,6 +6563,14 @@ def _sw_maximize(win):
             return                              # фіксований діалог — розмір задумано
         if win.state() == 'zoomed':
             return
+        # Користувач уже виставляв розмір цього вікна → поважаємо його, не розгортаємо
+        if getattr(win, '_sw_no_auto_max', False):
+            return
+        try:
+            if _DLG_GEOM_CACHE.get(_dlg_geom_key(win.title())):
+                return
+        except Exception:
+            pass
         try:
             win.state('zoomed')
         except Exception:
@@ -6875,6 +6888,7 @@ def _dlg_remember_size(win, key):
             ww = min(ww, win.winfo_screenwidth() - 40)
             wh = min(wh, win.winfo_screenheight() - 80)
             if ww > 100 and wh > 100:
+                win._sw_no_auto_max = True      # є збережений розмір — не розгортаємо на весь екран
                 win.geometry(f"{ww}x{wh}")
         # зберігаємо тільки зміни розміру самого вікна (не дочірніх віджетів)
         win.bind('<Configure>',
@@ -11261,6 +11275,17 @@ class DashboardFrame(tk.Frame):
                 ("🔁 Переселити", _close_then(lambda: _open_relocate_dlg(self, active_bid, refresh, self.user)), '#16a085'),
                 ("📋 Відкрити деталі", _close_then(lambda: BookingDetailDlg(self, active_bid, refresh)), C['accent']),
             ]
+            if not is_sauna:
+                # бронь на майбутнє: дата за замовчуванням — день виїзду поточного гостя
+                def _book_after():
+                    try:
+                        _d = _bk.get('check_out') if _bk else None
+                        _d = _d.date() if hasattr(_d, 'date') else (_d or today)
+                        if _d <= today: _d = today + _dt_tc.timedelta(days=1)
+                    except Exception:
+                        _d = today + _dt_tc.timedelta(days=1)
+                    _open_booking_dlg(self, room, _d, refresh)
+                actions.insert(3, ("📋 Забронювати після виїзду", _close_then(_book_after), C['accent']))
         else:
             if upcoming_bid is not None:
                 def _checkin_from_booking():
@@ -16784,9 +16809,14 @@ class ChessFrame(tk.Frame):
     def _new_booking_dlg(self, room, click_date):
         """Клік на клітинку — нове бронювання або виселення якщо заселений."""
         st = room.get('status', '')
+        # Номер зараз заселений, а клік по МАЙБУТНІЙ даті (після виїзду гостя) —
+        # дозволяємо створити бронь; заселити можна буде лише коли номер звільниться.
+        _occ_now = st in ('occupied', 'checkedin')
+        _future_click = click_date > date.today()
+        _occ_future = _occ_now and _future_click
 
         # Якщо номер заселений — одразу відкриваємо діалог виселення
-        if st == 'checkedin':
+        if st == 'checkedin' and not _occ_future:
             try:
                 from app.utils.db import get_conn as _gc_co
                 with _gc_co() as _conn_co:
@@ -16804,7 +16834,7 @@ class ChessFrame(tk.Frame):
             return
 
         # Зайнятий / заселений — шукаємо активне бронювання і відкриваємо дію
-        if st in ('occupied', 'checkedin'):
+        if st in ('occupied', 'checkedin') and not _occ_future:
             try:
                 from app.utils.db import get_conn as _gc_occ
                 with _gc_occ() as _co:
@@ -16832,7 +16862,7 @@ class ChessFrame(tk.Frame):
             return
 
         # Зайнятий — знайти активне бронювання і відкрити дію (без попередження)
-        if st in ('occupied', 'checkedin'):
+        if st in ('occupied', 'checkedin') and not _occ_future:
             try:
                 from app.utils.db import get_conn as _gc_occ
                 with _gc_occ() as _co:
@@ -16854,7 +16884,7 @@ class ChessFrame(tk.Frame):
             self._room_status_dlg(room); return
 
         # Прибирання / ремонт — питаємо
-        if st not in ('free', 'confirmed', None, ''):
+        if st not in ('free', 'confirmed', None, '') and not _occ_future:
             if not messagebox.askyesno(
                 "Номер недоступний",
                 f"Номер №{room['number']} має статус '{STATUS_UA.get(st, st)}'.\n"
@@ -16928,6 +16958,12 @@ class ChessFrame(tk.Frame):
                 lambda: (win.destroy(), _open_relocate_dlg(self, _bid_ref, self._redraw, self.user)),
                 '#16a085'
             ))
+        if _occ_future:
+            # Номер зараз заселений: лише бронювання на майбутню дату
+            actions = [a for a in actions if 'Забронювати' in a[0]]
+            lbl(f, "ℹ️ Номер зараз заселений. Бронь на цю дату можна створити,\n"
+                   "а заселити — лише після виселення поточного гостя.",
+                10, color=C['yellow']).pack(pady=(0, 10))
         actions.append(("✖ Скасувати", win.destroy, C['red']))
 
         for txt, cmd, color in actions:
@@ -19037,6 +19073,26 @@ class BookingDlg(ctk.CTkToplevel):
         if cout<=cin: messagebox.showerror("","Виїзд має бути пізніше заїзду"); return
         name=self.fields['name'].get().strip()
         if not name: messagebox.showerror("","Введіть ім'я гостя"); return
+        # Перетин дат з іншим активним бронюванням цього номера → заборона.
+        # (Заселений гість із виїздом ДО початку нової броні не заважає.)
+        try:
+            from app.utils.db import query as _q_ov
+            _rid_chk = self.room_map[self.room_var.get()]['id']
+            _clash = _q_ov(
+                "SELECT b.id, b.check_in, b.check_out, g.name AS guest_name FROM bookings b "
+                "LEFT JOIN guests g ON g.id=b.guest_id "
+                "WHERE b.room_id=%s AND b.status IN ('checkedin','confirmed') "
+                "AND b.check_in::date < %s AND b.check_out::date > %s "
+                "ORDER BY b.check_in LIMIT 1", (_rid_chk, cout_d, cin_d), fetch='one')
+            if _clash:
+                _c = dict(_clash)
+                messagebox.showerror("Номер зайнятий на ці дати",
+                    f"№ {self.room_map[self.room_var.get()].get('number','')} вже зайнятий:\n"
+                    f"{_c.get('guest_name','')}  ({str(_c['check_in'])[:10]} → {str(_c['check_out'])[:10]})\n\n"
+                    "Оберіть дати після виїзду цього гостя.")
+                return
+        except Exception as _e_ov:
+            log_error("BookingDlg: перевірка перетину дат", _e_ov)
         try:
             discount = max(float(self.e_discount.get() or 0), 0.0)
         except Exception:
@@ -19128,13 +19184,16 @@ class BookingDlg(ctk.CTkToplevel):
             from app.utils.db import get_conn
             with get_conn() as _conn:
                 with _conn.cursor() as _cur:
-                    _cur.execute("UPDATE rooms SET status='confirmed' WHERE id=%s", (rid,))
+                    # Не затираємо статус номера, який зараз заселений/прибирається/на ремонті
+                    _cur.execute("UPDATE rooms SET status='confirmed' WHERE id=%s "
+                                 "AND COALESCE(status,'free') NOT IN ('occupied','checkedin','cleaning','repair','blocked')", (rid,))
                 _conn.commit()
         except Exception as _e:
             log_error("BookingDlg: не вдалося оновити статус номера", _e)
             try:
                 from app.utils.db import query as _q
-                _q("UPDATE rooms SET status='confirmed' WHERE id=%s", (rid,), fetch=None)
+                _q("UPDATE rooms SET status='confirmed' WHERE id=%s "
+                   "AND COALESCE(status,'free') NOT IN ('occupied','checkedin','cleaning','repair','blocked')", (rid,), fetch=None)
             except Exception:
                 pass
         messagebox.showinfo("✅","Бронювання створено!")
