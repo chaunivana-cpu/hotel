@@ -1207,6 +1207,294 @@ def _booking_checkin_price(b, fallback=0.0):
     return stored
 
 
+# 3D-емодзі «готель» (Microsoft Fluent Emoji, MIT) — для бічної панелі
+_HOTEL_ICON_3D_B64 = (
+    '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'
+    'pNxzv88AAAAASUVORK5CYII='
+)
+
+
+def _tree_view_save(tree):
+    """Запам'ятовує позицію прокрутки та виділені рядки таблиці перед оновленням."""
+    try:
+        return (tree.yview()[0], tuple(tree.selection()))
+    except Exception:
+        return (0.0, ())
+
+
+def _tree_view_restore(tree, state):
+    """Після оновлення таблиці повертає ту саму прокрутку і виділення
+    (замість стрибка нагору після закриття вікна бронювання)."""
+    try:
+        y, sel = state
+    except Exception:
+        y, sel = 0.0, ()
+    def _do():
+        try:
+            tree.update_idletasks()
+            tree.yview_moveto(y)
+            keep = [i for i in sel if tree.exists(i)]
+            if keep:
+                tree.selection_set(keep)
+                tree.focus(keep[0])
+        except Exception:
+            pass
+    try:
+        tree.after(10, _do)
+        tree.after(120, _do)   # повторно — після авто-підгонки висоти рядків
+    except Exception:
+        pass
+
+
+def _bath_overdue_hours(booking):
+    """Погодинна оренда (баня): скільки ПОВНИХ (розпочатих) годин гість сидить
+    понад оплачений час, якщо бронювання досі «заселене».
+    Початок береться з нотатки «Баня: 3.00 год (18:07–21:07)» + дата заїзду.
+    Повертає (оплачені_години, прострочені_години). Без даних → (0, 0)."""
+    try:
+        import re as _re_bo, math as _m_bo, datetime as _dt_bo
+        notes = str(booking.get('notes') or '')
+        nl = notes.lower()
+        if 'баня:' not in nl and 'год (' not in nl:
+            return (0.0, 0.0)
+        mh = _re_bo.search(r'(\d+\.?\d*)\s*год', nl)
+        hours = float(mh.group(1)) if mh else 0.0
+        mt = _re_bo.search(r'(\d{1,2}):(\d{2})\s*[–—-]\s*(\d{1,2}):(\d{2})', notes)
+        if hours <= 0 or not mt:
+            return (hours, 0.0)
+        ci = booking.get('check_in')
+        ci = ci if hasattr(ci, 'year') else _dt_bo.date.fromisoformat(str(ci)[:10])
+        start = _dt_bo.datetime(ci.year, ci.month, ci.day, int(mt.group(1)), int(mt.group(2)))
+        end = start + _dt_bo.timedelta(hours=hours)
+        over = (_dt_bo.datetime.now() - end).total_seconds() / 3600.0
+        if over <= 0:
+            return (hours, 0.0)
+        return (hours, float(_m_bo.ceil(over)))
+    except Exception:
+        return (0.0, 0.0)
+
+
+def _legacy_dep_in_total(booking, total_stored, dep_paid, lodging_paid):
+    """Старі заселення з броні записували в total_amount «проживання + залог».
+    Повертає суму залогу, яку треба ВІДНЯТИ від total_amount (або 0).
+    Спрацьовує лише коли виконуються обидві умови: total_amount − залог дорівнює
+    очікуваному проживанню (ціна × доби − знижка) І вже сплачено рівно стільки."""
+    try:
+        if not (total_stored > 0 and dep_paid > 0):
+            return 0.0
+        import re as _re_ld, datetime as _dt_ld
+        ci = booking.get('check_in'); co = booking.get('check_out')
+        ci = ci if hasattr(ci, 'year') else _dt_ld.date.fromisoformat(str(ci)[:10])
+        co = co if hasattr(co, 'year') else _dt_ld.date.fromisoformat(str(co)[:10])
+        n = max((co - ci).days, 1)
+        price = float(booking.get('price_per_day') or 0)
+        m = _re_ld.search(r'Знижка:\s*([\d.,]+)\s*₴', booking.get('notes', '') or '')
+        disc = float(m.group(1).replace(',', '.')) if m else 0.0
+        expected = max(price * n - disc * n, 0.0)
+        if abs(total_stored - dep_paid - expected) < 0.5 and abs(lodging_paid - expected) < 0.5:
+            return float(dep_paid)
+    except Exception:
+        pass
+    return 0.0
+
+
 def calc_stay_financials(booking, payments, svc_total=None):
     """booking: dict з check_in, check_out, price_per_day, total_amount,
     status (з таблиці bookings). payments: список dict з amount, note
@@ -1249,6 +1537,10 @@ def calc_stay_financials(booking, payments, svc_total=None):
         n_actual = max((_dt_calc.date.today() - ci).days, 0)
         overdue_nights = max(n_actual - n_planned, 0)
     total = total_planned + (_extra_nights_cost(booking, co, overdue_nights) if overdue_nights > 0 else 0.0)
+    if booking.get('status') == 'checkedin':
+        _bh, _oh = _bath_overdue_hours(booking)
+        if _oh > 0:
+            total += price * _oh   # баня: ціна за годину × прострочені години
 
     # 🎁 Безкоштовне проживання: весь період до виселення не оплачується,
     # борг за проживання не рахується (послуги/штрафи — як звичайно).
@@ -1273,6 +1565,20 @@ def calc_stay_financials(booking, payments, svc_total=None):
 
     paid = adv_paid + dopla_paid + dep_paid
 
+    # Старі записи: залог влитий у total_amount — прибираємо його з суми проживання
+    if not _free and total_stored > 0:
+        _lodge_paid = 0.0
+        for p in (payments or []):
+            amt = float(p.get('amount') or 0); note = p.get('note', '') or ''
+            if amt <= 0 or any(tag in note for tag in ('Залог', 'deposit', 'Повернення залогу')):
+                continue
+            if note.startswith('Послуга') or note.startswith('Додаткові послуги'):
+                continue
+            _lodge_paid += amt
+        _adj = _legacy_dep_in_total(booking, total_stored, dep_paid, _lodge_paid)
+        if _adj > 0:
+            total = max(total - _adj, 0.0)
+
     # ── Замовлені послуги (service_orders) ──────────────────────────────
     # Якщо передано svc_total (сума замовлених послуг без залогів/штрафів) —
     # борг = борг за проживання + борг за послуги. Раніше послуги, додані
@@ -1294,8 +1600,8 @@ def calc_stay_financials(booking, payments, svc_total=None):
                 continue
             if note.startswith('Додаткові послуги при заселенні'):
                 checkin_svc_paid += amt
-            elif note.startswith('Послуга'):
-                svc_paid += amt
+            elif note.startswith('Послуга') or note.startswith('Додаткові послуги'):
+                svc_paid += amt   # у т.ч. «Додаткові послуги (баня)»
             else:
                 general_paid += amt
         lodging_total = max(total - checkin_svc_paid, 0.0)
@@ -2962,6 +3268,19 @@ def btn(p, text, cmd, color=None, w=130, **kw):
     return ctk.CTkButton(p, text=text, command=cmd, fg_color=color or C['accent'],
                          hover_color='#3a7ce0', width=w, font=('Segoe UI',12), **kw)
 
+def btn_fit(p, text, cmd, color=None, pad=22, min_w=60, size=11, height=30, **kw):
+    """Компактна кнопка, ширина якої автоматично підлаштовується під текст."""
+    try:
+        import tkinter.font as _tkf_fit
+        _f = _tkf_fit.Font(family='Segoe UI', size=size)
+        w = max(min_w, _f.measure(text) + pad)
+    except Exception:
+        w = max(min_w, len(text) * 8 + pad)
+    return ctk.CTkButton(p, text=text, command=cmd, fg_color=color or C['accent'],
+                         hover_color='#3a7ce0', width=w, height=height,
+                         font=('Segoe UI', size), corner_radius=8, **kw)
+
+
 def lbl(p, text, size=12, bold=False, color=None):
     return ctk.CTkLabel(p, text=text,
                         font=('Segoe UI',size,'bold' if bold else 'normal'),
@@ -3057,11 +3376,59 @@ def _attach_entry_clipboard(e):
     except Exception:
         pass
 
+def _cap_name(s):
+    """ПІБ: кожне слово (і частина після дефіса) з великої літери, решта — малі.
+    «іванов іван-петрович» → «Іванов Іван-Петрович». Апострофи не ламаємо."""
+    words = str(s or '').split()
+    out = []
+    for w in words:
+        parts = [(x[:1].upper() + x[1:].lower()) for x in w.split('-')]
+        out.append('-'.join(parts))
+    return ' '.join(out)
+
+
+def _cap_name_live(s):
+    """Під час набору: лише перша літера кожного слова (решту не чіпаємо,
+    пробіли зберігаємо — щоб не псувати курсор)."""
+    res = []; up = True
+    for ch in str(s or ''):
+        res.append(ch.upper() if up and ch.isalpha() else ch)
+        up = ch in (' ', '-')
+    return ''.join(res)
+
+
+def _bind_name_caps(e):
+    """Поле ПІБ: автоматично велика літера на початку кожного слова."""
+    def _fix(_ev=None, final=False):
+        try:
+            cur = e.get()
+            new = _cap_name(cur) if final else _cap_name_live(cur)
+            if final:
+                new = new if new else cur
+            if new != cur:
+                try: pos = e.index('insert')
+                except Exception: pos = len(new)
+                e.delete(0, 'end'); e.insert(0, new)
+                try: e.icursor(min(pos, len(new)))
+                except Exception: pass
+        except Exception:
+            pass
+    try:
+        e.bind('<KeyRelease>', lambda ev: _fix(ev, False), add='+')
+        e.bind('<FocusOut>',  lambda ev: _fix(ev, True),  add='+')
+    except Exception:
+        pass
+
+
 def ent(p, ph='', w=200, show=None):
     e = ctk.CTkEntry(p, placeholder_text=ph, width=w, fg_color=C['card2'],
                      border_color=C['border'], text_color=C['text'], font=('Segoe UI',12))
     if show: e.configure(show=show)
     _attach_entry_clipboard(e)
+    # Усі поля ПІБ гостя в програмі мають підказку «Іванов Іван…» — для них
+    # вмикаємо автоматичну велику літеру.
+    if str(ph or '').startswith('Іванов Іван'):
+        _bind_name_caps(e)
     return e
 
 def card(p, **kw):
@@ -7618,21 +7985,1028 @@ _NAV_ICON_COLORS = {
 }
 
 
+# 3D-іконки пунктів лівого меню (Microsoft Fluent Emoji, MIT), PNG 64×64 у base64
+_NAV_ICONS_3D_B64 = {
+    'dashboard': (
+        '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'
+    ),
+    'chess': (
+        'iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAQKklEQVR42uVbXawd11X+vr1n5pzjc6+vHce+5D9toqSJ4zRK0oS3+qUSohIRSD'
+        'bwBKJCvMBTJVpRhGPKQ1QJnhFCfUGq4F4pBEUI3uJISFGkVlTBbuOEJiSuTBPHje3r+3PO7L0WD3vPzJ45c8691yFKBVeaO3979s/aa33rW2vv'
+        'A/w//+Otf6qE/iKNhJ9ub86cUfPlM69kOLVmAeUv3lwqsab2y69odkbV/K9pwJkzZ8zZswBwVqpnFoDT7+eXXptmH35UEACuXrv6CYSyCuCDcE'
+        'K4rK+rd52yR44cUQA4Nj2m9xQfuuzpp0vf6riaM88DZ0m5ZQGcOrVm19dPewD4xgvnTvz0+uCrWzr4ks/zu9Vmh7WwQzE0sAbIDNQCIOMRazcm'
+        '6Ev6rL4m1Mw+AxGsq3pmkncAlAagADSw1ggsd/J88PFgYH86zPH9uzL91+88M/h3BXBqTe36afp9C6Aa/J/++UsPn7+8/Bcfu+Gvl6Nj1hUDSG'
+        'YhmYXmhGZx8BkBawADKBk6XV3HQdSCqJ83Qqm/YfONxrJg+zkY64p1MgNsDuRDYDAARqXitgFffsDhT/7yGZ4/pWrX2S8ELhr81/7wxd947+Px'
+        'd6/h6MrUEBiMHIcFbZGDmSFyCxTV7BuoZTNQ0wxQTWd2u++7A0alGR0B1QKshAmAQei0UGYAMygL2NER8LBi8z7ga39zgv8wTwjsA7uzZyl/8E'
+        'cvPnfx8uilq+VBcDhyZjTK7GAIO8hh8gzMbZx5A1hGIbAeWGsA6ez3zGw9o13TQFcgaASYHgYwNhx5ARQFYAZwOka2sgzcsYnf/usT/Ps+czCz'
+        'gEf91rdffOAnl+zfXd0YqWEh1gyznAPkyGE1A8UC3gDSHOqbs3qG9z7eu+Y+PbRzrp9LdSbUE+oBxCO9ru7VA74MRzkB3BQoPLKVKQQl9NoI3z'
+        '3zrn5h/RSk6yE67uJ5kNAfX3DfubG5skwz8MYMTWYGsMxBWISpMICGDkIYOqrhDK2uAdVIF9TU5USTspKck+cqgAqAeFbF7LP03odr74CyBLYn'
+        'wM0tQEqY0QTeLGH0Xzv4K/ZwBdOZffnmn7306PXrxXOlUzEsMssClhkIC8aBh0FVXKjSS7SeV7qqGt5pZW3VfeRR1Tk8Q31d3UPb99Wz8G1ynw'
+        'jKOWB7CtzYBtwUGa5DpgV+5esX9YmzZEsL6otz504aALj0rntO9KCFKYTMYZnBwIC1we3mUDgXXzV5x/r/rZHSXt5XCSRqw/YE2NwB/BQiY/Cq'
+        '4tfCWJtxZ9XFq69eUQDY2sazKhmglgYZSBOQthIA99PhMESdV1ZjNco9Vcf4yWJC2GhF6YMmFFNQJwAEzwLAq1eaarLmy9NiLVBOeZdEP0UakO'
+        '0ZJfYYAmg1TazvSY3C0I4ANRHWrQc12iOI0gPTEvQ7ADzuVVVD0kOVIGtbIAB1To0KD1T2TDS1RouFQuJDiXOrrfv6TEnKSxRGWq66Tr6rjX5v'
+        'OsZFwo8CEAGcAJMSmHqsXLqEQVo0a395zqhKhpSdUkFIYrFtjQhzapI5SN9zDxiRgCPRAGptGuwftrZba+kUmzlQBcSD3gEqGJy/jBzA9hwBvE'
+        'XvD1HUw6uDkRKiBvAKZL5xfWqCKlfurWJnyuYeHfan/axwhuImg1dWwmgwQg0T+XYIVhU/mGC6XgFrgbII7tFL4HALNOAhzfPLOsAEpQMGRYYs'
+        'l8j2DGhtZHtRABEcWwOvBqWmFfzUHZXuoIMhsWZ4XYqclksVq91eVU/olgUMId6gYI5BZoHcYEAv5eFrOiMAVY1gt8zf+a1jZlQcxqA4gKXxMo'
+        'pBHugtGIwg1TN2AIgMOsc+aGK/AXfxcMaMdMa6VGNTHf+iNWAJSIIkssIjH+QYHRxAUVoprElb6WjAUzh48BWsjAqMigLjcY68yGGM6fjsXQa3'
+        'CJzmfaq7Fdxr5XWGCIZEVhgMhgZLY2LiwZ1OdiDrVuMc4Lyi9EDpgpbTaMQizmlQF2SqGsDan0PHPp1iu1JGC1UBjCimApQ9qZEZAdC0os5okk'
+        'z4QNJcvzuPPj9cVGVMMqk6Z+aZPFPuIoPeDrB11XfsKgDTo9Ls0UwFQMO2abDhqRpH2ZJbJEaG7HXmqtrAi3Ya7bYVy0kaHPRq1mIKn80+MgmJ'
+        'nel7i9eXbgrnyw47VGQ2Q24HPQBHiHhM3ATsaAFJDPJhLV1NuKdCMZ3uQNQnmhiEXOQDWGYBAHUvxHxXAcx2uuKBlRBC1KW4+OZb+OjGFWQ2j5'
+        '4EcM5h9dgqHnv4BFzp6kYVCgODn13+EG+/fxFZnqGacKgiyzM8eeIpDPIBJCXMBLY3dvDGmz+EU1cLgCScd/jCgw/jjmN3oSzLHjPlrpiSLcYe'
+        'zlSmqlBVeCeYTqbwpYAqUA2uxzuBd7NooxrUdTKZwjkP0kaV18QNa+LQgqQVRDl1KKcOYpJ4koB3PppAn5pzl9h0oQZw1n5n0JYgTcABBtMxKW'
+        'Bqjzy1eU+2RUs2UNVoTQOsITDzLQEwumcuVPLFYjC35n04YyLsPucsIoNdPGaSZ2BP85zT3uztbtkK7EcDGurN3kQIu2XjBwTr67avq2Yf9WyT'
+        'JkApY7DINPLswXEChpGQRYpM4S5TxCRo248J6CIc1Tp6V1G4qQMy1nZcOgdpYQDbQZwCPoJj5fbq8wJi453A0ze6FttSj7n2PzuhexLArEqyRw'
+        '1pFPfd8zms7twBxiiuMv3l5TFEpI3KDAK7/fYjKIoTnfBZkRc5iqxoaU4VWgxHAzz0wCPw3jc9iThy+OBheO+jRnWsEJiDY4uY4CJ7j2EqqbCZ'
+        'we3HjsAw1Ymm1yKSQJLWQlheWcLKoYPtUIANRwixD2tPQALFsMCdd63OZKPI8E1KoLpkTfeLAToHPdPMmKqJTNSj0nZ2dK41+1V2yUQTENciOu'
+        'mAUvxI6/ReegdTeZ4WgGgCscqFi9l70ICU57MF8IY2obVsFFoVotJoOJs0lTGEYd4TPgStmRcwFRkTl9W8dDHthdT1dmkr9+kF0PLGs26tKrG9'
+        's4WJ24kpMa1ZYpEVODAc16aROvSydNiabMwMxBiD8Wi5qSu1D1G8e1OwqSYKIUhTQNwxJA5bwFcepW/Eul8BcAG1iJWJF7x18e2GCiN4AedKrB'
+        '5bxeOPPBGocJPCgyHxs8sf4O333wxUuMoOqSLPMzz9xS9hkA8jr2+SIdsbW3jhPwRvmRWMGNKsBsCGWHz9YYPTq1NslGGJsuN0bpEHzOA/Z2Tg'
+        'vcB7QZ0610prTD8jU0QK7SMmmCTkYyftztplhhyFQL3AmHZpo934Wnuyo5zjyRYxwU5hTcCs6hnB+cRTF3OJ2WBrQUpEE3NMPiUTj8AFjJENPv'
+        'X9md4Oag/z072tBLXHyX0sn/UHNJyXNqsDKPakmzqay30HQ4tmqN0bVrS0pvpMOH/KHbvsnxE32qsMfUEXAAhDFlgT/y6ck//YczqkI4ALFy4Q'
+        'u/CAOoaPeWxfCihSz4g4CeCm83slTuGpIYQGISow1F7NUwAGROE8Mj9BRoVoALzcW2QyjFSXaCs7Z1Nuuwng+PHjevmdf5tj220YMUbxwOcexN'
+        '2Te2cSEQeWhvAJFU5n/OixoxiPl2ZqD1R4EGKKWnWDXy3GQ3zjMYMd79pGYwSrhyy2fdie1B8e8hbcYEdVZzGMsNZi5bbl2dQZQ5Ajor1EfLw0'
+        'wtLygV6iUhOhJIEQcvs57l3NZyyTAJxo//g0sSDOjwizvSWc2ZvrFok7EjqZ4b4sskbBhQVL6cfNiCVNRrjRoNL3xcrahOBdEt8TAu4pJ8iFKK'
+        '2tNX9rTTvDW2mcdGhtwk5pCGOzBExSvu/brSYrTXmWzawcEYAXicFQZxZ0b2mSbK+Lz+xgNUHc2LiO7ekWjDENCKpgWIxwcHwIWlG9ZAZ2JhNs'
+        'bF3rRsMwxuDw8m1NWJvEHyKCj69fgYdr9UShWB4fxDAfxdzgPK5xSwJYvGDjveA/3/4JPrrxYZsKlw6/tLqKJ44/CVcKqvFUy+gfXP4QF9/7Mf'
+        'I8CzMX8wR5nuGZJ5/FMB8FwdVrf8TmxjbOn78Ax05WuCxx/JHjuHt1Cb7KCnehRfchgB/gB4BSObPG32GFqhAf3FZm80YAIJABxtjZiC5mhVXC'
+        'ukFms3phR43C2qwVOFYqrKpQrzDGIjNoaDdDW21P07XFBlfiQpJqx/ZaC0FPYUOxcHMxZzcmaJgpVY3n3SgIq57UKXYV7cWEdOkr3RVWbxzTTi'
+        'xBLk7mQJ33XmYE0Mz4SU/QtejW3ExwB/lTldPZgGrulaYxBeeyD2rHvS2KNVIKrQBg1ABQ5c7NmzfLvlhAVZVhIyE3SAMoVXsaYl8KvAckdGaB'
+        'hbPr+GD7lc7fYtPv7RO055zcZmUyAaev3X///ZPeYGh9PWqDmksGFuJVg2rOkToBSwv42W2wJkJLusGj+sgaCyPxOyHgCXUE1SYeoB3Ckgx1er'
+        'a+g7dh9+oc153ogsIA3vn3Saquqa12jdYgePTouag19nUoT3knEKeQXEMczna21ljgwQcfwv3Tz7foJwEMRgOIl9aaQuAqgmOrR7GystJdTUee'
+        'Z4EK19kA1jmR0XiIxx/9YmSXyewZYjQewnvX4SPNLmpW7kQB7/U1AMCpppZaAOfOnRQAGB848PLmjZsvDPKxdVOPPFOIafYKVGZgDbG0NGryhD'
+        'Uva0AxDfUYd3wNRgWGBwadJbYOFWYaziry3KI4vNSbuBLpAwS28xUKc/2q87Dun6p4bMYEzp6lrK2t2We/8uhbovqPw+wAp9vOlVOBlBIWIAQt'
+        'hqUKqNfI/BQqAvEClSgKTY7Ui8SyWn/TuNWZI2aYQtl4VG16rfcop0eVmTI0UKEbDWG2tiYv337nwR/FjZLSmxA5deGUqioPrBz85s3Nmzf9hH'
+        'ayWUq5o/BTRdhrx7hLm61N0U2H4yZpYdI51Juswzlus1eTPCda3qf1bX8b/Ueom2ogjmIU5ucfTba883+sOpvVaQmAZynr6+vmma/c944hfpdi'
+        'WW7C7GyUbrop8DsKPwFkSogjpAyHOtM+yvAbgXAfzyXjdTx8574+0rrYrjPWIaWJ7bI+V2URy/upOp3CuImYjRs7v3fP8ZW319fRmv25vkzX1P'
+        'I0/Wtr7/1m7sd/Ox4uL011G8Uoc1lhaTNDE0GB3G0Huc53mXG/bv8aROLmujut2FOuYRUqonY8tNzcmW5t++3ff+Tkoe+pquVefjJT/a2tqT19'
+        'mv717/338UxH34bHcytLK4ZZ1BvTv+72afygcLflrbg5NPxmi8CNzYkik3+eYudbj//qbW/MG/yu/a2EAABvrP/8cdkeflW9/DJg7gFkhbQ5RE'
+        '2cIe7t9wT9k6h725hQl6MyqISlADo15HVaXKLl6zDuXx47vfTDVJv31qu+Bs+oeT56idbz81pcfie40SvX8Jn8kvTooSCPOz8Px8c4Td+dif3m'
+        '2U/ww8muIM4B5spx6OkFEv0s/9bW1B49Cp48CeEuvxj9xCbb51I+yz9+2j+e/r/69z+8tV5cGCixqgAAAABJRU5ErkJggg=='
+    ),
+    'bookings': (
+        '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'
+    ),
+    'checkedin': (
+        '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'
+    ),
+    'checkedout': (
+        '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'
+        '0esZf3ktAkhISBAxxiCiwL52Ng7tVer6XD3DKwcAsOho9tzAJFreUJdsvXFJckF+4S8kaDsaG7eIZowhJSVV9F8jgMaEhunrGc5q09qctLS1v4'
+        '2OlqmaBipfNBgpIxJUirqvCu89pPpa1YysrDXaDSj4LxBAU8obGzsxzNLCtqtSWV+gW8fvaMzKXniI6OhoHgT2qPrOgTu37+SCF7WvrfXowxjD'
+        '6/Ttr4x+S3l1jWZaW9iSjrb299GTo2uk0tSXrshIJVKRXC5X1dUqvi1+WEqKOvWsptzkXy2AxsxNmDhxYiezVhZvqVSqJ7w229hgwF5+tFUmk/'
+        'EgML6qYkfejbxCXs0Cz5w50+MZBZN/HQI4IiLG60U7t/XQ1tLh1owePbhUIpGK/ionf1bMJZVIRavkq2pqqutW1JVrRA8KHo9osC9m7F8rgKY7'
+        'rqrCprt596R6JqbLiF7u7j8LBUTE6otFq3+9eFVy88rd1Y354b9mSPoN/ZUt+Lszws8KqSUSyWv5N5w39Ibe0Bt6Q//f6X8ACBOCo9nR+dYAAA'
+        'AASUVORK5CYII='
+    ),
+    'arrivals': (
+        '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'
+        '9v//4HfNdOE4Y0gHcAAAAASUVORK5CYII='
+    ),
+    'departures': (
+        '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'
+    ),
+    'cleaning': (
+        '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'
+        '//BJmsiZAAAAAElFTkSuQmCC'
+    ),
+    'rooms': (
+        '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'
+    ),
+    'cashier': (
+        'iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAANy0lEQVR42u2aa4wk11XHf+feqn7Na99e2+tlZQzya4MdO7YjLBRLMWAESBCPFY'
+        'xElCCQkBJZKEYCCWk0CAERCCUQAl8wIQpxtItIgEBkSMzLlkMCwSbxOo81tvHusvGOvTM729Ovuufwoaq7qrqrZ3uN8ae5q9b2TE/Xvfd//uec'
+        '/zn3ws7YGTtjZ+yMnbEzdsbO2Bk7Y2fsjDd3GMjl/P5NHcu27JftmMeQN/w16wbfgLmW7ZhftmV/ebtfWXH//xAL4LZ5vcEkMKt8YFSJuqzqLS'
+        'd/6Ud8wz1oatcy0BgRm0LXyyK9iNC/0OfRzr/ENy92JKhQNE/A4Ul4QRbt/vrdg+A8Drs8QDTFULwk4uQF6+ujXxX5XLq38pLLANiKQ1b11uc/'
+        '+OFoV/0hzLCgSDOunt9eBwDO4XoJDU2gleATVyKFR8ESmk7xczVEfD61TEFfqgwOqIJzb3ctefCWkw9/9Gn5nQ8M9zgBwLIt++OyGm797w++O1'
+        '5qPTR4dSvBgZlIaPexYKO5xu1hs9MQcUJvbYutOAh1CInhpcgA8GK0NaG7ccGCeFwpPEphh9mKxArGSD8XB36+hjgxS5R4//z7b/n2L37laVn9'
+        'xLId88flgVDpAjbgPdpL1ATYClHvxHn6a1vphDI7/20KAKhx8fQ6es8AIkFCGU0xA++gnbD1lTOo89me5bLSi6liNZi/7SDR3lainb4a/AzwiR'
+        't51iYYcJxjmtl3SYM6DAsnL5Jc6FE/uhdfjzCz/1sg0gzE001c7X9Ak8mNiUAISCOieftB1KUMsNcxV//EeTafOsXSD14rUvPOYBFglVWbHgQF'
+        'xQEDZbC2hez1NK5dRLtJTr/LsETJb8wQL9RCggS3/a4iR3SggcpsQdDGf4gFb47BU1skG12iXQ2qLDjpAqqCGQZoUASPDhQbhAwAeX3x3zIXDo'
+        'J2EyzaTu4ImGGDgEka1EtAzgR89seRYKaYGVbx5QoALFuslVc+em6qZIbPKhpZEHTaCmXsmTNuxCDLwLJt1L+8YLSdDoAUqcIGS+u1EhyZbhUC'
+        'ykACdeLCzDKWKw0zwYJOmXkSNPEg4jAM0yyOXMojrLxxs5T9pjYbACkENmYKqwRVgEQCTYs54vfyor2K6HiqstGiBMVUS8+bNkIvYTAYIJrGDt'
+        '+IcI0YEUEHyZAeOdg2vkLLP58y36QLmKWxorD4af4zXIBe6PAr8b38+JX38CH7G/7kwj8xr3V06L1WZpapbh8svGDthM1/O03SNyQYqoZF4BZr'
+        'NK5ZpHl4CYkd1g8FECi5mFi+d6MyBlYxoGyd9O0kgkNZEDDa585z1b55IjyHoj1ckC6LNAjF72S+ZEIlFSeQVahbRFRzOAMNRhgkDM72uPjSab'
+        'Z2vcLC7VdSP7SI9cKkQivFi8yoTALvKt3HimhZhqCN2GFmiBkDAmHQ5yf23Mnepf1sapvrwxW8o3Y9G9IZsXLIIMuEkAVN/dmmvwRwkcNFHldL'
+        'qR/PNWjsmqO1ewHXNtYf+y/aX38Fai4N3gUGD/+RrX2abo+qo+a4tTUlgAzVGiQo9S3lN1vv4oeP3EUAOv0Ot8dH+FTrF/ho7Qv8/uZjtEIte6'
+        'SNwEQtD2ZaEdA0N5aIICI4BPOGd4I4oe5TcC4+eRpXczSu24P2AzIeeCVPZDpLDFBS6w4ZMPL9AiMET7u9yfuTe7jv0PezFl/k4+f+nqdPf4O7'
+        'wnfxwHX38tDSD3Fi7gx/t/EMi9RTd7BCDDBAZdIqVqxeh8lVMpDSn51Pt0mrjiVK+0tniA/MIa04zTAZCFLKPlaZE12VhCwFPWOCUgNLWDxv3N'
+        '26Aa1H/GHyRT6UfJ6n9p9ltfNZvvjCk4jF/Gj9VtRpOQgN05Ey/ZUFsJHskjTYjtgggniPjyPi+QZ0jc5za0gkJTctZoORC14SgKIZpJRI08Wb'
+        'Yaq4XsBZWl6f1Q1MhKarU79iF/+w/jU2z69xNpxPC7Wi9bPvj+hfsfnR+2m5fgiGd/jYE7XqJKc20V5CrtJyI+bCbhYlaAEzn7uAGTaWDSJxvB'
+        'b3+fezJ7j5mu/jA/6ddJsdXux+h8ac568PvsCzr/0Gm4nRCDHBwii2iA4ZUIgDVTHIikaQMUU5/LWk/YV6TLLVRtsDZKEGiZXVm9nUQi6aSUNm'
+        'IdvyeoH6/kU+9vwXuOEbR7jjujv544WfZ2N+i3Vt8497v8nvbv0t7W6HBlFBDwwzgeYRXyuaC1M1v0xUWOIE532K2SBkDR+t7p7oTEKoIIYm/C'
+        'edNAD1qMapIz1++swf8L6tZ3n7vqPsiuY51DrAexbewdHFa3if/hGdXg9nUnCDIgMulQWE8WaQDRsgDPsgWQPEO4glfXa2Bzcm7sx09ixQrmIt'
+        '1/+WNta6DHhL8zBzN7b4yPoTPNL+V6Sr3LC2xK9d/17eevgWfmrhbj7S+xy7mSNkFdkowxR9vqposUm/H1J//CNNAjIfIa0IU62wveVa4NJZQH'
+        'PRU1ZGI78MKPW1Hr/t38WfH/xl7jhwI4OlmOaVu3l890t8/tQTmBpH48N459FhVhlaImgek4pAFF86a1lnaG9AdPUcRC7PYjY0Vr5+mwUAGwUg'
+        'G4kKK7jBkGKDjQ5bF9uYGvfWj7LJFq/01zkQL3DzFd+LiHCBDokm+caxvBDaLg1qtSAbEwqYQNIZYE0h+p6ltH9AAezCNxRDZ1WCZjoSEbnx8w'
+        'aGV+H8Ehx/8XHeevVbeG/zHg7t3sW3t05zZ+sIdy3dTBL1+cz6U0TB5eW15gwYWdmm73OyEV9gpYD2A4Nul9ptu6Hpsb6OulZWdJ2RMtTZsoBN'
+        'lLLlAimYsrBriU9ffIbdX36En73pJ/mxxdtwu98GIrwaNvit9b/kiY3nmLdGlgbz0szMpmcBqnSAgeUNfREYdBJ6vS7RLUv4q1tpQeQkK+aGy3'
+        'UFIVfdqnHTyuFC2CvJCsuoB1A/tIffW3iSd395ha+d+xbdCB5Pvs59536dT68/yZzWCcMUOmTSeAbYzgXGWaCGDgLdbp/+vBLfsYQ/3EL7mml+'
+        'K4erYpvAZi6HbUQ1KYEy5pNZL35x/x6+uXmWQa9DqzbPmWSDk7rGVbaLviWj71OSwjoZ/MZbgiIk856QpK1yFUO9oU1we+rEe2IQwXo6NDRTHK'
+        'YghGyWNKg4y1NhGc7xktuwJOAaNf7q1BPUl5Z4InqWOa0xsCRHfJRJdFIHhAIPi+uLjOQ6j+JTFjhBYiGKJMU+WN6UsEudWGX81ZmDIKUN6+iX'
+        'UlKEKSuV2v4FHun8B59c+0+ShqdhMcGK+dgKaU9zmTpkQJhQOyM3I0pLYssOTWxgpdJ8QiFmHeEJN7bqKBAxprUsO1cu6ugyhcYgzxbSWphDDe'
+        'qaBpyJ1kKpmLLqosfKcjjtQ7j0q+MbtqEbymR0LwbZYmd7pjSoqY8OO9F5cDGkQpAMfwpJYGIpNrYg1ez5Vq78qo7cXH6UNvx8oi1rVSekhQpQ'
+        'bCywh+0ASHc8fKaK4kUInQScIXEKttn0+mTb8/MhMolhruD/0wAw0AgsylxQZIJ11QIp+88ZJJnhHbNUg0P7KmJGcIH4QEx8MiL56iauGW1fo9'
+        's2x9eZ8rOgaHdAONWHuW0YIEDHkG91MB8hLrtYst1JEuXT4ogIWYdkF7iFCEv0UidD6Q7iC0oyZ1iidA9CHM8TrSVYZxtNXjwDGY/KlqchGxjW'
+        'NmhrOedXACABfMcj3uNc4UhuhlOhtIUmbO0dwFWNUWM06kcTSWMiBrh/vojdvxsiQQeB3j5gb/FYSmY6GpfiCZNJ6ssB2KrhBhHmUhcwLQe4kQ'
+        'vWoH+9Q2M32tDlHYsZOI8oWNqWov5ifRsGSFb6PNeh/xcB/85F3LzPVzTjwWTRE8Sk5AIEIAGLDO8AD37MdXz2EO9Bamnud8XeqWzjclRkCg/a'
+        'M/xJj3slmgAxmlh8UwjPtOmdbONvmMPtjaeiX3V1xapOjy0vtekH9BScN+GiGN0kk/CZjyvQwPGaGf3vdNAowokUWCLD1sD2QXH4zC7YaxEudk'
+        'hjlo6QgtQdtjGg/6WLUPPpjY0i/fP1TiIhUxYmeT7WdTijTfa1hfawhnEySqPNSHi5K/RebmNRnANQ7A/KlDlKl9Ac0oiJ5j20mFEJFi4YSOyg'
+        '5sC5ygkEKoGpfF848Ql1SRfn0mMvl7W9keyCnKSHH9JwaZNjFAKmbF4qLA/gBWlI6ldTXCaaRp5SlGYGtC/1fiRx004u4koqTzKfTbNIdiBiUt'
+        'AdwsQtrXE/kKpbKYXP3ORdwbwcXl52WU9wXUR0/D7d9E3KbEBkNEeEUQQcXYr0KRjD98PfZ6yYiEFVFt8GeBMz8aIK6wawsiJTGdBPwsfF+/sQ'
+        'NIvZMi38V9w7nOHGQ0pNQzBzTAqxrJgZ+cM2OVcKh5XTjZPyyXvX7yV/CsBNJyoAOH48sLLiXl5dPbbv/rvf5mq1hzVyEHnwUom6TLP6JYKiNK'
+        'HRCLRqDpRM6IC4FPWmh4YIrlbD3Ng8JYvnLfLKG8jeIc0Y16wz2Gh/+KWHP/lnrKw4HlgNl0ogtmf5B+7VyD8osf9udRJX/aVMo7+bGlnS9JwY'
+        'H9s34GhL6AxlvuRgNSLhZN/4uXN1gquofIvAusn5JT1bFYl8Iq34eeeiR8/96rHHZqfsCm/CZek3eUy5AD5dSy1nV8xvPG6sYm/0emyGG1wy67'
+        'W4aTtbQbhpOd3jA8cDO2NnTIz/BSAfk1vC/SlOAAAAAElFTkSuQmCC'
+    ),
+    'restaurant': (
+        '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'
+        'RU5ErkJggg=='
+    ),
+    'gazebo': (
+        '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'
+    ),
+    'sauna': (
+        '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'
+        'AAAAAElFTkSuQmCC'
+    ),
+    'reports': (
+        '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'
+        'BJRU5ErkJggg=='
+    ),
+    'visitors': (
+        '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'
+    ),
+    'guestdb': (
+        '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'
+    ),
+    'settings': (
+        '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'
+    ),
+}
+
+
 class NavButton(tk.Frame):
     """Кастомна кнопка лівого меню: іконка окремим (більшим) шрифтом від
     назви пункту. Звичайний CTkButton малює весь текст ОДНИМ шрифтом,
     тож збільшити лише емодзі-іконку, не зачепивши розмір назви, іншим
     способом не вийде. Підтримує .configure(fg_color=, text_color=),
     щоб не переписувати код, який керує підсвіткою активного пункту."""
-    def __init__(self, parent, icon, name, icon_color, command, bg_color, hover_color):
+    def __init__(self, parent, icon, name, icon_color, command, bg_color, hover_color, icon_img=None):
         super().__init__(parent, bg=bg_color, cursor='hand2')
+        self._icon_img = icon_img   # тримаємо посилання, щоб картинку не прибрав збирач сміття
         self._fg_color = 'transparent'
         self._bg_normal = bg_color
         self._hover_color = hover_color
         self._command = command
-        self.icon_lbl = tk.Label(self, text=icon, font=('Segoe UI Emoji', 16),
-                                  bg=bg_color, fg=icon_color)
-        self.icon_lbl.pack(side='left', padx=(12, 6), pady=6)
+        if icon_img is not None:
+            self.icon_lbl = tk.Label(self, image=icon_img, bg=bg_color, bd=0)
+            self.icon_lbl.pack(side='left', padx=(10, 6), pady=3)
+        else:
+            self.icon_lbl = tk.Label(self, text=icon, font=('Segoe UI Emoji', 16),
+                                      bg=bg_color, fg=icon_color)
+            self.icon_lbl.pack(side='left', padx=(12, 6), pady=6)
         self.text_lbl = tk.Label(self, text=name, font=('Segoe UI', 12, 'bold'),
                                   bg=bg_color, fg=icon_color, anchor='w')
         self.text_lbl.pack(side='left', fill='both', expand=True, pady=6)
@@ -7682,7 +9056,8 @@ class NavButton(tk.Frame):
             self._fg_color = fg
             self._set_bg(self._bg_normal if fg == 'transparent' else fg)
         if tc is not None:
-            self.icon_lbl.configure(fg=tc)
+            if self._icon_img is None:
+                self.icon_lbl.configure(fg=tc)
             self.text_lbl.configure(fg=tc)
         if kw:
             super().configure(**kw)
@@ -8617,9 +9992,39 @@ class HotelApp(ctk.CTk):
         # Верхня частина (логотип + юзер + кнопка виходу) — фіксована
         sb_top = tk.Frame(sb, bg=C['card'])
         sb_top.pack(fill='x', side='top')
-        ctk.CTkLabel(sb_top, text="🏨", font=('Segoe UI',40)).pack(pady=(20,0))
-        self._sb_hotel_lbl = lbl(sb_top, _HOTEL_INFO.get('name','Готель\nКоролівська Бочка').replace(' ','\n',1), 13, True, C['accent'])
+        # 3D-іконка готелю (кольорова, з вбудованого PNG); запасний варіант — звичайний емодзі
+        try:
+            import base64 as _b64_ic, io as _io_ic
+            from PIL import Image as _PILImg_ic
+            _ic_img = _PILImg_ic.open(_io_ic.BytesIO(_b64_ic.b64decode(_HOTEL_ICON_3D_B64))).convert('RGBA')
+            self._sb_icon_img = ctk.CTkImage(light_image=_ic_img, dark_image=_ic_img, size=(64, 64))
+            ctk.CTkLabel(sb_top, text="", image=self._sb_icon_img).pack(pady=(16,0))
+        except Exception:
+            ctk.CTkLabel(sb_top, text="🏨", font=('Segoe UI',40)).pack(pady=(20,0))
+        self._sb_hotel_lbl = lbl(sb_top, _HOTEL_INFO.get('name','Готель\nКоролівська Бочка').replace(' ','\n',1), 11, True, C['accent'])
         self._sb_hotel_lbl.pack()
+
+        # 🕒 Годинник із секундами під назвою готелю
+        self._sb_clock = ctk.CTkLabel(sb_top, text="", font=('Segoe UI', 20, 'bold'),
+                                      text_color=C['text'])
+        self._sb_clock.pack(pady=(4,0))
+        self._sb_date = ctk.CTkLabel(sb_top, text="", font=('Segoe UI', 10),
+                                     text_color=C['text2'])
+        self._sb_date.pack(pady=(0,0))
+        def _sb_clock_tick():
+            try:
+                if not self.winfo_exists() or not self._sb_clock.winfo_exists():
+                    return
+                import datetime as _dt_clk
+                _now = _dt_clk.datetime.now()
+                self._sb_clock.configure(text=_now.strftime('%H:%M:%S'))
+                self._sb_date.configure(text=_now.strftime('%d.%m.%Y'))
+                # наступний тік рівно на початку наступної секунди (без накопичення зсуву)
+                self.after(max(50, 1000 - _now.microsecond // 1000), _sb_clock_tick)
+            except Exception:
+                pass
+        _sb_clock_tick()
+
         lbl(sb_top,f"👤 {self.user['full_name']}",11,color=C['text2']).pack(pady=(3,3))
 
         # ── Статус БД — бейдж-хмарка ─────────────────────
@@ -8719,14 +10124,27 @@ class HotelApp(ctk.CTk):
             try: _b.destroy()
             except Exception: pass
         self.nav = {}
+        if not hasattr(self, '_nav_img_cache'):
+            self._nav_img_cache = {}
         for icon, name, key in _NAV_ITEMS:
             if not _sidebar_visible(key):
                 continue
             _color = _NAV_ICON_COLORS.get(key, C['text'])
+            _img = self._nav_img_cache.get(key)
+            if _img is None and key in _NAV_ICONS_3D_B64:
+                try:
+                    import base64 as _b64_n, io as _io_n
+                    from PIL import Image as _PI_n, ImageTk as _PT_n
+                    _pil = _PI_n.open(_io_n.BytesIO(_b64_n.b64decode(_NAV_ICONS_3D_B64[key]))).convert('RGBA')
+                    _pil = _pil.resize((30, 30), _PI_n.LANCZOS)
+                    _img = _PT_n.PhotoImage(_pil)
+                    self._nav_img_cache[key] = _img
+                except Exception:
+                    _img = None   # запасний варіант — звичайний емодзі
             b = NavButton(
                 self._sb_nav, icon, name, _color,
                 command=lambda k=key: self._show(k),
-                bg_color=C['card'], hover_color=C['card2'])
+                bg_color=C['card'], hover_color=C['card2'], icon_img=_img)
             b.pack(fill='x', padx=10, pady=2)
             self.nav[key] = b
 
@@ -9418,10 +10836,10 @@ class DashboardFrame(tk.Frame):
                         except Exception: pass
                     self.after(500, _set_type)
             except Exception: pass
-        btn(self._hdr, "📋 X-звіт",       lambda: _open_x_or_z('X-звіт'), C['card2'], 110).pack(side='right', padx=(0,4))
-        btn(self._hdr, "🔒 Закрити зміну", lambda: _open_x_or_z('Z-звіт'), C['red'],   140).pack(side='right', padx=(0,4))
-        btn(self._hdr, "🧾 Рахунок", lambda: _open_invoice_dlg(self), C['accent'], 130).pack(side='right', padx=(0,4))
-        btn(self._hdr, "📜 Історія рахунків", lambda: _open_invoices_history_dlg(self), C['card2'], 170).pack(side='right', padx=(0,4))
+        btn_fit(self._hdr, "📋 X-звіт",  lambda: _open_x_or_z('X-звіт'), C['card2']).pack(side='right', padx=(0,4))
+        btn_fit(self._hdr, "🔒 Z звіт",  lambda: _open_x_or_z('Z-звіт'), C['red']).pack(side='right', padx=(0,4))
+        btn_fit(self._hdr, "🧾 Рахунок", lambda: _open_invoice_dlg(self), C['accent']).pack(side='right', padx=(0,4))
+        btn_fit(self._hdr, "📜 Історія", lambda: _open_invoices_history_dlg(self), C['card2']).pack(side='right', padx=(0,4))
 
         # ── Банер "Готівка в касі / Залоги в касі" (як у Касі) ──
         # Контейнер тримає місце смуги в розкладці: при «Сховати/Показати» смуга
@@ -9769,6 +11187,126 @@ class DashboardFrame(tk.Frame):
 
         btn(row, "✕", _dismiss, C['card2'], 34, height=32).pack(side='right')
 
+    def _tile_click(self, r):
+        """Клік по плитці номера на дашборді: заселити, виселити, продовжити,
+        забронювати — ті самі діалоги, що й у шахматці."""
+        import datetime as _dt_tc
+        from app.utils.db import query as _q_tc
+        from app.modules.logic import get_booking as _gb_tc, update_booking_status as _ubs_tc
+        try:
+            rid = int(r.get('id'))
+        except Exception:
+            return
+        room = _get_room_by_id(rid) or dict(r)
+        st = str(r.get('status') or room.get('status') or 'free')
+        number = r.get('number', room.get('number', ''))
+        _cn = (room.get('cat_name') or r.get('cat_name') or '').lower()
+        _cd = (room.get('cat_description') or room.get('description') or '').lower()
+        is_sauna = any(k in _cn for k in ['баня', 'бані', 'sauna']) or '[tariff:hour]' in _cd
+        today = _dt_tc.date.today()
+        refresh = self._load_data_async
+
+        if st in ('repair', 'blocked'):
+            messagebox.showinfo("Номер недоступний",
+                                f"№{number}: {STATUS_UA.get(st, st)}.\nЗмінити статус можна в шахматці.")
+            return
+
+        # Активне (заселене) та найближче заброньоване бронювання цього номера
+        active_bid = upcoming_bid = None
+        try:
+            _row = _q_tc("SELECT id FROM bookings WHERE room_id=%s AND status='checkedin' "
+                         "ORDER BY check_in DESC LIMIT 1", (rid,), fetch='one')
+            if _row: active_bid = int(dict(_row)['id'])
+            if active_bid is None:
+                _row = _q_tc("SELECT id FROM bookings WHERE room_id=%s AND status='confirmed' "
+                             "AND check_out >= CURRENT_DATE ORDER BY check_in LIMIT 1", (rid,), fetch='one')
+                if _row: upcoming_bid = int(dict(_row)['id'])
+        except Exception as _e:
+            log_error("dashboard tile click: пошук бронювання", _e)
+
+        win = dlg_win(self, f"Номер №{number}", "400x460")
+        scroll = ctk.CTkScrollableFrame(win, fg_color=C['bg'])
+        scroll.pack(fill='both', expand=True, padx=10, pady=10)
+        f = card(scroll); f.pack(fill='x', pady=5)
+        lbl(f, f"🛏 №{number} — {room.get('cat_name', r.get('cat_name', ''))}", 14, True, C['accent']).pack(pady=(12, 3))
+        _bk = None
+        _bid_hdr = active_bid or upcoming_bid
+        if _bid_hdr:
+            try:
+                _bk = _gb_tc(_bid_hdr)
+            except Exception:
+                _bk = None
+        if _bk:
+            lbl(f, f"👤 {_bk.get('guest_name', '')}", 13, True).pack(pady=(0, 2))
+            lbl(f, f"📅 {_bk.get('check_in')} → {_bk.get('check_out')}", 11, color=C['text2']).pack(pady=(0, 4))
+        lbl(f, f"● {STATUS_UA.get(st, st)}", 12,
+            color=STATUS_COLOR.get(st, C['gray'])).pack(pady=(0, 12))
+
+        actions = []
+        def _close_then(fn):
+            def _go():
+                win.destroy()
+                fn()
+            return _go
+
+        if active_bid is not None:
+            def _extend():
+                if is_sauna:
+                    _open_extend_sauna_dlg(self, active_bid, room, refresh)
+                else:
+                    _open_extend_room_dlg(self, active_bid, refresh)
+            actions += [
+                ("🚪 Виселити", _close_then(lambda: _open_checkout_dlg(self, active_bid, refresh)), C['yellow']),
+                ("📅 Продовжити", _close_then(_extend), C['green']),
+                ("🔁 Переселити", _close_then(lambda: _open_relocate_dlg(self, active_bid, refresh, self.user)), '#16a085'),
+                ("📋 Відкрити деталі", _close_then(lambda: BookingDetailDlg(self, active_bid, refresh)), C['accent']),
+            ]
+        else:
+            if upcoming_bid is not None:
+                def _checkin_from_booking():
+                    if is_sauna:
+                        _open_sauna_checkin_from_booking(self, upcoming_bid, room, refresh)
+                    else:
+                        _b = _gb_tc(upcoming_bid)
+                        if not _b:
+                            messagebox.showerror("", "Бронювання не знайдено"); return
+                        _b = dict(_b); _b['cat_name'] = room.get('cat_name', '')
+                        _open_checkin_existing(self, _b, room, refresh)
+                def _cancel_booking():
+                    if not messagebox.askyesno("Скасувати бронь?", f"Скасувати бронювання #{upcoming_bid}?"):
+                        return
+                    try:
+                        _ubs_tc(upcoming_bid, 'cancelled')
+                    except Exception as _e:
+                        messagebox.showerror("Помилка", str(_e)); return
+                    refresh()
+                actions += [
+                    ("✅ Заселити з броні", _close_then(_checkin_from_booking), C['green']),
+                    ("📋 Деталі броні", _close_then(lambda: BookingDetailDlg(self, upcoming_bid, refresh)), C['accent']),
+                    ("❌ Скасувати бронь", _close_then(_cancel_booking), C['red']),
+                ]
+            def _new_booking():
+                if is_sauna:
+                    _open_sauna_booking_dlg(self, room, refresh)
+                else:
+                    _open_booking_dlg(self, room, today, refresh)
+            def _new_checkin():
+                if st == 'cleaning' and not messagebox.askyesno(
+                        "Прибирання", f"Номер №{number} зараз на прибиранні. Заселити все одно?"):
+                    return
+                if is_sauna:
+                    _open_sauna_checkin_dlg(self, room, refresh)
+                else:
+                    _open_checkin_dlg(self, room, today, refresh)
+            actions += [
+                ("📋 Забронювати", _close_then(_new_booking), C['accent']),
+                ("✅ Одразу заселити", _close_then(_new_checkin), C['green']),
+            ]
+        actions.append(("✖ Закрити", win.destroy, C['card2']))
+        for txt, cmd, color in actions:
+            rr = ctk.CTkFrame(scroll, fg_color='transparent'); rr.pack(fill='x', pady=3)
+            btn(rr, txt, cmd, color, 340, height=40).pack(fill='x', padx=10)
+
     def _load_data_async(self):
         """Запускає завантаження даних у фоновому потоці."""
         import threading, time as _time_ld
@@ -9861,10 +11399,10 @@ class DashboardFrame(tk.Frame):
                     checkedin_room_ids = {int(r['room_id']) for r in _sq_ci}
                     try:
                         _sq_bk = _sqlite_select(
-                            "SELECT room_id, status, check_in, check_out FROM bookings "
+                            "SELECT room_id, status, check_in, check_out, notes FROM bookings "
                             "WHERE status='checkedin' OR (status='confirmed' AND check_out >= ?) "
                             "ORDER BY check_in", (str(today),))
-                        _bk_rows = [(int(x['room_id']), x['status'], x['check_in'], x['check_out'], None) for x in _sq_bk]
+                        _bk_rows = [(int(x['room_id']), x['status'], x['check_in'], x['check_out'], x['notes']) for x in _sq_bk]
                     except Exception:
                         _bk_rows = []
                 for r in rooms:
@@ -9893,9 +11431,21 @@ class DashboardFrame(tk.Frame):
                     _b = _by_room_bk.get(int(r.get('id')))
                     if _b and r.get('status') in ('checkedin', 'confirmed', 'occupied'):
                         _sd, _fd = _tile_dates_info(_b[2], _b[3], _b[4])
-                        _lbl_st = 'Проживає' if _b[1] == 'checkedin' else 'Заброньовано'
+                        _is_bath_bk = 'баня:' in str(_b[4] or '').lower()
+                        if _b[1] == 'checkedin':
+                            _lbl_st = 'Відвідує (погодинно)' if _is_bath_bk else 'Проживає'
+                        else:
+                            _lbl_st = 'Заброньовано'
                         r['tile_dates'] = _sd
                         r['tile_tip'] = f"{_lbl_st}\n{_fd}" if _fd else ''
+                        if _is_bath_bk:
+                            # Час оренди бані — з нотатки «Баня: 2.00 год (13:00–15:00)»
+                            import re as _re_bt
+                            _mt = _re_bt.search(r'(\d{1,2}:\d{2})\s*[–—-]\s*(\d{1,2}:\d{2})', str(_b[4] or ''))
+                            if _mt:
+                                _t_from, _t_to = _mt.group(1), _mt.group(2)
+                                r['tile_dates'] = f"{_t_from}–{_t_to}"
+                                r['tile_tip'] = (f"{_lbl_st}\n{_fd}\n" if _fd else f"{_lbl_st}\n") + f"Час: {_t_from}–{_t_to}\nДо: {_t_to}"
                     else:
                         r['tile_dates'] = ''; r['tile_tip'] = ''
             except Exception as _sync_err:
@@ -10285,7 +11835,10 @@ class DashboardFrame(tk.Frame):
         try: self._sched_stat_fit()
         except Exception: pass
 
-        _need_rebuild = self._first_render or (len(rooms) != len(self._tile_refs))
+        _rooms_sig = tuple((int(r.get('id', 0)), str(r.get('number', ''))) for r in rooms)
+        _need_rebuild = (self._first_render or (len(rooms) != len(self._tile_refs))
+                         or getattr(self, '_rooms_sig', None) != _rooms_sig)
+        self._rooms_sig = _rooms_sig   # змінилась назва/номер номера → плитки перебудовуються
         if _need_rebuild:
             # ── Перший раз (або кількість кімнат змінилась/раніше прийшла
             # порожньою через гонку зі стартовою синхронізацією) — (пере)будуємо сітку ──
@@ -10362,6 +11915,14 @@ class DashboardFrame(tk.Frame):
                 _tile_dt_place(dt_l)
                 _dash_tip_bind(dt_l, lambda c=cell: getattr(c, '_tip_text', ''))
                 self._tile_order.append(rid)
+                # ── Клік по плитці → меню дій (заселити / виселити / продовжити / забронювати) ──
+                cell._room = r
+                for _w in (cell, num_l, st_l, dt_l):
+                    try:
+                        _w.bind('<Button-1>', lambda e, _c=cell: self._tile_click(getattr(_c, '_room', None) or {}))
+                        _w.configure(cursor='hand2')
+                    except Exception:
+                        pass
                 # ── Бейдж прострочення прямо на плитці ──
                 _ov_info = _overdue_by_room.get(str(r.get('number','')))
                 # Не показуємо бейдж якщо кімната вже вільна або прибирається —
@@ -10573,8 +12134,9 @@ class DashboardFrame(tk.Frame):
                     cell, num_l, st_l = self._tile_refs[rid]
                     new_color = STATUS_COLOR.get(r['status'], C['gray'])
                     try:
+                        cell._room = r
                         cell.configure(bg=new_color)
-                        num_l.configure(bg=new_color)
+                        num_l.configure(bg=new_color, text=f"№{r['number']}")
                         st_l.configure(bg=new_color,
                                        text=('' if r.get('tile_dates') else STATUS_UA.get(r['status'],'')))
                         _dtl2 = getattr(cell, '_dt_lbl', None)
@@ -12568,10 +14130,10 @@ def _open_checkout_dlg(parent, bid, on_close=None):
           COALESCE(SUM(CASE WHEN amount>0 AND (note IS NULL OR (
             note NOT LIKE 'Залог%%' AND note NOT LIKE 'deposit%%'
             AND note NOT LIKE 'Повернення залогу%%'
-            AND note NOT LIKE 'Послуга%%' AND note NOT LIKE 'Додаткові послуги при заселенні%%'
+            AND note NOT LIKE 'Послуга%%' AND note NOT LIKE 'Додаткові послуги%%'
           )) THEN amount END), 0) AS paid_no_dep,
           COALESCE(SUM(CASE WHEN amount>0 AND (note LIKE 'Послуга%%'
-            OR note LIKE 'Додаткові послуги при заселенні%%')
+            OR note LIKE 'Додаткові послуги%%')
             THEN amount END), 0) AS svc_paid,
           COALESCE(SUM(CASE WHEN amount>0 AND note LIKE 'Залог%%'
             THEN amount END), 0) AS dep_in,
@@ -12614,7 +14176,10 @@ def _open_checkout_dlg(parent, bid, on_close=None):
     actual_nights_real = max((today - checkin_date).days, 0)
     overdue_days = max((today - checkout_plan).days, 0)
     actual_nights = actual_nights_real
-    actual_units = booked_units if is_hourly_booking else actual_nights
+    _bath_over_h = 0.0
+    if is_hourly_booking:
+        _bath_over_h = _bath_overdue_hours(b)[1]
+    actual_units = (booked_units + _bath_over_h) if is_hourly_booking else actual_nights
     early = (not is_hourly_booking) and actual_nights < booked_nights
 
     def _extra_cost(k):
@@ -12646,6 +14211,13 @@ def _open_checkout_dlg(parent, bid, on_close=None):
     except Exception as _e_sv:
         log_error("checkout_services", _e_sv); svc_rows = []
     svc_total = sum(x['total'] for x in svc_rows)
+    # Послугу часто оплачують ОДНИМ платежем разом з орендою («Оплата при заселенні»
+    # = оренда + послуги). Тоді окремого платежу «Послуга…» немає, і вона
+    # помилково виглядала боргом. Надлишок понад вартість проживання
+    # зараховуємо на послуги (так само, як у calc_stay_financials).
+    _lodging_basis = max(living_total, price * booked_units)
+    _surplus_for_svc = max(living_income - _lodging_basis, 0.0)
+    svc_paid = svc_paid + min(_surplus_for_svc, max(svc_total - svc_paid, 0.0))
     svc_debt  = max(svc_total - svc_paid, 0.0)
     svc_unpaid_items = _svc_unpaid_items(bid, svc_paid, query) if svc_debt > 0 else []
     try:
@@ -12679,6 +14251,22 @@ def _open_checkout_dlg(parent, bid, on_close=None):
     nights_spin.insert(0, f"{actual_units:.1f}" if is_hourly_booking else str(int(actual_units)))
     nights_spin.pack(side='left', padx=8)
     lbl(nf, f"{unit_label_full} (змінити якщо виїжджає раніше)", 11, color=C['text2']).pack(side='left', padx=4)
+
+    # Форс-мажор: гість сидів довше (або ночував довше), бо виселення вчасно
+    # не оформили — рецепціоніст може виставити фактично оплачуваний час.
+    _over_units = _bath_over_h if is_hourly_booking else max(actual_units - booked_units, 0)
+    if _over_units > 0:
+        _of = tk.Frame(nc, bg=C['card']); _of.pack(fill='x', padx=12, pady=(0,10))
+        _ou = f"{_over_units:.0f} год" if is_hourly_booking else f"{int(_over_units)} н."
+        lbl(_of, f"⚠ Прострочено {_ou} понад бронювання — нараховано доплату.",
+            11, True, C['yellow']).pack(anchor='w', padx=8)
+        lbl(_of, "Якщо виселення вчасно не оформили (форс-мажор) — поставте фактичний час вручну:",
+            10, color=C['text2']).pack(anchor='w', padx=8, pady=(2,4))
+        def _set_booked():
+            nights_spin.delete(0, 'end')
+            nights_spin.insert(0, f"{booked_units:.1f}" if is_hourly_booking else str(int(booked_units)))
+            _refresh_fin()
+        btn(_of, "✅ Без доплати (за бронюванням)", _set_booked, C['green'], 240).pack(anchor='w', padx=8)
 
     def _get_n():
         try:
@@ -12788,7 +14376,8 @@ def _open_checkout_dlg(parent, bid, on_close=None):
             query("""INSERT INTO payments (booking_id,amount,method,note,shift_id,created_at)
                        VALUES (%s,%s,%s,%s,%s,NOW())""",
                   (bid, overdue_amt, meth_var.get(),
-                   f'Доплата за прострочення {int(overdue_n)} дн.',
+                   (f'Доплата за прострочення {overdue_n:.0f} год.' if is_hourly_booking
+                    else f'Доплата за прострочення {int(overdue_n)} дн.'),
                    get_current_shift_id()), fetch=None)
         svc_part = min(max(extra - debt, 0.0), svc_debt) if (svc_debt > 0 and svc_unpaid_items) else 0.0
         main_extra = extra - svc_part
@@ -13127,7 +14716,7 @@ def _open_checkin_existing(parent, b, room, on_save=None):
         _tot_eff = 0.0 if _free_on else total
 
         # Оновити ім'я/телефон гостя якщо змінено
-        new_name  = e_name.get().strip()
+        new_name  = _cap_name(e_name.get())
         new_phone = e_phone.get().strip()
         if not _confirm_guest_not_blacklisted(win, new_name or b.get('guest_name', ''), new_phone or b.get('phone', '') or b.get('guest_phone', '')): return
         if new_name or new_phone:
@@ -13146,7 +14735,8 @@ def _open_checkin_existing(parent, b, room, on_save=None):
             query("UPDATE bookings SET notes=%s WHERE id=%s", (new_notes, b['id']), fetch=None)
 
         # Встановити/оновити total_amount = сума проживання + залог
-        total_with_dep = _tot_eff + dep
+        # total_amount = ТІЛЬКИ проживання; залог — окремий платіж і в суму не входить
+        total_with_dep = _tot_eff
         query("UPDATE bookings SET total_amount=%s WHERE id=%s",
               (total_with_dep, b['id']), fetch=None)
         if abs(price - float(b.get('price_per_day') or 0)) > 0.005:
@@ -14062,9 +15652,9 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
         g = query("SELECT id FROM guests WHERE phone=%s", (phone,), fetch='one')
         if g:
             gid = g['id']
-            query("UPDATE guests SET name=%s WHERE id=%s", (name, gid), fetch=None)
+            query("UPDATE guests SET name=%s WHERE id=%s", (_cap_name(name), gid), fetch=None)
         else:
-            query("INSERT INTO guests (name, phone) VALUES (%s,%s)", (name, phone), fetch=None)
+            query("INSERT INTO guests (name, phone) VALUES (%s,%s)", (_cap_name(name), phone), fetch=None)
             g = query("SELECT id FROM guests WHERE phone=%s", (phone,), fetch='one')
             gid = g['id']
 
@@ -14913,8 +16503,8 @@ class ChessFrame(tk.Frame):
             if x2 < x1+4: x2=x1+CW-4
             y1=ri*CH+3;                   y2=ri*CH+CH-3
             # Заселені — червоним (номер зайнятий, гість живе); заброньовані
-            # (ще не заселені) — зеленим, як і просив користувач.
-            color=C['red'] if b['status']=='checkedin' else C['green']
+            # (ще не заселені) — блакитним/синім, як на дашборді.
+            color=C['red'] if b['status']=='checkedin' else C['accent']
             canvas.create_rectangle(x1,y1,x2,y2,fill=color,outline='')
             if x2-x1>20:
                 name=(b.get('guest_name') or '').split()[0]
@@ -15815,6 +17405,12 @@ class CheckedinFrame(tk.Frame):
                     overdue_nights = 0
                 overdue_amt = _extra_nights_cost(b, _ci_date + timedelta(days=nights), overdue_nights) if overdue_nights > 0 else 0.0
                 total_live_base = total + overdue_amt
+                _bh_ci, _oh_ci = _bath_overdue_hours(b)
+                if _oh_ci > 0:
+                    total_live_base += price_night * _oh_ci   # баня: прострочені години
+                _adj_dep = _legacy_dep_in_total(b, float(_raw_total_ci or 0), dep, adv + paid_dopla)
+                if _adj_dep > 0:
+                    total_live_base = max(total_live_base - _adj_dep, 0.0)
                 # Сплачено = ціна×діб - аванс - доплата + залог
                 # Сплачено = аванс + доплата + залог (всі реально отримані гроші від гостя)
                 splacheno  = adv + paid_dopla + dep
@@ -16092,6 +17688,7 @@ class CheckedinFrame(tk.Frame):
             self._loading_in_progress = False
 
     def _apply_checkedin_rows(self, groups):
+        _tv_state = _tree_view_save(self.tree)
         self.tree.delete(*self.tree.get_children())
         self.tree.tag_configure('debt', foreground='#e74c3c')
         self.tree.tag_configure('nodebt', foreground='#2ecc71')
@@ -16113,8 +17710,7 @@ class CheckedinFrame(tk.Frame):
                                   tags=('debt',) if r['debt'] else ('nodebt',),
                                   values=r['vals'])
         self._autosize_columns()
-        try: self.tree.after(10, lambda: self.tree.yview_moveto(0))
-        except Exception: pass
+        _tree_view_restore(self.tree, _tv_state)
 
     def _autosize_columns(self):
         """Підганяє ширину кожної показаної колонки під найдовший вміст
@@ -16246,9 +17842,7 @@ class CheckedinFrame(tk.Frame):
                 query("""INSERT INTO payments (booking_id,amount,method,note,shift_id,created_at)
                           VALUES (%s,%s,'cash','Повернення залогу при виїзді',%s,NOW())""",
                       (bid, -dep_amt, get_current_shift_id()), fetch=None)
-                # Оновити total_amount — прибрати залог
-                query("UPDATE bookings SET total_amount=total_amount-%s WHERE id=%s",
-                      (dep_amt, bid), fetch=None)
+                # total_amount залог не містить — нічого віднімати не треба
 
             update_booking_status(bid,'checkedout')
             _mark_booking_event_time(bid, 'виселення')
@@ -16658,6 +18252,7 @@ class CheckedOutFrame(tk.Frame):
             self._loading_in_progress = False
 
     def _apply_rows(self, groups):
+        _tv_state = _tree_view_save(self.tree)
         self.tree.delete(*self.tree.get_children())
         self.tree.tag_configure('debt', foreground='#e74c3c')
         self.tree.tag_configure('nodebt', foreground='#2ecc71')
@@ -16673,8 +18268,7 @@ class CheckedOutFrame(tk.Frame):
                 self.tree.insert('', 'end', iid=r['vals'][0],
                                   tags=('debt',) if r['debt'] else ('nodebt',),
                                   values=r['vals'])
-        try: self.tree.after(10, lambda: self.tree.yview_moveto(0))
-        except Exception: pass
+        _tree_view_restore(self.tree, _tv_state)
 
     def _sel(self):
         s = self.tree.selection()
@@ -16952,11 +18546,11 @@ class BookingsFrame(tk.Frame):
             self._loading_in_progress = False
 
     def _apply_bookings_rows(self, rows):
+        _tv_state = _tree_view_save(self.tree)
         self.tree.delete(*self.tree.get_children())
         for r in rows:
             self.tree.insert('', 'end', iid=r[0], values=r)
-        try: self.tree.after(10, lambda: self.tree.yview_moveto(0))
-        except Exception: pass
+        _tree_view_restore(self.tree, _tv_state)
 
     def _sel(self):
         s=self.tree.selection()
@@ -17189,7 +18783,7 @@ class BookingsFrame(tk.Frame):
             if _free_on and not _free_cm:
                 messagebox.showerror("", "Вкажіть коментар до безкоштовного проживання"); return
             _rt_eff = 0.0 if _free_on else room_total
-            total_with_dep = _rt_eff + dep
+            total_with_dep = _rt_eff + dep   # для чека (разом до сплати)
 
             # Зберегти паспорт у нотатки
             if passport_info.strip():
@@ -17198,8 +18792,9 @@ class BookingsFrame(tk.Frame):
                       (f"Паспорт: {passport_info}  {notes}".strip(), bid), fetch=None)
 
             # Встановити total_amount = проживання + залог
+            # total_amount = ТІЛЬКИ проживання; залог — окремий платіж, у суму не входить
             query("UPDATE bookings SET total_amount=%s WHERE id=%s",
-                  (total_with_dep, bid), fetch=None)
+                  (_rt_eff, bid), fetch=None)
             if abs(price - float(b.get('price_per_day') or 0)) > 0.005:
                 query("UPDATE bookings SET price_per_day=%s WHERE id=%s", (price, bid), fetch=None)
             _save_free_stay(bid, _free_on, _free_cm)
@@ -18098,6 +19693,11 @@ class BookingDetailDlg(ctk.CTkToplevel):
             # "Заброньовано" тощо — щоб цифри були однакові скрізь)
             try:
                 _fin = calc_stay_financials(b, pay, svc_total=_svc_orders_total(self.bid))
+                self._fin = _fin
+                try:
+                    self._svc_unpaid = _svc_unpaid_items(self.bid, _fin.get('svc_covered', 0)) if _fin.get('svc_debt', 0) > 0 else []
+                except Exception:
+                    self._svc_unpaid = []
                 bal['total'] = _fin['total']
                 bal['paid']  = _fin['paid']
                 bal['debt']  = _fin['debt']
@@ -18185,19 +19785,98 @@ class BookingDetailDlg(ctk.CTkToplevel):
         lbl(inf, f"👤  {b.get('guest_name','')}   📞  {b.get('phone','')}", 13).pack(anchor='w', padx=12, pady=2)
         lbl(inf, f"📅  {b['check_in']} → {b['check_out']}   |   {STATUS_UA.get(b['status'],b['status'])}", 12, color=C['text2']).pack(anchor='w', padx=12, pady=(2,10))
 
+        # ── Розрахунок (якщо не передано із завантажувача) ─────
+        if not getattr(self, '_fin', None):
+            try:
+                self._fin = calc_stay_financials(b, pay, svc_total=_svc_orders_total(self.bid))
+                self._svc_unpaid = _svc_unpaid_items(self.bid, self._fin.get('svc_covered', 0)) \
+                    if self._fin.get('svc_debt', 0) > 0 else []
+                bal['total'] = self._fin['total']; bal['paid'] = self._fin['paid']; bal['debt'] = self._fin['debt']
+            except Exception as _e_fin:
+                log_error("BookingDetailDlg: _fin", _e_fin)
+        # Залог на руках: прийнятий платежем мінус повернений; або залог із service_orders
+        _dep_in = sum(float(p.get('amount') or 0) for p in (pay or [])
+                      if float(p.get('amount') or 0) > 0 and 'Залог' in str(p.get('note') or ''))
+        _dep_out = sum(-float(p.get('amount') or 0) for p in (pay or [])
+                       if float(p.get('amount') or 0) < 0 and 'залог' in str(p.get('note') or '').lower())
+        dep_show = max(max(_dep_in - _dep_out, 0.0), dep_active)
+
         # ── Фінансовий підсумок ───────────────────────
         bf = card(scroll); bf.pack(fill='x', pady=5)
-        bf.columnconfigure((0,1,2,3), weight=1)
+        bf.columnconfigure((0,1,2,3,4), weight=1)
         for col, (lt, val, color) in enumerate([
-            ("Всього",   f"{bal['total']:.0f}₴",  C['accent']),
-            ("Оплачено", f"{bal['paid']:.0f}₴",   C['green']),
-            ("Борг",     f"{bal['debt']:.0f}₴",   C['red'] if bal['debt']>0 else C['gray']),
-            ("Штрафи",   f"{fine_total:.0f}₴",    C['red'] if fine_total>0 else C['gray']),
+            ("Всього (проживання)", f"{bal['total']:.0f}₴",  C['accent']),
+            ("Оплачено",            f"{bal['paid']:.0f}₴",   C['green']),
+            ("Борг",                f"{bal['debt']:.0f}₴",   C['red'] if bal['debt']>0 else C['gray']),
+            ("Залог (окремо)",      f"{dep_show:.0f}₴",      C['yellow'] if dep_show>0 else C['gray']),
+            ("Штрафи",              f"{fine_total:.0f}₴",    C['red'] if fine_total>0 else C['gray']),
         ]):
             ctk.CTkFrame(bf, fg_color=color, corner_radius=8, height=64, width=100).grid(row=0, column=col, padx=5, pady=6, sticky='ew')
             bf.grid_rowconfigure(0, minsize=64)
             lbl(bf, val, 14, True, color).grid(row=0, column=col, pady=(8,1))
             lbl(bf, lt, 9, color=C['text2']).grid(row=1, column=col, pady=(0,6))
+
+        # ── Розрахунок: звідки береться борг ─────────
+        try:
+            _fin = getattr(self, '_fin', None) or {}
+            import datetime as _dtb
+            _ci = b['check_in'] if hasattr(b['check_in'], 'year') else _dtb.date.fromisoformat(str(b['check_in'])[:10])
+            _co = b['check_out'] if hasattr(b['check_out'], 'year') else _dtb.date.fromisoformat(str(b['check_out'])[:10])
+            _nn = max((_co - _ci).days, 1)
+            _pr = float(b.get('price_per_day') or 0)
+            _planned = _pr * _nn
+            _stored = float(b.get('total_amount') or 0)
+            _dep_paid = float(_fin.get('dep_paid', 0) or 0)
+            _adv = float(_fin.get('adv_paid', 0) or 0)
+            _dop = float(_fin.get('dopla_paid', 0) or 0)
+            _svc_t = float(_fin.get('svc_total', 0) or 0)
+            _l_debt = float(_fin.get('lodging_debt', 0) or 0)
+            _s_debt = float(_fin.get('svc_debt', 0) or 0)
+            dbf = card(scroll); dbf.pack(fill='x', pady=5)
+            lbl(dbf, "🧮  Звідки береться борг", 13, True).pack(anchor='w', padx=12, pady=(10,4))
+            def _row(txt, val=None, color=None, bold=False):
+                r = ctk.CTkFrame(dbf, fg_color='transparent'); r.pack(fill='x', padx=12, pady=1)
+                lbl(r, txt, 11, bold, color or C['text2']).pack(side='left')
+                if val is not None:
+                    lbl(r, val, 11, True, color or C['text']).pack(side='right')
+            _bh, _oh = _bath_overdue_hours(b) if b.get('status') == 'checkedin' else (0.0, 0.0)
+            _is_bath = ('баня:' in str(b.get('notes') or '').lower()) and _bh > 0
+            if _is_bath:
+                _planned = _pr * _bh
+                _row(f"Оренда бані: {_bh:g} год × {_pr:.0f}₴", f"{_planned:.0f}₴")
+                if _oh > 0:
+                    _row(f"Прострочення: {_oh:.0f} год × {_pr:.0f}₴ (при виселенні можна обрати «без доплати»)",
+                         f"{_pr * _oh:.0f}₴", C['yellow'])
+            else:
+                _row(f"Проживання: {_pr:.0f}₴ × {_nn} діб", f"{_planned:.0f}₴")
+            if _stored > 0 and abs(_stored - _planned) > 0.5:
+                _diff = _stored - _planned
+                _row(f"Сума в бронюванні (total_amount): {_stored:.0f}₴ — "
+                     f"{'більше' if _diff>0 else 'менше'} на {abs(_diff):.0f}₴ "
+                     f"(знижка, послуги або додаткові доби)", None, C['yellow'])
+            _row("Замовлені послуги", f"{_svc_t:.0f}₴")
+            for _it in (getattr(self, '_svc_unpaid', None) or []):
+                _row(f"   • {_it['name']} × {_it['qty']:g} — не сплачено", f"{_it['total']:.0f}₴", C['yellow'])
+            _row("Сплачено за проживання/послуги (аванс + доплата)", f"{_adv + _dop:.0f}₴", C['green'])
+            _row("Залог (окремо, у борг НЕ входить)", f"{max(_dep_paid, dep_show):.0f}₴", C['text2'])
+            _row("Борг за проживання", f"{_l_debt:.0f}₴", C['red'] if _l_debt > 0 else C['gray'])
+            _row("Борг за послуги", f"{_s_debt:.0f}₴", C['red'] if _s_debt > 0 else C['gray'])
+            _row("РАЗОМ борг", f"{bal['debt']:.0f}₴", C['red'] if bal['debt'] > 0 else C['gray'], True)
+            # Список платежів — щоб було видно, що саме внесено
+            if pay:
+                lbl(dbf, "Платежі:", 11, True, C['text2']).pack(anchor='w', padx=12, pady=(8,2))
+                for _p in pay:
+                    try:
+                        _pa = float(_p.get('amount') or 0)
+                        _pn = str(_p.get('note') or '—')
+                        _pt = str(_p.get('created_at') or '')[:16]
+                        _pm = str(_p.get('method') or '')
+                        _row(f"   {_pt}  {_pn}  {('(' + _pm + ')') if _pm else ''}", f"{_pa:.0f}₴")
+                    except Exception:
+                        pass
+            ctk.CTkFrame(dbf, fg_color='transparent', height=8).pack()
+        except Exception as _e_dbg:
+            log_error("BookingDetailDlg: блок розрахунку боргу", _e_dbg)
 
         # ── Залог ─────────────────────────────────────
         df = card(scroll); df.pack(fill='x', pady=5)
@@ -18205,6 +19884,12 @@ class BookingDetailDlg(ctk.CTkToplevel):
         dep_color = C['green'] if dep_active <= 0 else C['yellow']
         lbl(dh, "🔐  Залог", 13, True).pack(side='left')
         dep_status = "✅ Повернено" if dep_returned>0 and dep_active<=0 else (f"💛 Утримується: {dep_active:.0f}₴" if dep_active>0 else "—")
+        try:
+            _dpp = float((getattr(self, '_fin', None) or {}).get('dep_paid', 0) or 0)
+            if dep_status == "—" and _dpp > 0:
+                dep_status = f"💛 Прийнято при заселенні: {_dpp:.0f}₴"
+                dep_color = C['yellow']
+        except Exception: pass
         lbl(dh, dep_status, 11, color=dep_color).pack(side='left', padx=12)
         if deposits:
             ff_d, dt = mktree(df, ('type','amount','note','time'), 3, [120,90,230,130])
@@ -18248,6 +19933,12 @@ class BookingDetailDlg(ctk.CTkToplevel):
         ff, st = mktree(sv, ('name','qty','price','total','time'), 5, [200,60,80,80,140])
         for c, h in zip(('name','qty','price','total','time'), ['Послуга','Кіл.','Ціна','Сума','Час']): st.heading(c, text=h)
         for s in svc:
+            # Залоги та штрафи зберігаються в service_orders під «першою» послугою
+            # з довідника (тому раніше з'являлись як «Вареники…», у т.ч. зі знаком «−»
+            # при поверненні залогу). Вони мають свої секції — тут їх не показуємо.
+            _sn = str(s.get('note') or '').lower()
+            if _sn.startswith('deposit') or _sn.startswith('fine'):
+                continue
             st.insert('','end', iid=s['id'], values=(_fix_mojibake(s['svc_name']), s['quantity'], f"{float(s['price'] or 0):.0f}₴", f"{float(s['total'] or 0):.0f}₴", str(s['created_at'])[:16]))
         ff.pack(fill='x', padx=8, pady=(0,5))
         af = ctk.CTkFrame(sv, fg_color='transparent'); af.pack(fill='x', padx=8, pady=(0,10))
@@ -19075,7 +20766,7 @@ class BookingDetailDlg(ctk.CTkToplevel):
             try:
                 if b.get('guest_id'):
                     _qe("UPDATE guests SET name=%s, phone=%s WHERE id=%s",
-                        (name, phone, b['guest_id']), fetch=None)
+                        (_cap_name(name), phone, b['guest_id']), fetch=None)
                 _qe("""UPDATE bookings SET check_in=%s, check_out=%s, adults=%s,
                        price_per_day=%s, total_amount=%s, notes=%s,
                        free_stay=%s, free_stay_comment=%s WHERE id=%s""",
@@ -19138,9 +20829,14 @@ class BookingDetailDlg(ctk.CTkToplevel):
             sid = first_svc['id'] if first_svc else 1
             # Для повернення — від'ємна сума (зменшує борг)
             real_amt = -amt if action in ('return',) else amt
-            query("""INSERT INTO service_orders (booking_id,room_id,service_id,quantity,price,total,note,created_at)
-                      VALUES (%s,%s,%s,1,%s,%s,%s,NOW())""",
-                  (self.bid, b['room_id'], sid, abs(real_amt), real_amt, note_text))
+            try:
+                query("""INSERT INTO service_orders (booking_id,room_id,service_id,quantity,price,total,note,created_at)
+                          VALUES (%s,%s,%s,1,%s,%s,%s,NOW())""",
+                      (self.bid, b['room_id'], sid, abs(real_amt), real_amt, note_text), fetch=None)
+            except Exception as _e:
+                log_error("_deposit_dlg", _e)
+                messagebox.showerror("Помилка", f"Не вдалося зберегти залог:\n{_e}")
+                return
             action_ua = {'take':'Залог {:.0f}₴ взято','return':'Залог {:.0f}₴ повернено','keep':'Залог {:.0f}₴ утримано'}
             messagebox.showinfo("✅", action_ua[action].format(amt))
             win.destroy(); self._rebuild()
@@ -24463,9 +26159,9 @@ def _open_sauna_checkin_dlg(parent, room, on_save=None, booking=None):
         g = query("SELECT id FROM guests WHERE phone=%s", (phone,), fetch='one')
         if g:
             gid = g['id']
-            query("UPDATE guests SET name=%s WHERE id=%s", (name, gid), fetch=None)
+            query("UPDATE guests SET name=%s WHERE id=%s", (_cap_name(name), gid), fetch=None)
         else:
-            query("INSERT INTO guests (name, phone) VALUES (%s,%s)", (name, phone), fetch=None)
+            query("INSERT INTO guests (name, phone) VALUES (%s,%s)", (_cap_name(name), phone), fetch=None)
             g = query("SELECT id FROM guests WHERE phone=%s", (phone,), fetch='one')
             gid = g['id']
 
@@ -24789,9 +26485,9 @@ def _open_sauna_booking_dlg(parent, room, on_save=None):
                     g_row = _cur.fetchone()
                     if g_row:
                         gid = g_row[0] if isinstance(g_row, (list,tuple)) else g_row['id']
-                        _cur.execute("UPDATE guests SET name=%s WHERE id=%s", (name, gid))
+                        _cur.execute("UPDATE guests SET name=%s WHERE id=%s", (_cap_name(name), gid))
                     else:
-                        _cur.execute("INSERT INTO guests (name,phone) VALUES (%s,%s) RETURNING id", (name, phone))
+                        _cur.execute("INSERT INTO guests (name,phone) VALUES (%s,%s) RETURNING id", (_cap_name(name), phone))
                         r = _cur.fetchone()
                         gid = r[0] if isinstance(r, (list,tuple)) else r['id']
 
@@ -30301,7 +31997,7 @@ class GuestDatabaseFrame(tk.Frame):
                         return
                 _ensure_guest_mark_cols()
                 _row = _q("INSERT INTO guests (name, phone) VALUES (%s,%s) RETURNING id",
-                          (name, phone or ''), fetch='one')
+                          (_cap_name(name), phone or ''), fetch='one')
                 gid = (_row['id'] if isinstance(_row, dict) else _row[0]) if _row else None
                 if not gid:
                     _r2 = _q("SELECT id FROM guests WHERE name=%s AND COALESCE(phone,'')=%s ORDER BY id DESC LIMIT 1",
@@ -30555,7 +32251,7 @@ class GuestDatabaseFrame(tk.Frame):
                             for gid_e in row['all_ids']:
                                 _cur_e.execute(
                                     "UPDATE guests SET name=%s, phone=%s WHERE id=%s",
-                                    (new_name, new_phone or None, gid_e))
+                                    (_cap_name(new_name), new_phone or None, gid_e))
                         _conn_e.commit()
                     edit_win.destroy()
                     win.destroy()
@@ -31206,6 +32902,12 @@ class SettingsFrame(tk.Frame):
 
     def _load_rooms(self):
         from app.modules.logic import get_rooms
+        try:
+            _rooms_fresh=get_rooms() or []
+        except Exception as _e:
+            log_error("_load_rooms", _e)
+            messagebox.showerror("Помилка","Не вдалося завантажити номери:\n"+str(_e))
+            return   # не очищаємо список, якщо дані не завантажились
         self.rooms_t.delete(*self.rooms_t.get_children())
         def _rank(r):
             # порядок: бані → альтанки/бесідки → номери → золоті → рожеві
@@ -31220,7 +32922,7 @@ class SettingsFrame(tk.Frame):
         def _numkey(r):
             m=_re_room_sort.search(r'\d+(?:/\d+)*',str(r.get('number','') or ''))
             return tuple(int(x) for x in m.group(0).split('/')) if m else (999999,)
-        _rooms_sorted=sorted(get_rooms() or [],key=lambda r:(_rank(r),_numkey(r),str(r.get('number',''))))
+        _rooms_sorted=sorted(_rooms_fresh,key=lambda r:(_rank(r),_numkey(r),str(r.get('number',''))))
         for r in _rooms_sorted:
             self.rooms_t.insert('','end',iid=r['id'],
                 values=(r['id'],r['number'],r.get('cat_name','—'),r.get('floor',1),
@@ -31273,6 +32975,8 @@ class SettingsFrame(tk.Frame):
                           room['id'] if room else None)
 
             def _on_success(_r):
+                try: _invalidate_rooms_cache()   # дашборд/шахматка одразу побачать нову назву
+                except Exception: pass
                 try: self._load_rooms(); win.destroy()
                 except Exception: pass
 
@@ -31289,12 +32993,48 @@ class SettingsFrame(tk.Frame):
         if r: self._room_dlg(p,r)
 
     def _room_del(self,p):
-        from app.modules.logic import delete_room
+        from app.modules.logic import delete_room, get_rooms
+        from app.utils.db import query
         s=self.rooms_t.selection()
         if not s: messagebox.showwarning("","Оберіть номер"); return
-        if messagebox.askyesno("Видалити?","Видалити цей номер?"):
-            try: delete_room(int(s[0])); self._load_rooms()
-            except Exception as e: messagebox.showerror("Помилка",str(e))
+        if len(s)>1:
+            messagebox.showwarning("","Оберіть лише ОДИН номер для видалення"); return
+        rid=int(s[0])
+        try:
+            _vals=self.rooms_t.item(s[0],'values')
+            _name=str(_vals[1]) if len(_vals)>1 else str(rid)
+        except Exception:
+            _name=str(rid)
+        # Не видаляємо номер з активними/майбутніми бронюваннями
+        try:
+            _cnt=query("SELECT COUNT(*) AS c FROM bookings WHERE room_id=%s "
+                       "AND status IN ('checkedin','confirmed')",(rid,),fetch='one')
+            _c=int(_cnt['c'] if isinstance(_cnt,dict) else (_cnt[0] if _cnt else 0))
+        except Exception as _e:
+            log_error("_room_del: перевірка бронювань", _e); _c=0
+        if _c>0:
+            messagebox.showwarning("Не можна видалити",
+                f"Номер «{_name}» має активні або майбутні бронювання ({_c}).\n"
+                "Спершу виселіть або скасуйте їх."); return
+        if not messagebox.askyesno("Видалити?",f"Видалити номер «{_name}» (ID {rid})?\nЦю дію не можна відмінити."):
+            return
+        try:
+            _before=len(get_rooms() or [])
+            delete_room(rid)
+            try: _invalidate_rooms_cache()
+            except Exception: pass
+            _after=len(get_rooms() or [])
+            if _before-_after!=1:
+                log_error("_room_del", Exception(f"після видалення номера {rid}: було {_before}, стало {_after}"))
+                messagebox.showwarning("Увага",
+                    f"Кількість номерів змінилась з {_before} до {_after} (мало бути на 1 менше).\n"
+                    "Перевірте дані та повідомте розробника.")
+            self._load_rooms()
+        except Exception as e:
+            log_error("_room_del", e)
+            messagebox.showerror("Помилка",str(e))
+            try: self._load_rooms()
+            except Exception: pass
 
     def _load_cleaning_log(self):
         if not hasattr(self,'clean_t'): return
@@ -31682,6 +33422,7 @@ class SettingsFrame(tk.Frame):
         btn(tb,"✏️ Ред.",lambda:self._cat_edit(p),C['card2'],100).pack(side='left',padx=4)
         btn(tb,"🗑 Видалити",lambda:self._cat_del(p),C['red'],120).pack(side='left',padx=4)
         btn(tb,"📤 Експорт Excel",self._cats_export_excel,C['accent'],150).pack(side='left',padx=4)
+        btn(tb,"🖨 Друк",lambda:self._cats_print(),'#2980b9',110).pack(side='left',padx=4)
         btn(tb,"📥 Імпорт Excel",lambda:self._cats_import_excel(p),C['green'],150).pack(side='left',padx=4)
         refresh_btn(tb, lambda:self._load_cats(), side='left', padx=4, pady=6)
         ff,self.cats_t=mktree(p,('id','name','desc','price','cap'),14,[50,150,220,100,70])
@@ -31773,6 +33514,24 @@ class SettingsFrame(tk.Frame):
             return 'break'
         ed.bind('<Return>',_commit); ed.bind('<KP_Enter>',_commit); ed.bind('<FocusOut>',_commit)
         ed.bind('<Escape>',lambda e:(_close(),'break')[1])
+
+    def _cats_print(self):
+        """Друк списку категорій (А4) у тому порядку, що видно в таблиці."""
+        import datetime as _dtc
+        try:
+            rows=[]
+            for iid in self.cats_t.get_children(''):
+                v=list(self.cats_t.item(iid,'values'))
+                if len(v)>=5: rows.append([str(v[1]),str(v[2]),str(v[3]),str(v[4])])
+            if not rows:
+                messagebox.showinfo("","Немає категорій для друку"); return
+            _open_report_print("Категорії номерів",
+                               f"Станом на {_dtc.datetime.now().strftime('%d.%m.%Y %H:%M')} · всього: {len(rows)}",
+                               ['Назва','Опис','Ціна','Місць'],
+                               rows, landscape=False)
+        except Exception as _ex:
+            log_error("SettingsFrame._cats_print", _ex)
+            messagebox.showerror("Помилка друку", str(_ex))
 
     def _cats_export_excel(self):
         """Експортує список категорій у .xlsx."""
@@ -33355,8 +35114,16 @@ class SettingsFrame(tk.Frame):
         btn(tb,"✏️ Ред.",lambda:self._user_edit(p),C['card2'],100).pack(side='left',padx=4)
         btn(tb,"🗑 Видалити",lambda:self._user_del(p),C['red'],120).pack(side='left',padx=4)
         refresh_btn(tb, lambda:self._load_users(), side='left', padx=4, pady=6)
-        ff,self.users_t=mktree(p,('id','username','full_name','role','active'),14,[50,120,200,120,70])
-        for c,h in zip(('id','username','full_name','role','active'),['ID','Логін','Ім\'я','Роль','Акт.']):
+        # 👁 Пароль: за замовчуванням ВИДНО (адмін), за потреби можна сховати кнопкою
+        self._users_show_pw = True
+        def _toggle_pw():
+            self._users_show_pw = not self._users_show_pw
+            _pw_btn.configure(text="🙈 Сховати паролі" if self._users_show_pw else "👁 Показати паролі")
+            self._load_users()
+        _pw_btn = btn(tb,"🙈 Сховати паролі",_toggle_pw,C['card2'],170)
+        _pw_btn.pack(side='left',padx=4)
+        ff,self.users_t=mktree(p,('id','username','full_name','role','password','active'),14,[50,110,190,110,130,60])
+        for c,h in zip(('id','username','full_name','role','password','active'),['ID','Логін','Ім\'я','Роль','Пароль','Акт.']):
             self.users_t.heading(c,text=h)
         ff.pack(fill='both',expand=True); self.after(90, self._load_users)
 
@@ -33572,8 +35339,24 @@ class SettingsFrame(tk.Frame):
         from app.modules.logic import get_users
         if not hasattr(self,'users_t'): return
         self.users_t.delete(*self.users_t.get_children())
+        # Паролі бачить лише адміністратор. Паролі ІНШИХ адмінів не показуємо.
+        _pw_map = {}
+        try:
+            if self.user.get('role') == 'admin':
+                from app.utils.db import query as _q_pw
+                for _r in (_q_pw("SELECT id, password FROM users") or []):
+                    _pw_map[_r['id']] = _r.get('password') or ''
+        except Exception as _e_pw:
+            log_error("_load_users: паролі", _e_pw)
+        _show = bool(getattr(self, '_users_show_pw', False))
         for u in (get_users() or []):
-            self.users_t.insert('','end',iid=u['id'],values=(u['id'],u['username'],u['full_name'],u['role'],'✓' if u['active'] else '✗'))
+            if u['role'] == 'admin' and u['id'] != self.user.get('id'):
+                _pw_txt = '— (адмін)'
+            elif u['id'] in _pw_map:
+                _pw_txt = (_pw_map[u['id']] or '—') if _show else ('••••••' if _pw_map[u['id']] else '—')
+            else:
+                _pw_txt = ''
+            self.users_t.insert('','end',iid=u['id'],values=(u['id'],u['username'],u['full_name'],u['role'],_pw_txt,'✓' if u['active'] else '✗'))
 
     def _user_dlg(self,p,usr=None):
         from app.modules.logic import save_user
