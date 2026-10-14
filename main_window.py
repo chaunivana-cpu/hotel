@@ -299,7 +299,24 @@ class OfflineSyncManager:
             return 0
 
     # ── Вивантаження в PG ─────────────────────────────────────────────────────
-    def flush_to_pg(self, on_progress=None) -> dict:
+    _flush_lock = _thr.Lock()
+
+    def flush_to_pg(self, on_progress=None, wait=False) -> dict:
+        """Обгортка: гарантує, що чергу вивантажує ЛИШЕ ОДИН потік за раз.
+        Раніше фоновий цикл, відновлення зв'язку, відкриття зміни та закриття зміни
+        могли запустити flush одночасно — обидва потоки читали ті самі записи черги
+        і двічі виконували той самий INSERT (дублікати в базі)."""
+        _got = self._flush_lock.acquire(timeout=30) if wait else self._flush_lock.acquire(blocking=False)
+        if not _got:
+            self._log('flush_skipped', 'інший flush уже виконується')
+            return {'ok': 0, 'fail': 0, 'total': 0}
+        try:
+            return self._flush_to_pg_impl(on_progress)
+        finally:
+            try: self._flush_lock.release()
+            except Exception: pass
+
+    def _flush_to_pg_impl(self, on_progress=None) -> dict:
         """
         Вивантажує всі операції з черги в PostgreSQL.
         on_progress(done, total) — callback для UI progressbar.
@@ -444,7 +461,7 @@ class OfflineSyncManager:
         _result = {'ok': 0, 'fail': 0}
 
         def _do_flush():
-            res = self.flush_to_pg()
+            res = self.flush_to_pg(wait=True)
             _result.update(res)
 
         t = _thr.Thread(target=_do_flush, daemon=True)
@@ -2132,6 +2149,13 @@ def _free_stay_map(ids):
         return {}
 
 
+def _rn(number):
+    """Підпис номера: «№» додається лише до суто числових назв (1, 12, 1золотий).
+    Назви, що вже містять слова/№ («Баня №3», «Альтанка 7»), лишаються як є."""
+    s = str(number if number is not None else '').strip()
+    return ('№' + s) if s[:1].isdigit() else s
+
+
 def _dash_clear_overdue_overlays(master):
     """Знищує всі банери «прострочених виїздів» у контейнері дашборда."""
     try:
@@ -2141,6 +2165,90 @@ def _dash_clear_overdue_overlays(master):
                 except Exception: pass
     except Exception:
         pass
+
+
+def _dash_build_overdue_marquee(parent, before, overdue, font_size=9, speed_px=2, tick_ms=30):
+    """Банер прострочених виїздів у вигляді бігучого рядка.
+    Показує ВСІ прострочені номери (без ліміту), стрічка безкінечно їде справа наліво.
+    Якщо всі плашки влазять у ширину — стоїть на місці. Наведення миші = пауза.
+    Повертає кореневий Frame (позначений _is_overdue_overlay)."""
+    strictly = [b for b in overdue if b.get('days_late', 0) > 0]
+    today_co = [b for b in overdue if b.get('days_late', 0) == 0]
+    _bg  = '#3d0000' if strictly else '#3d2c00'
+    _fg  = '#ff4444' if strictly else '#ffcc00'
+    _ico = '🚨' if strictly else '⚠️'
+    _msg = (f"{_ico} {len(strictly)} прострочених виїздів — Виселити або Продовжити"
+            if strictly else
+            f"⚠️ Виїзд сьогодні: {len(today_co)} номерів — Виселити або Продовжити")
+
+    ov = tk.Frame(parent, bg=_bg, highlightbackground=_fg, highlightthickness=2)
+    ov._is_overdue_overlay = True
+    ov.pack(in_=parent, before=before, fill='x', side='top')
+
+    hf = tk.Frame(ov, bg=_bg); hf.pack(fill='x', padx=8, pady=(5, 3))
+    tk.Label(hf, text=_msg, bg=_bg, fg=_fg,
+             font=('Segoe UI', 10, 'bold')).pack(side='left')
+    tk.Button(hf, text='✕', bg=_bg, fg='#888888',
+              relief='flat', bd=0, cursor='hand2',
+              font=('Segoe UI', 10),
+              command=lambda: (_sw_note_ghost(ov), ov.pack_forget())).pack(side='right')
+
+    cv = tk.Canvas(ov, bg=_bg, height=28, highlightthickness=0, bd=0)
+    cv.pack(fill='x', padx=8, pady=(0, 5))
+
+    def _make_strip():
+        strip = tk.Frame(cv, bg=_bg)
+        for b in overdue:
+            d  = b.get('days_late', 0)
+            bc = '#cc0000' if d > 0 else '#cc8800'
+            bt = (b['late_long'] if b.get('late_long')
+                  else (f"+{d} дн." if d > 0 else "виїзд"))
+            nm = (b.get('guest_name') or '—').split()[0]
+            ch = tk.Frame(strip, bg=bc, padx=4, pady=2)
+            ch.pack(side='left', padx=2, pady=1)
+            tk.Label(ch, text=f"{_rn(b.get('room_number','?'))} {nm} {bt}",
+                     bg=bc, fg='white', font=('Segoe UI', font_size - 1, 'bold')).pack()
+        return strip
+
+    s1 = _make_strip(); s2 = _make_strip()
+    s1.update_idletasks()
+    sw = s1.winfo_reqwidth()
+    sh = max(s1.winfo_reqheight(), 24)
+    cv.configure(height=sh + 2)
+    mid = (sh + 2) // 2
+    w1 = cv.create_window(4, mid, window=s1, anchor='w')
+    w2 = cv.create_window(-10000, mid, window=s2, anchor='w')
+    GAP = 60
+    st = {'x': 4.0}
+
+    def _hover():
+        try:
+            px, py = cv.winfo_pointerxy()
+            x0, y0 = cv.winfo_rootx(), cv.winfo_rooty()
+            return x0 <= px <= x0 + cv.winfo_width() and y0 <= py <= y0 + cv.winfo_height()
+        except Exception:
+            return False
+
+    def _tick():
+        try:
+            if not cv.winfo_exists():
+                return
+            cw = cv.winfo_width()
+            if cw > 1 and sw + 8 <= cw:
+                # усе влазить — без прокрутки
+                cv.coords(w1, 4, mid); cv.coords(w2, -10000, mid)
+            elif not _hover():
+                period = sw + GAP
+                st['x'] -= speed_px
+                if st['x'] <= 4 - period:
+                    st['x'] += period
+                cv.coords(w1, st['x'], mid)
+                cv.coords(w2, st['x'] + period, mid)
+            cv.after(tick_ms, _tick)
+        except Exception:
+            pass
+    cv.after(tick_ms, _tick)
+    return ov
 
 
 def _block_if_room_occupied(room_id, exclude_bid=None):
@@ -5101,7 +5209,7 @@ def _open_invoice_dlg(parent):
     except Exception:
         _guests = []
     _opts = ["— не заповнювати —"] + [
-        f"№{g.get('room_number','')} — {g.get('guest_name','')}" for g in _guests]
+        f"{_rn(g.get('room_number',''))} — {g.get('guest_name','')}" for g in _guests]
 
     fill_card = card(scroll); fill_card.pack(fill='x', pady=(0,6))
     lbl(fill_card, "⚡ Заповнити з заселеного гостя (необов'язково)", 12, True).pack(
@@ -11222,7 +11330,7 @@ class DashboardFrame(tk.Frame):
 
         if st in ('repair', 'blocked'):
             messagebox.showinfo("Номер недоступний",
-                                f"№{number}: {STATUS_UA.get(st, st)}.\nЗмінити статус можна в шахматці.")
+                                f"{_rn(number)}: {STATUS_UA.get(st, st)}.\nЗмінити статус можна в шахматці.")
             return
 
         # Активне (заселене) та найближче заброньоване бронювання цього номера
@@ -11238,11 +11346,11 @@ class DashboardFrame(tk.Frame):
         except Exception as _e:
             log_error("dashboard tile click: пошук бронювання", _e)
 
-        win = dlg_win(self, f"Номер №{number}", "400x460")
+        win = dlg_win(self, f"Номер {_rn(number)}", "400x460")
         scroll = ctk.CTkScrollableFrame(win, fg_color=C['bg'])
         scroll.pack(fill='both', expand=True, padx=10, pady=10)
         f = card(scroll); f.pack(fill='x', pady=5)
-        lbl(f, f"🛏 №{number} — {room.get('cat_name', r.get('cat_name', ''))}", 14, True, C['accent']).pack(pady=(12, 3))
+        lbl(f, f"🛏 {_rn(number)} — {room.get('cat_name', r.get('cat_name', ''))}", 14, True, C['accent']).pack(pady=(12, 3))
         _bk = None
         _bid_hdr = active_bid or upcoming_bid
         if _bid_hdr:
@@ -11317,7 +11425,7 @@ class DashboardFrame(tk.Frame):
                     _open_booking_dlg(self, room, today, refresh)
             def _new_checkin():
                 if st == 'cleaning' and not messagebox.askyesno(
-                        "Прибирання", f"Номер №{number} зараз на прибиранні. Заселити все одно?"):
+                        "Прибирання", f"Номер {_rn(number)} зараз на прибиранні. Заселити все одно?"):
                     return
                 if is_sauna:
                     _open_sauna_checkin_dlg(self, room, refresh)
@@ -11925,7 +12033,7 @@ class DashboardFrame(tk.Frame):
                 row_i, col_i = i//COLS, i%COLS
                 cell = tk.Frame(self._rf, bg=color)
                 cell.grid(row=row_i, column=col_i, padx=3, pady=3, sticky='nsew')
-                num_l = tk.Label(cell, text=f"№{r['number']}", bg=color, fg='white',
+                num_l = tk.Label(cell, text=f"{_rn(r['number'])}", bg=color, fg='white',
                          font=('Segoe UI',12,'bold'), padx=6, pady=6)
                 num_l.pack()
                 st_l  = tk.Label(cell, text=('' if r.get('tile_dates') else STATUS_UA.get(r['status'],'')),
@@ -12089,34 +12197,8 @@ class DashboardFrame(tk.Frame):
                     # Прибираємо ВСІ раніше створені банери перед створенням нового —
                     # інакше при швидких повторних оновленнях вони множилися (3 банери).
                     _dash_clear_overdue_overlays(self._grid_canvas.master)
-                    ov = tk.Frame(self._grid_canvas.master, bg=_bg,
-                                  highlightbackground=_fg, highlightthickness=2)
-                    ov._is_overdue_overlay = True
-                    ov.pack(in_=self._grid_canvas.master, before=self._grid_canvas, fill='x', side='top')
-                    self._overdue_tile_overlay = ov
-
-                    hf = tk.Frame(ov, bg=_bg); hf.pack(fill='x', padx=8, pady=(5, 3))
-                    tk.Label(hf, text=_msg, bg=_bg, fg=_fg,
-                             font=('Segoe UI', 10, 'bold')).pack(side='left')
-                    tk.Button(hf, text='✕', bg=_bg, fg='#888888',
-                              relief='flat', bd=0, cursor='hand2',
-                              font=('Segoe UI', 10),
-                              command=lambda: (_sw_note_ghost(ov), ov.pack_forget())).pack(side='right')
-
-                    cf = tk.Frame(ov, bg=_bg); cf.pack(fill='x', padx=8, pady=(0, 5))
-                    for b in overdue[:12]:
-                        d  = b.get('days_late', 0)
-                        bc = '#cc0000' if d > 0 else '#cc8800'
-                        bt = (b['late_long'] if b.get('late_long')
-                              else (f"+{d} дн." if d > 0 else "виїзд"))
-                        nm = (b.get('guest_name') or '—').split()[0]
-                        ch = tk.Frame(cf, bg=bc, padx=4, pady=2)
-                        ch.pack(side='left', padx=2, pady=1)
-                        tk.Label(ch, text=f"№{b.get('room_number','?')} {nm} {bt}",
-                                 bg=bc, fg='white', font=('Segoe UI', 8, 'bold')).pack()
-                    if len(overdue) > 12:
-                        tk.Label(cf, text=f"  +{len(overdue)-12} ще",
-                                 bg=_bg, fg='#888888', font=('Segoe UI', 8)).pack(side='left', padx=3)
+                    self._overdue_tile_overlay = _dash_build_overdue_marquee(
+                        self._grid_canvas.master, self._grid_canvas, overdue)
                 except Exception as _ove:
                     log_error("Dashboard: tile overlay", _ove)
             self.after(100, _build_tile_overlay)
@@ -12161,7 +12243,7 @@ class DashboardFrame(tk.Frame):
                     try:
                         cell._room = r
                         cell.configure(bg=new_color)
-                        num_l.configure(bg=new_color, text=f"№{r['number']}")
+                        num_l.configure(bg=new_color, text=f"{_rn(r['number'])}")
                         st_l.configure(bg=new_color,
                                        text=('' if r.get('tile_dates') else STATUS_UA.get(r['status'],'')))
                         _dtl2 = getattr(cell, '_dt_lbl', None)
@@ -12206,32 +12288,8 @@ class DashboardFrame(tk.Frame):
                     # Прибираємо ВСІ раніше створені банери перед створенням нового —
                     # інакше при швидких повторних оновленнях вони множилися (3 банери).
                     _dash_clear_overdue_overlays(self._grid_canvas.master)
-                    ov = tk.Frame(self._grid_canvas.master, bg=_bg,
-                                  highlightbackground=_fg, highlightthickness=2)
-                    ov._is_overdue_overlay = True
-                    ov.pack(in_=self._grid_canvas.master, before=self._grid_canvas, fill='x', side='top')
-                    self._overdue_tile_overlay = ov
-                    hf = tk.Frame(ov, bg=_bg); hf.pack(fill='x', padx=8, pady=(5, 3))
-                    tk.Label(hf, text=_msg, bg=_bg, fg=_fg,
-                             font=('Segoe UI', 10, 'bold')).pack(side='left')
-                    tk.Button(hf, text='✕', bg=_bg, fg='#888888',
-                              relief='flat', bd=0, cursor='hand2',
-                              font=('Segoe UI', 10),
-                              command=lambda: (_sw_note_ghost(ov), ov.pack_forget())).pack(side='right')
-                    cf = tk.Frame(ov, bg=_bg); cf.pack(fill='x', padx=8, pady=(0, 5))
-                    for b in overdue[:12]:
-                        d  = b.get('days_late', 0)
-                        bc = '#cc0000' if d > 0 else '#cc8800'
-                        bt = (b['late_long'] if b.get('late_long')
-                              else (f"+{d} дн." if d > 0 else "виїзд"))
-                        nm = (b.get('guest_name') or '—').split()[0]
-                        ch = tk.Frame(cf, bg=bc, padx=4, pady=2)
-                        ch.pack(side='left', padx=2, pady=1)
-                        tk.Label(ch, text=f"№{b.get('room_number','?')} {nm} {bt}",
-                                 bg=bc, fg='white', font=('Segoe UI', 8, 'bold')).pack()
-                    if len(overdue) > 12:
-                        tk.Label(cf, text=f"  +{len(overdue)-12} ще",
-                                 bg=_bg, fg='#888888', font=('Segoe UI', 8)).pack(side='left', padx=3)
+                    self._overdue_tile_overlay = _dash_build_overdue_marquee(
+                        self._grid_canvas.master, self._grid_canvas, overdue)
                 except Exception: pass
             self.after(50, _rebuild_overlay)
 
@@ -12618,7 +12676,7 @@ class CleaningFrame(tk.Frame):
         # Filter to show cleaning rooms first
         cleaning_rooms = [r for r in all_rooms if r['status']=='cleaning']
         priority = cleaning_rooms + [r for r in all_rooms if r['status']!='cleaning']
-        room_labels3 = [f"№{r['number']} — {r['cat_name']} [{STATUS_UA.get(r['status'],r['status'])}]" for r in priority]
+        room_labels3 = [f"{_rn(r['number'])} — {r['cat_name']} [{STATUS_UA.get(r['status'],r['status'])}]" for r in priority]
         rid_by_lbl3 = {room_labels3[i]: priority[i]['id'] for i in range(len(priority))}
         room_var3 = ctk.StringVar(value=room_labels3[0] if room_labels3 else '—')
         ctk.CTkOptionMenu(f1, values=room_labels3 or ['—'], variable=room_var3,
@@ -12684,7 +12742,7 @@ class CleaningFrame(tk.Frame):
         import os, json, datetime as _dt
         rooms = get_rooms() or []
         # Будуємо map по id кімнати для надійності
-        room_list = [(r['id'], f"№{r['number']} — {r.get('cat_name','')} ({STATUS_UA.get(r.get('status',''),'')})", r)
+        room_list = [(r['id'], f"{_rn(r['number'])} — {r.get('cat_name','')} ({STATUS_UA.get(r.get('status',''),'')})", r)
                      for r in rooms]
         room_labels = [x[1] for x in room_list]
         id_by_label = {x[1]: x[0] for x in room_list}
@@ -12710,7 +12768,7 @@ class CleaningFrame(tk.Frame):
         cleaning_rooms = [r for r in rooms if r.get('status')=='cleaning']
         if cleaning_rooms:
             r = cleaning_rooms[0]
-            lbl_k = f"№{r['number']} — {r.get('cat_name','')} ({STATUS_UA.get(r.get('status',''),'')})"
+            lbl_k = f"{_rn(r['number'])} — {r.get('cat_name','')} ({STATUS_UA.get(r.get('status',''),'')})"
             room_var.set(lbl_k)
         ctk.CTkOptionMenu(f1, values=room_labels or ['—'], variable=room_var,
                           width=440, fg_color=C['card2'],
@@ -12796,7 +12854,7 @@ class CleaningFrame(tk.Frame):
             })
 
             messagebox.showinfo("✅",
-                f"Прибирання зафіксовано!\nНомер №{room['number']} → {STATUS_UA.get(sv.get(),sv.get())}")
+                f"Прибирання зафіксовано!\nНомер {_rn(room['number'])} → {STATUS_UA.get(sv.get(),sv.get())}")
             win.destroy()
             self._rebuild()
 
@@ -12830,12 +12888,12 @@ class CleaningFrame(tk.Frame):
         def _get_cl():
             return _get_cleaners_db()
 
-        win = dlg_win(self, f"✏️ Прибирання №{room_num}", "500x580")
+        win = dlg_win(self, f"✏️ Прибирання {_rn(room_num)}", "500x580")
         scroll = ctk.CTkScrollableFrame(win, fg_color=C['bg'])
         scroll.pack(fill='both', expand=True, padx=10, pady=10)
 
         hdr = card(scroll); hdr.pack(fill='x', pady=5)
-        lbl(hdr, f"🧹  Кімната №{room_num}", 15, True, C['yellow']).pack(anchor='w', padx=12, pady=(10,4))
+        lbl(hdr, f"🧹  Кімната {_rn(room_num)}", 15, True, C['yellow']).pack(anchor='w', padx=12, pady=(10,4))
         lbl(hdr, f"Початок: {entry.get('started','')}", 11, color=C['text2']).pack(anchor='w', padx=12, pady=(0,8))
 
         # Прибиральниця
@@ -12918,7 +12976,7 @@ class CleaningFrame(tk.Frame):
                 import traceback; traceback.print_exc()
                 messagebox.showerror(
                     "⚠️ Статус кімнати НЕ оновлено",
-                    f"Запис у журналі прибирань збережено, але статус кімнати №{room_num} "
+                    f"Запис у журналі прибирань збережено, але статус кімнати {_rn(room_num)} "
                     f"у базі оновити НЕ вдалось:\n{_ex_upd}\n\n"
                     f"Через це кімната може знову з'явитись у списку на прибирання. "
                     f"Спробуйте зберегти ще раз, коли з'явиться зв'язок з сервером."
@@ -12927,7 +12985,7 @@ class CleaningFrame(tk.Frame):
             if not _room_status_ok:
                 messagebox.showwarning(
                     "⚠️ Кімнату не знайдено",
-                    f"Кімнату №{room_num} не знайдено в базі — статус НЕ оновлено. "
+                    f"Кімнату {_rn(room_num)} не знайдено в базі — статус НЕ оновлено. "
                     f"Запис у журналі збережено, але кімната може знову з'явитись у списку на прибирання."
                 )
             win.destroy(); self._load_log()
@@ -13467,7 +13525,7 @@ class RoomsFrame(tk.Frame):
         # ── Вибір номера (прокрутний) ──
         r1=card(main_f); r1.pack(fill='x',pady=4)
         lbl(r1,"🏠 Номер кімнати:",12,True).pack(anchor='w',padx=12,pady=(8,3))
-        room_names=[f"№{r['number']} — {r.get('cat_name','')}" for r in rooms]
+        room_names=[f"{_rn(r['number'])} — {r.get('cat_name','')}" for r in rooms]
         room_picker, get_room_idx = _make_scroll_picker(r1, room_names, height=5)
         room_picker.pack(fill='x', padx=12, pady=(0,10))
 
@@ -13536,13 +13594,13 @@ class RoomsFrame(tk.Frame):
                             except: _cu.execute("INSERT INTO payments(booking_id,amount,method,note,shift_id,created_at) VALUES(NULL,%s,%s,%s,%s,NOW())",(total,meth_var.get(),f"Послуга: {note}",get_current_shift_id()))
                         _cc.commit()
                 lines=[f"  Готель: {_HOTEL_INFO.get('name','Готель Королівська Бочка')}",f"{'─'*50}",f"  🛎 ЧЕК ПОСЛУГИ",f"{'─'*50}",
-                       f"  Номер  : №{sel_room['number']} ({sel_room.get('cat_name','')})",
+                       f"  Номер  : {_rn(sel_room['number'])} ({sel_room.get('cat_name','')})",
                        f"  Послуга: {s['name']}",f"  К-сть  : {qty} {s.get('unit','шт')}",
                        f"  Ціна   : {pr:.0f}₴",f"{'─'*50}",f"  Сума   : {total:.0f}₴",
                        f"  Метод  : {meth_var.get()}",f"{'─'*50}",
                        f"  Час    : {_dt3.datetime.now().strftime('%d.%m.%Y %H:%M')}",f"  Дякуємо!"]
                 cbx_ask_and_receipt(total,"CARD" if meth_var.get()=="card" else "CASH",f"Послуга: {s['name']}","","")
-                print_text(f"Чек послуги — №{sel_room['number']}",lines)
+                print_text(f"Чек послуги — {_rn(sel_room['number'])}",lines)
                 messagebox.showinfo("✅",f"Послуга «{s['name']}» — {total:.0f}₴ збережено!")
                 win.destroy()
             except Exception as ex: _st.configure(text=f"❌ {ex}"); messagebox.showerror("Помилка",str(ex))
@@ -13564,7 +13622,7 @@ class RoomsFrame(tk.Frame):
         lbl(hdr,"Причини та суми беруться з Налаштування → Меню (категорія: штрафи)",10,color=C['text2']).pack(padx=12,pady=(0,10))
         f1=card(sc); f1.pack(fill='x',pady=4)
         lbl(f1,"🏠 Номер кімнати:",12,True).pack(anchor='w',padx=12,pady=(8,3))
-        room_opts=[f"№{r['number']} — {r.get('cat_name','')}" for r in rooms]
+        room_opts=[f"{_rn(r['number'])} — {r.get('cat_name','')}" for r in rooms]
         fine_room_picker, get_fine_room_idx = _make_scroll_picker(f1, room_opts or ['—'], height=5)
         fine_room_picker.pack(fill='x', padx=12, pady=(0,10))
         f2=card(sc); f2.pack(fill='x',pady=4)
@@ -13625,7 +13683,7 @@ class RoomsFrame(tk.Frame):
                     _cfin.commit()
                 self._load_room_fines()
                 if hasattr(self,'_sw_rt'): self._sw_rt('fines')
-                messagebox.showinfo("✅",f"Штраф {amt:.0f}₴ збережено для №{sel_room['number']}"); win.destroy()
+                messagebox.showinfo("✅",f"Штраф {amt:.0f}₴ збережено для {_rn(sel_room['number'])}"); win.destroy()
             except Exception as ex: messagebox.showerror("Помилка",str(ex))
         bf2=tk.Frame(win,bg=C['bg']); bf2.pack(fill='x',padx=10,pady=8)
         btn(bf2,"⚠️ Зберегти штраф",_save_fine,C['red'],170,height=40).pack(side='left',padx=8)
@@ -13683,7 +13741,7 @@ class RoomsFrame(tk.Frame):
             st = r.get('status', 'free')
             tag = _status_tag.get(st, 'free')
             self._map_tree.insert('', 'end', iid=str(rid_), tags=(tag,), values=(
-                f"№{r['number']}",
+                f"{_rn(r['number'])}",
                 r.get('cat_name', '—'),
                 r.get('floor', 1),
                 STATUS_UA.get(st, st),
@@ -13770,12 +13828,12 @@ class RoomsFrame(tk.Frame):
                     if row_s: active_bk=dict(zip(cols_s,row_s))
         except Exception: pass
 
-        win=dlg_win(self,f"🛏 Номер №{room['number']}","400x380")
+        win=dlg_win(self,f"🛏 Номер {_rn(room['number'])}","400x380")
         scroll=ctk.CTkScrollableFrame(win,fg_color=C['bg'])
         scroll.pack(fill='both',expand=True,padx=10,pady=10)
 
         hdr=card(scroll); hdr.pack(fill='x',pady=5)
-        lbl(hdr,f"№{room['number']} — {room.get('cat_name','')}",14,True,C['accent']).pack(anchor='w',padx=12,pady=(10,3))
+        lbl(hdr,f"{_rn(room['number'])} — {room.get('cat_name','')}",14,True,C['accent']).pack(anchor='w',padx=12,pady=(10,3))
         st_color = STATUS_COLOR.get(cur, C['gray'])
         lbl(hdr,f"● {STATUS_UA.get(cur,cur)}",12,color=st_color).pack(anchor='w',padx=12,pady=(0,4))
         if active_bk:
@@ -13807,7 +13865,7 @@ class RoomsFrame(tk.Frame):
             if not active_bk or active_bk.get('status')!='checkedin':
                 messagebox.showwarning("","Немає активного заселення"); return
             if not messagebox.askyesno("Виселити?",
-                f"Виселити {active_bk.get('guest_name','')} з №{room['number']}?"): return
+                f"Виселити {active_bk.get('guest_name','')} з {_rn(room['number'])}?"): return
             try:
                 query("UPDATE bookings SET status='checkedout' WHERE id=%s",(active_bk['id'],),fetch=None)
                 _mark_booking_event_time(active_bk['id'], 'виселення')
@@ -13918,9 +13976,9 @@ class RoomsFrame(tk.Frame):
         from app.utils.db import query
         import os,json,datetime as _dt
         rooms=get_rooms() or []
-        all_labels=[f"№{r['number']} — {r.get('cat_name','')} ({STATUS_UA.get(r.get('status',''),'')})"
+        all_labels=[f"{_rn(r['number'])} — {r.get('cat_name','')} ({STATUS_UA.get(r.get('status',''),'')})"
                     for r in rooms]
-        room_map={f"№{r['number']} — {r.get('cat_name','')} ({STATUS_UA.get(r.get('status',''),'')})": r
+        room_map={f"{_rn(r['number'])} — {r.get('cat_name','')} ({STATUS_UA.get(r.get('status',''),'')})": r
                   for r in rooms}
         win=dlg_win(self,"🧹 Прибирання","480x500")
         scroll=ctk.CTkScrollableFrame(win,fg_color=C['bg'])
@@ -13974,7 +14032,7 @@ class RoomsFrame(tk.Frame):
                         'finished':e_end.get().strip() or '—',
                         'new_status':sv.get(),'note':e_note.get().strip(),
                         'logged_at':_dt.datetime.now().strftime('%d.%m.%Y %H:%M:%S')})
-            messagebox.showinfo("✅",f"Зафіксовано!\n№{room['number']} → {STATUS_UA.get(sv.get(),sv.get())}")
+            messagebox.showinfo("✅",f"Зафіксовано!\n{_rn(room['number'])} → {STATUS_UA.get(sv.get(),sv.get())}")
             win.destroy(); self._rebuild()
         bf=ctk.CTkFrame(scroll,fg_color='transparent'); bf.pack(fill='x',pady=8)
         btn(bf,"💾 Зберегти",save,C['green'],200,height=42).pack(side='left',padx=5)
@@ -14261,7 +14319,7 @@ def _open_checkout_dlg(parent, bid, on_close=None):
     main.pack(fill='both', expand=True, padx=10, pady=10)
 
     hdr = card(main); hdr.pack(fill='x', pady=(0,6))
-    lbl(hdr, f"🚪  Виселення — №{b['room_number']}", 15, True, C['yellow']).pack(anchor='w', padx=12, pady=(10,3))
+    lbl(hdr, f"🚪  Виселення — {_rn(b['room_number'])}", 15, True, C['yellow']).pack(anchor='w', padx=12, pady=(10,3))
     lbl(hdr, f"👤 {b.get('guest_name','')}   📞 {b.get('phone','')}", 12).pack(anchor='w', padx=12, pady=(0,3))
     lbl(hdr, f"📅 {checkin_date} → план. {b['check_out']}", 11, color=C['text2']).pack(anchor='w', padx=12, pady=(0,8))
 
@@ -14443,7 +14501,7 @@ def _open_checkout_dlg(parent, bid, on_close=None):
             f"  🚪 ЧЕК ВИСЕЛЕННЯ",
             f"{'─'*52}",
             f"  Гість    : {b.get('guest_name','')}",
-            f"  Номер    : №{b['room_number']}",
+            f"  Номер    : {_rn(b['room_number'])}",
             f"  Заїзд    : {checkin_date}",
             f"  Виїзд    : {actual_checkout}",
             f"  {unit_label_full.capitalize()} : {n} з {(f'{booked_units:.1f}' if is_hourly_booking else str(int(booked_units)))} заброньованих",
@@ -14558,7 +14616,7 @@ def _open_checkin_existing(parent, b, room, on_save=None):
     sc.bind('<Configure>', lambda e: canvas_.configure(scrollregion=canvas_.bbox('all')))
 
     hdr = card(sc); hdr.pack(fill='x', padx=12, pady=(10,5))
-    lbl(hdr, f"✅  Заселення — Номер №{room['number']}", 15, True, C['green']).pack(anchor='w', padx=12, pady=(10,3))
+    lbl(hdr, f"✅  Заселення — Номер {_rn(room['number'])}", 15, True, C['green']).pack(anchor='w', padx=12, pady=(10,3))
     lbl(hdr, f"👤 {b.get('guest_name','')}   📞 {b.get('phone','')}", 12).pack(anchor='w', padx=12, pady=2)
     lbl(hdr, f"📅 {b['check_in']} → {b['check_out']}  ({nights} ніч)", 11, color=C['text2']).pack(anchor='w', padx=12, pady=(0,10))
 
@@ -14802,7 +14860,7 @@ def _open_checkin_existing(parent, b, room, on_save=None):
         if passport_info:
             lines.append(f"  Паспорт : {passport_info}")
         lines += [
-            f"  Номер   : №{room['number']}  ({room.get('cat_name','—')})",
+            f"  Номер   : {_rn(room['number'])}  ({room.get('cat_name','—')})",
             f"  Заїзд   : {b['check_in']}",
             f"  Виїзд   : {b['check_out']}",
             f"  Ночей   : {nights}",
@@ -15342,7 +15400,7 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
 
     # Заголовок
     hdr = card(sc); hdr.pack(fill='x', padx=12, pady=(10,5))
-    lbl(hdr, f"✅  Заселення — Номер №{room['number']}", 15, True, C['green']).pack(anchor='w', padx=12, pady=(10,3))
+    lbl(hdr, f"✅  Заселення — Номер {_rn(room['number'])}", 15, True, C['green']).pack(anchor='w', padx=12, pady=(10,3))
     lbl(hdr, f"🏷 {room.get('cat_name','')}  |  💰 {float(room.get('base_price',0)):.0f}₴/ніч",
         11, color=C['text2']).pack(anchor='w', padx=12, pady=(0,10))
 
@@ -15770,7 +15828,7 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
         if passport_info.strip():
             lines.append(f"  Паспорт : {passport_info}")
         lines += [
-            f"  Номер   : №{room['number']}  ({room.get('cat_name','—')})",
+            f"  Номер   : {_rn(room['number'])}  ({room.get('cat_name','—')})",
             f"  Заїзд   : {ci}",
             f"  Виїзд   : {co}",
             f"  Ночей   : {nights}",
@@ -16456,7 +16514,7 @@ class ChessFrame(tk.Frame):
                     _nm = (_b.get('guest_name') or '—').split()[0]
                     _ch = tk.Frame(cf, bg=_bc, padx=5, pady=2)
                     _ch.pack(side='left', padx=2, pady=2)
-                    tk.Label(_ch, text=f"№{_b.get('room_number','?')} {_nm} {_bt}",
+                    tk.Label(_ch, text=f"{_rn(_b.get('room_number','?'))} {_nm} {_bt}",
                              bg=_bc, fg='white', font=('Segoe UI', 9, 'bold')).pack()
                 if len(_overdue_chess) > 12:
                     tk.Label(cf, text=f"  +{len(_overdue_chess)-12} ще",
@@ -16480,7 +16538,7 @@ class ChessFrame(tk.Frame):
             left.create_rectangle(0,y,LW,y+CH,fill=C['card'],outline=C['border'])
             left.create_rectangle(2,y+2,7,y+CH-2,fill=STATUS_COLOR.get(room['status'],C['gray']),outline='')
             left.create_text(10,y+CH//2,
-                text=f"№{room['number']}  {(room.get('cat_name') or '')}",
+                text=f"{_rn(room['number'])}  {(room.get('cat_name') or '')}",
                 fill=C['text'],font=('Segoe UI',10,'bold'),anchor='w')
             for i in range(days_snap):
                 x=i*CW
@@ -16625,11 +16683,11 @@ class ChessFrame(tk.Frame):
     def _room_status_dlg(self, room):
         """Діалог зміни статусу номера."""
         from app.utils.db import query
-        win = dlg_win(self, f"Статус номера №{room['number']}", "380x320")
+        win = dlg_win(self, f"Статус номера {_rn(room['number'])}", "380x320")
         scroll = ctk.CTkScrollableFrame(win, fg_color=C['bg'])
         scroll.pack(fill='both', expand=True, padx=10, pady=10)
         f = card(scroll); f.pack(fill='x', pady=5)
-        lbl(f, f"№{room['number']} — {room.get('cat_name','')}", 14, True, C['accent']).pack(pady=(12,5))
+        lbl(f, f"{_rn(room['number'])} — {room.get('cat_name','')}", 14, True, C['accent']).pack(pady=(12,5))
         lbl(f, f"Поточний: {STATUS_UA.get(room['status'],'')}", 12, color=C['text2']).pack(pady=(0,10))
 
         sv = ctk.StringVar(value=room['status'])
@@ -16830,7 +16888,7 @@ class ChessFrame(tk.Frame):
                             return
             except Exception:
                 pass
-            messagebox.showinfo("ℹ️", f"Номер №{room['number']} заселений, але бронювання не знайдено.")
+            messagebox.showinfo("ℹ️", f"Номер {_rn(room['number'])} заселений, але бронювання не знайдено.")
             return
 
         # Зайнятий / заселений — шукаємо активне бронювання і відкриваємо дію
@@ -16887,15 +16945,15 @@ class ChessFrame(tk.Frame):
         if st not in ('free', 'confirmed', None, '') and not _occ_future:
             if not messagebox.askyesno(
                 "Номер недоступний",
-                f"Номер №{room['number']} має статус '{STATUS_UA.get(st, st)}'.\n"
+                f"Номер {_rn(room['number'])} має статус '{STATUS_UA.get(st, st)}'.\n"
                 "Все одно створити бронювання?"):
                 return
 
-        win = dlg_win(self, f"Номер №{room['number']} — {click_date.strftime('%d.%m.%Y')}", "400x400")
+        win = dlg_win(self, f"Номер {_rn(room['number'])} — {click_date.strftime('%d.%m.%Y')}", "400x400")
         scroll = ctk.CTkScrollableFrame(win, fg_color=C['bg'])
         scroll.pack(fill='both', expand=True, padx=10, pady=10)
         f = card(scroll); f.pack(fill='x', pady=5)
-        lbl(f, f"🛏 №{room['number']} — {room.get('cat_name','')}", 14, True, C['accent']).pack(pady=(12,3))
+        lbl(f, f"🛏 {_rn(room['number'])} — {room.get('cat_name','')}", 14, True, C['accent']).pack(pady=(12,3))
         lbl(f, f"📅 {click_date.strftime('%d.%m.%Y')}", 12, color=C['text2']).pack(pady=(0,12))
 
         # Перевірити чи є активне бронювання для виселення
@@ -17070,7 +17128,7 @@ def _open_relocate_dlg(parent, bid, on_done=None, user=None):
         reason = e_reason.get().strip()
         if reason.startswith("Наприклад"): reason = ""
         if not messagebox.askyesno("Переселити?",
-                f"Переселити {b.get('guest_name','')}\nз №{old_num} у №{it['number']}?"):
+                f"Переселити {b.get('guest_name','')}\nз №{old_num} у {_rn(it['number'])}?"):
             return
         try:
             who = (user or {}).get('full_name') or (user or {}).get('username') or ''
@@ -17098,17 +17156,17 @@ def _open_relocate_dlg(parent, bid, on_done=None, user=None):
             try:
                 _r = query("SELECT notes FROM bookings WHERE id=%s", (bid,), fetch='one') or {}
                 _n = (_r.get('notes') or '').strip()
-                _n = (_n + '  ' if _n else '') + f"Переселення: №{old_num}→№{it['number']} [{now.strftime('%Y-%m-%d %H:%M')}]"
+                _n = (_n + '  ' if _n else '') + f"Переселення: №{old_num}→{_rn(it['number'])} [{now.strftime('%Y-%m-%d %H:%M')}]"
                 query("UPDATE bookings SET notes=%s WHERE id=%s", (_n, bid), fetch=None)
             except Exception as _en:
                 log_error("relocate_notes", _en)
             try: _invalidate_rooms_cache()
             except Exception: pass
-            log_info(f"[Переселення] бронювання #{bid}: №{old_num} → №{it['number']} ({reason}) {who}")
+            log_info(f"[Переселення] бронювання #{bid}: №{old_num} → {_rn(it['number'])} ({reason}) {who}")
         except Exception as _e:
             log_error("relocate", _e)
             messagebox.showerror("Помилка", str(_e)); return
-        messagebox.showinfo("✅", f"Гостя переселено: №{old_num} → №{it['number']}")
+        messagebox.showinfo("✅", f"Гостя переселено: №{old_num} → {_rn(it['number'])}")
         win.destroy()
         if on_done: on_done()
 
@@ -17843,7 +17901,7 @@ class CheckedinFrame(tk.Frame):
         main = tk.Frame(win, bg=C['bg']); main.pack(fill='both',expand=True,padx=15,pady=15)
 
         hdr = card(main); hdr.pack(fill='x', pady=(0,8))
-        lbl(hdr,f"🚪  Виселення — №{b['room_number']}",15,True,C['yellow']).pack(anchor='w',padx=12,pady=(10,3))
+        lbl(hdr,f"🚪  Виселення — {_rn(b['room_number'])}",15,True,C['yellow']).pack(anchor='w',padx=12,pady=(10,3))
         lbl(hdr,f"👤 {b.get('guest_name','')}   📞 {b.get('phone','')}",12).pack(anchor='w',padx=12,pady=(0,10))
 
         # Фінансовий підсумок
@@ -17893,7 +17951,7 @@ class CheckedinFrame(tk.Frame):
                 f"  🚪 ЧЕК ВИСЕЛЕННЯ",
                 f"{'─'*52}",
                 f"  Гість   : {b.get('guest_name','')}",
-                f"  Номер   : №{b['room_number']}",
+                f"  Номер   : {_rn(b['room_number'])}",
                 f"  Заїзд   : {b['check_in']}",
                 f"  Виїзд   : {b['check_out']}",
                 f"  Ночей   : {nights}",
@@ -18690,7 +18748,7 @@ class BookingsFrame(tk.Frame):
 
         # Заголовок
         hdr = card(sc); hdr.pack(fill='x',padx=12,pady=(10,5))
-        lbl(hdr,f"✅  Заселення — №{b['room_number']}",15,True,C['green']).pack(anchor='w',padx=12,pady=(10,3))
+        lbl(hdr,f"✅  Заселення — {_rn(b['room_number'])}",15,True,C['green']).pack(anchor='w',padx=12,pady=(10,3))
         lbl(hdr,f"👤 {b.get('guest_name','')}   📞 {b.get('phone','')}",12).pack(anchor='w',padx=12,pady=2)
         _cn_h = (b.get('cat_name') or '').lower()
         _is_h = any(k in _cn_h for k in ['баня','бані','sauna','альтанк','бесідк','gazebo'])
@@ -18871,7 +18929,7 @@ class BookingsFrame(tk.Frame):
             if passport_info.strip():
                 lines.append(f"  Паспорт : {passport_info}")
             lines += [
-                f"  Номер   : №{b['room_number']}  ({b.get('cat_name','—')})",
+                f"  Номер   : {_rn(b['room_number'])}  ({b.get('cat_name','—')})",
                 f"  Заїзд   : {b['check_in']}",
                 f"  Виїзд   : {b['check_out']}",
                 f"  Ночей   : {nights}",
@@ -18942,7 +19000,7 @@ class BookingDlg(ctk.CTkToplevel):
         self.room_map={}
         for r in rooms:
             r['base_price'] = _room_night_price(r)   # ціна — з категорій цін
-            k=f"№{r['number']} — {r.get('cat_name','') or ''} ({r.get('base_price') or 0}₴/ніч)"
+            k=f"{_rn(r['number'])} — {r.get('cat_name','') or ''} ({r.get('base_price') or 0}₴/ніч)"
             self.room_map[k]=r
         f=row_frm(b2)
         ctk.CTkLabel(f,text="Номер *",font=('Segoe UI',11),text_color=C['text2'],width=120,anchor='w').pack(side='left')
@@ -24502,7 +24560,7 @@ class RestaurantFrame(tk.Frame):
                 f"  🍽  ЧЕК РЕСТОРАНУ / БАРУ",
                 f"{'─'*48}",
                 f"  Замовлення : #{self.cur_order}",
-                f"  Номер      : №{room_num}  ({guest_name})",
+                f"  Номер      : {_rn(room_num)}  ({guest_name})",
                 f"  Дата/час   : {now_str}",
                 f"  Адмін.     : {admin_name}",
                 f"  Зміна з    : {shift_str}",
@@ -24517,7 +24575,7 @@ class RestaurantFrame(tk.Frame):
             lines += [
                 f"{'─'*48}",
                 f"  РАЗОМ      : {rest_total:.0f}₴",
-                f"  Оплата     : Нараховано на номер №{room_num}",
+                f"  Оплата     : Нараховано на номер {_rn(room_num)}",
                 f"{'─'*48}",
                 f"  Дякуємо за замовлення!",
             ]
@@ -26924,7 +26982,7 @@ def _open_extend_room_dlg(parent, bid, on_save=None):
     sc = tk.Frame(win, bg=C['bg']); sc.pack(fill='both', expand=True, padx=20, pady=15)
 
     hdr = card(sc); hdr.pack(fill='x', pady=(0,10))
-    lbl(hdr, f"📅  Продовжити — №{b.get('room_number','')}", 15, True, C['green']).pack(anchor='w', padx=12, pady=(10,3))
+    lbl(hdr, f"📅  Продовжити — {_rn(b.get('room_number',''))}", 15, True, C['green']).pack(anchor='w', padx=12, pady=(10,3))
     lbl(hdr, f"👤 {b.get('guest_name','')}  |  Виїзд: {b['check_out']}  |  {price:.0f}₴/ніч", 11, color=C['text2']).pack(anchor='w', padx=12, pady=(0,10))
 
     p_card = card(sc); p_card.pack(fill='x', pady=5)
@@ -33115,9 +33173,9 @@ class SettingsFrame(tk.Frame):
         rooms = get_rooms() or []
         # Показати тільки номери зі статусом cleaning або всі
         cleaning_rooms = [r for r in rooms if r.get('status')=='cleaning']
-        all_labels = [f"№{r['number']} — {r.get('cat_name','')} ({STATUS_UA.get(r.get('status',''),'')})"
+        all_labels = [f"{_rn(r['number'])} — {r.get('cat_name','')} ({STATUS_UA.get(r.get('status',''),'')})"
                       for r in rooms]
-        room_map = {f"№{r['number']} — {r.get('cat_name','')} ({STATUS_UA.get(r.get('status',''),'')})": r
+        room_map = {f"{_rn(r['number'])} — {r.get('cat_name','')} ({STATUS_UA.get(r.get('status',''),'')})": r
                     for r in rooms}
 
         win = dlg_win(self, "🧹 Прибирання номера", "480x520")
@@ -33194,7 +33252,7 @@ class SettingsFrame(tk.Frame):
                 'logged_at': _dt.datetime.now().strftime('%d.%m.%Y %H:%M:%S'),
             })
             messagebox.showinfo("✅",
-                f"Прибирання зафіксовано!\n"                f"Номер №{room['number']} → {STATUS_UA.get(sv.get(),sv.get())}")
+                f"Прибирання зафіксовано!\n"                f"Номер {_rn(room['number'])} → {STATUS_UA.get(sv.get(),sv.get())}")
             win.destroy()
             self._load_rooms(); self._load_cleaning_log()
 
@@ -34582,10 +34640,18 @@ class SettingsFrame(tk.Frame):
                             _c.commit()
                         except Exception:
                             _c.rollback()
+                        _seen_import = set()   # дублі всередині самого файлу не імпортуємо двічі
                         for r in real_rows:
                             name=str(r[0]).strip() if r else ''
                             if not name: skipped+=1; continue
                             name=_fix_mojibake(name)  # виправляємо кракозябри, якщо файл прочитано не тим кодуванням
+                            try:
+                                _dk = (name.strip().lower(), str(r[2]).strip() if len(r)>2 else '', str(r[3]).strip().lower() if len(r)>3 else '')
+                            except Exception:
+                                _dk = (name.strip().lower(), '', '')
+                            if _dk in _seen_import:
+                                skipped += 1; continue
+                            _seen_import.add(_dk)
                             try:
                                 raw=str(r[2]).replace(',','.').replace('₴','').strip() if len(r)>2 else '0'
                                 price=float(raw) if raw else 0.0
@@ -35654,6 +35720,7 @@ class SettingsFrame(tk.Frame):
         btn(cl_bf, "🔗 Тест хмари", self._test_cloud_db, C['green'], 130).pack(side='left', padx=4)
         btn(cl_bf, "📦 Ініціалізувати хмару", self._init_cloud_db, C['yellow'], 190).pack(side='left', padx=4)
         btn(cl_bf, "🔄 Оновити довідники в хмарі", self._push_cloud_refs, '#3498db', 220).pack(side='left', padx=4)
+        btn(cl_bf, "🧹 Очистити хмару від видаленого меню", self._prune_cloud_menu, C['card2'], 290).pack(side='left', padx=4)
 
         # ── Інтервал фонової синхронізації довідників у хмару ──────────────
         try:
@@ -36032,6 +36099,33 @@ class SettingsFrame(tk.Frame):
                     clr = C['green']
                 else:
                     txt, clr = "✗ Хмара недоступна або не налаштована", C['red']
+            except Exception as _e:
+                txt, clr = f"✗ {_e}", C['red']
+            def _apply():
+                try: self.cloud_info.configure(text=txt, text_color=clr)
+                except Exception: pass
+            try: self.after(0, _apply)
+            except Exception: pass
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _prune_cloud_menu(self):
+        """Одноразове очищення: видаляє з ХМАРНОЇ копії позиції меню, яких немає на
+        основному сервері (ті, що видаляли раніше, а вони «воскресали» при аварійному
+        перемиканні). Нові видалення далі відстежуються автоматично (журнал видалень)."""
+        if not messagebox.askyesno("Очистити хмару",
+                "Видалити з ХМАРНОЇ копії меню позиції, яких вже немає на основному сервері?\n\n"
+                "Це прибере «воскреслі» дублікати. Основну базу не змінює.\n"
+                "Виконуйте, коли програма працює на основному сервері."):
+            return
+        self.cloud_info.configure(text="⏳ Очищую хмару…", text_color=C['yellow'])
+        def _bg():
+            try:
+                from app.utils.db import prune_cloud_missing
+                res = prune_cloud_missing(('services',))
+                if 'error' in res:
+                    txt, clr = f"✗ {res['error']}", C['red']
+                else:
+                    txt, clr = f"✓ З хмари видалено позицій меню: {res.get('services', 0)}", C['green']
             except Exception as _e:
                 txt, clr = f"✗ {_e}", C['red']
             def _apply():
