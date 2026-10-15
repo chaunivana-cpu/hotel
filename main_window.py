@@ -8118,6 +8118,7 @@ _NAV_ITEMS = [
     ("📈","Звіти","reports"),
     ("👥","Відвідувачі","visitors"),
     ("📒","База гостей","guestdb"),
+    ("💬","Чат","chat"),
     ("⚙️","Налаштування","settings"),
 ]
 _NAV_ICON_COLORS = {
@@ -8137,6 +8138,7 @@ _NAV_ICON_COLORS = {
     "reports":    "#5B9BD5",
     "visitors":   "#B07EE0",
     "guestdb":    "#5FA8D3",
+    "chat":       "#4FC3F7",
     "settings":   "#9AA5B1",
 }
 
@@ -9143,6 +9145,381 @@ _NAV_ICONS_3D_B64 = {
 }
 
 
+# ══════════════════════════════════════════════════════
+# ЧАТ МІЖ КОРИСТУВАЧАМИ (загальний канал + особисті повідомлення)
+# Дані зберігаються в БД готелю (PostgreSQL) — таблиці chat_messages / chat_reads.
+# ══════════════════════════════════════════════════════
+_CHAT_TABLES_OK = False
+
+def _chat_ensure_tables():
+    """Створює таблиці чату (один раз за запуск). Повертає True, якщо все готово."""
+    global _CHAT_TABLES_OK
+    if _CHAT_TABLES_OK:
+        return True
+    try:
+        if not _sync_mgr.is_online():
+            return False
+    except Exception:
+        pass
+    try:
+        from app.utils.db import query as _cq
+        _cq("""CREATE TABLE IF NOT EXISTS chat_messages (
+            id SERIAL PRIMARY KEY,
+            sender VARCHAR(100) NOT NULL,
+            sender_name VARCHAR(200),
+            recipient VARCHAR(100),
+            body TEXT NOT NULL,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )""", fetch=None)
+        _cq("CREATE INDEX IF NOT EXISTS idx_chat_msg_recip ON chat_messages(recipient, id)", fetch=None)
+        _cq("""CREATE TABLE IF NOT EXISTS chat_reads (
+            username VARCHAR(100) NOT NULL,
+            peer VARCHAR(100) NOT NULL,
+            last_id INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (username, peer)
+        )""", fetch=None)
+        _CHAT_TABLES_OK = True
+        return True
+    except Exception as _e:
+        log_error("chat: ensure tables", _e)
+        return False
+
+def chat_init_user(me):
+    """Перший вхід у чат: стара історія загального каналу не вважається непрочитаною."""
+    try:
+        from app.utils.db import query as _cq
+        _cq("""INSERT INTO chat_reads (username, peer, last_id)
+               SELECT %s, '*', COALESCE(MAX(id), 0) FROM chat_messages
+               ON CONFLICT (username, peer) DO NOTHING""", (me,), fetch=None)
+    except Exception as _e:
+        log_error("chat_init_user", _e)
+
+def chat_users(me):
+    from app.utils.db import query as _cq
+    return _cq("""SELECT username, COALESCE(NULLIF(full_name,''), username) AS full_name, role
+                  FROM users WHERE active=TRUE AND username<>%s
+                  ORDER BY COALESCE(NULLIF(full_name,''), username)""",
+               (me,), fetch='all') or []
+
+def chat_send(me, me_name, peer, body):
+    """peer='*' — загальний чат. Повертає id повідомлення."""
+    from app.utils.db import query as _cq
+    rcp = None if peer == '*' else peer
+    r = _cq("""INSERT INTO chat_messages (sender, sender_name, recipient, body)
+               VALUES (%s,%s,%s,%s) RETURNING id""",
+            (me, me_name, rcp, body[:2000]), fetch='one') or {}
+    return r.get('id')
+
+def chat_fetch(me, peer, after_id=0, limit=200):
+    from app.utils.db import query as _cq
+    if peer == '*':
+        where, args = "recipient IS NULL", []
+    else:
+        where = "((sender=%s AND recipient=%s) OR (sender=%s AND recipient=%s))"
+        args = [me, peer, peer, me]
+    if after_id:
+        rows = _cq(f"""SELECT id, sender, sender_name, recipient, body, created_at
+                       FROM chat_messages WHERE {where} AND id > %s ORDER BY id ASC""",
+                   tuple(args + [after_id]), fetch='all') or []
+        return rows
+    rows = _cq(f"""SELECT id, sender, sender_name, recipient, body, created_at
+                   FROM chat_messages WHERE {where} ORDER BY id DESC LIMIT %s""",
+               tuple(args + [limit]), fetch='all') or []
+    return list(reversed(rows))
+
+def chat_unread(me):
+    """[{peer, cnt, max_id}] — непрочитані по співрозмовниках ('*' = загальний чат)."""
+    from app.utils.db import query as _cq
+    return _cq("""
+        SELECT u.peer, COUNT(*) AS cnt, MAX(u.id) AS max_id
+        FROM (SELECT m.id,
+                     CASE WHEN m.recipient IS NULL THEN '*' ELSE m.sender END AS peer
+              FROM chat_messages m
+              WHERE m.sender <> %s AND (m.recipient IS NULL OR m.recipient = %s)) u
+        LEFT JOIN chat_reads r ON r.username = %s AND r.peer = u.peer
+        WHERE u.id > COALESCE(r.last_id, 0)
+        GROUP BY u.peer""", (me, me, me), fetch='all') or []
+
+def chat_mark_read(me, peer, last_id):
+    from app.utils.db import query as _cq
+    _cq("""INSERT INTO chat_reads (username, peer, last_id) VALUES (%s,%s,%s)
+           ON CONFLICT (username, peer)
+           DO UPDATE SET last_id = GREATEST(chat_reads.last_id, EXCLUDED.last_id)""",
+        (me, peer, int(last_id or 0)), fetch=None)
+
+def chat_message_by_id(msg_id):
+    from app.utils.db import query as _cq
+    return _cq("SELECT sender_name, sender, body FROM chat_messages WHERE id=%s",
+               (msg_id,), fetch='one') or {}
+
+
+class ChatFrame(tk.Frame):
+    """Вкладка «Чат»: ліворуч — «Загальний чат» і список користувачів
+    (з лічильниками непрочитаних), праворуч — переписка й поле вводу."""
+    POLL_MS = 2500
+
+    def __init__(self, parent, user):
+        super().__init__(parent, bg=C['bg'])
+        self.user = user
+        self.me = user.get('username', '')
+        self.me_name = user.get('full_name') or self.me
+        self.peer = '*'
+        self._last_id = 0
+        self._last_day = None
+        self._busy = False
+        self._unread = {}
+        self._users = []
+        self._list_sig = None
+        self._row_widgets = {}
+        self._build()
+        threading.Thread(target=self._bootstrap, daemon=True).start()
+        self.after(self.POLL_MS, self._tick)
+
+    # ── UI ────────────────────────────────────────────────────────────────
+    def _build(self):
+        hdr = tk.Frame(self, bg=C['bg']); hdr.pack(fill='x', padx=20, pady=(16, 8))
+        tk.Label(hdr, text="💬  Чат", font=('Segoe UI', 20, 'bold'),
+                 bg=C['bg'], fg=C['text']).pack(side='left')
+        self.status_lbl = tk.Label(hdr, text="", font=('Segoe UI', 10),
+                                   bg=C['bg'], fg=C['text2'])
+        self.status_lbl.pack(side='right')
+
+        body = tk.Frame(self, bg=C['bg']); body.pack(fill='both', expand=True, padx=20, pady=(0, 16))
+        left = tk.Frame(body, bg=C['card'], width=260)
+        left.pack(side='left', fill='y'); left.pack_propagate(False)
+        tk.Label(left, text="Розмови", font=('Segoe UI', 11, 'bold'),
+                 bg=C['card'], fg=C['text2']).pack(anchor='w', padx=14, pady=(12, 6))
+        self.list_frame = ctk.CTkScrollableFrame(left, fg_color=C['card'],
+                                                 scrollbar_button_color=C['card2'])
+        self.list_frame.pack(fill='both', expand=True, padx=4, pady=(0, 8))
+
+        right = tk.Frame(body, bg=C['card']); right.pack(side='left', fill='both', expand=True, padx=(12, 0))
+        self.title_lbl = tk.Label(right, text="Загальний чат", font=('Segoe UI', 14, 'bold'),
+                                  bg=C['card'], fg=C['text'], anchor='w')
+        self.title_lbl.pack(fill='x', padx=16, pady=(12, 8))
+
+        mid = tk.Frame(right, bg=C['card']); mid.pack(fill='both', expand=True, padx=12)
+        self.txt = tk.Text(mid, bg=C['bg'], fg=C['text'], font=('Segoe UI', 11), wrap='word',
+                           relief='flat', bd=0, padx=10, pady=8, state='disabled',
+                           cursor='arrow', highlightthickness=0)
+        sb = tk.Scrollbar(mid, command=self.txt.yview)
+        self.txt.configure(yscrollcommand=sb.set)
+        sb.pack(side='right', fill='y'); self.txt.pack(side='left', fill='both', expand=True)
+        t = self.txt
+        t.tag_configure('day', justify='center', foreground=C['text2'], font=('Segoe UI', 9, 'bold'),
+                        spacing1=8, spacing3=6)
+        t.tag_configure('me_h', justify='right', foreground=C['text2'], font=('Segoe UI', 9),
+                        lmargin1=140, lmargin2=140, rmargin=12)
+        t.tag_configure('me_b', justify='right', background='#2f5fa8', foreground='white',
+                        lmargin1=140, lmargin2=140, rmargin=12)
+        t.tag_configure('ot_h', justify='left', foreground=C['accent'], font=('Segoe UI', 9, 'bold'),
+                        lmargin1=12, lmargin2=12, rmargin=140)
+        t.tag_configure('ot_b', justify='left', background=C['card2'], foreground=C['text'],
+                        lmargin1=12, lmargin2=12, rmargin=140)
+        t.tag_configure('gap', font=('Segoe UI', 4))
+
+        inp = tk.Frame(right, bg=C['card']); inp.pack(fill='x', padx=12, pady=12)
+        self.inp = tk.Text(inp, height=3, bg=C['card2'], fg=C['text'], insertbackground=C['text'],
+                           font=('Segoe UI', 11), wrap='word', relief='flat', bd=0, padx=10, pady=8)
+        self.inp.pack(side='left', fill='x', expand=True)
+        self.inp.bind('<Return>', self._on_enter)
+        self.inp.bind('<Shift-Return>', lambda e: None)
+        ctk.CTkButton(inp, text="Надіслати ➤", width=120, height=40, fg_color=C['accent'],
+                      command=self._send).pack(side='left', padx=(10, 0))
+        tk.Label(right, text="Enter — надіслати  ·  Shift+Enter — новий рядок",
+                 font=('Segoe UI', 9), bg=C['card'], fg=C['text2']).pack(anchor='w', padx=16, pady=(0, 8))
+
+    def _on_enter(self, e):
+        self._send()
+        return 'break'
+
+    # ── Список розмов ─────────────────────────────────────────────────────
+    def _convs(self):
+        return [('*', "📢  Загальний чат", "для всіх")] + [
+            (u['username'], f"👤  {u['full_name']}", u.get('role') or '') for u in self._users]
+
+    def _render_list(self, force=False):
+        convs = self._convs()
+        sig = (tuple((k, n) for k, n, _ in convs), self.peer,
+               tuple(sorted((k, v) for k, v in self._unread.items() if k != self.peer)))
+        if sig == self._list_sig and not force:
+            return
+        self._list_sig = sig
+        for w in self.list_frame.winfo_children():
+            try: w.destroy()
+            except Exception: pass
+        for key, name, sub in convs:
+            sel = (key == self.peer)
+            bg = C['accent'] if sel else C['card']
+            row = tk.Frame(self.list_frame, bg=bg, cursor='hand2')
+            row.pack(fill='x', padx=4, pady=2)
+            l1 = tk.Label(row, text=name, font=('Segoe UI', 11, 'bold' if sel else 'normal'),
+                          bg=bg, fg='white' if sel else C['text'], anchor='w')
+            l1.pack(side='left', fill='x', expand=True, padx=(10, 4), pady=8)
+            n = self._unread.get(key, 0) if key != self.peer else 0
+            if n:
+                tk.Label(row, text=f" {n} ", font=('Segoe UI', 9, 'bold'),
+                         bg=C['red'], fg='white').pack(side='right', padx=8)
+            for w in (row, l1):
+                w.bind('<Button-1>', lambda e, k=key: self._open_peer(k))
+
+    # ── Фонові запити ─────────────────────────────────────────────────────
+    def _bootstrap(self):
+        try:
+            ok = _chat_ensure_tables()
+            if not ok:
+                self.after(0, lambda: self.status_lbl.configure(text="⚠ Немає зв'язку з сервером"))
+                return
+            chat_init_user(self.me)
+            users = chat_users(self.me)
+            self.after(0, lambda: self._set_users(users))
+        except Exception as e:
+            log_error("ChatFrame bootstrap", e)
+        self.after(0, self._consume_pending_peer)
+        self.after(0, lambda: self._open_peer(self.peer, force=True))
+
+    def _set_users(self, users):
+        self._users = users or []
+        self._render_list(force=True)
+
+    def _consume_pending_peer(self):
+        try:
+            app = self.winfo_toplevel()
+            p = getattr(app, '_chat_pending_peer', None)
+            if p:
+                app._chat_pending_peer = None
+                self.peer = p
+        except Exception:
+            pass
+
+    def _open_peer(self, peer, force=False):
+        if peer == self.peer and not force and self._last_id:
+            return
+        self.peer = peer
+        self._last_id = 0; self._last_day = None
+        name = "Загальний чат" if peer == '*' else next(
+            (u['full_name'] for u in self._users if u['username'] == peer), peer)
+        self.title_lbl.configure(text=name)
+        self.txt.configure(state='normal'); self.txt.delete('1.0', 'end'); self.txt.configure(state='disabled')
+        self._render_list(force=True)
+        self._poll(initial=True)
+        try: self.inp.focus_set()
+        except Exception: pass
+
+    def _tick(self):
+        try:
+            if not self.winfo_exists():
+                return
+            if self.winfo_ismapped():
+                self._poll()
+        except Exception:
+            pass
+        try: self.after(self.POLL_MS, self._tick)
+        except Exception: pass
+
+    def _load_data_async(self):
+        """Викликається при поверненні на вкладку (див. HotelApp._refresh_tab)."""
+        self._consume_pending_peer()
+        def _bg():
+            try:
+                users = chat_users(self.me)
+                self.after(0, lambda: self._set_users(users))
+            except Exception: pass
+        threading.Thread(target=_bg, daemon=True).start()
+        self._open_peer(self.peer, force=True)
+
+    def _poll(self, initial=False):
+        if self._busy:
+            return
+        self._busy = True
+        peer, after_id = self.peer, (0 if initial else self._last_id)
+        def _bg():
+            try:
+                rows = chat_fetch(self.me, peer, after_id)
+                unread = chat_unread(self.me)
+                self.after(0, lambda: self._apply(peer, rows, unread, initial))
+            except Exception as e:
+                log_error("ChatFrame poll", e)
+                try: self.after(0, lambda: self.status_lbl.configure(text="⚠ Немає зв'язку"))
+                except Exception: pass
+            finally:
+                self._busy = False
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _apply(self, peer, rows, unread, initial):
+        try:
+            if not self.winfo_exists() or peer != self.peer:
+                return
+            self.status_lbl.configure(text="")
+            self._unread = {r['peer']: int(r['cnt']) for r in unread}
+            if rows:
+                self._append(rows)
+                self._last_id = max(self._last_id, max(r['id'] for r in rows))
+                if any(r['sender'] != self.me for r in rows):
+                    self._mark_read(peer, self._last_id)
+            elif initial:
+                self._last_id = max(self._last_id, 0)
+            self._unread[peer] = 0
+            self._render_list()
+        except Exception as e:
+            log_error("ChatFrame apply", e)
+
+    def _mark_read(self, peer, last_id):
+        def _bg():
+            try:
+                chat_mark_read(self.me, peer, last_id)
+                app = self.winfo_toplevel()
+                if hasattr(app, '_chat_poll_now'):
+                    app.after(0, app._chat_poll_now)
+            except Exception: pass
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _append(self, rows):
+        t = self.txt
+        at_bottom = t.yview()[1] >= 0.97
+        t.configure(state='normal')
+        for r in rows:
+            dt = r['created_at']
+            try:
+                if getattr(dt, 'tzinfo', None):
+                    dt = dt.astimezone()
+            except Exception:
+                pass
+            day = dt.date()
+            if day != self._last_day:
+                self._last_day = day
+                t.insert('end', f"{day:%d.%m.%Y}\n", 'day')
+            mine = (r['sender'] == self.me)
+            who = "Ви" if mine else (r.get('sender_name') or r['sender'])
+            t.insert('end', f"{who}  {dt:%H:%M}\n", 'me_h' if mine else 'ot_h')
+            t.insert('end', f" {r['body']} \n", 'me_b' if mine else 'ot_b')
+            t.insert('end', "\n", 'gap')
+        t.configure(state='disabled')
+        if at_bottom or self._last_id == 0:
+            t.see('end')
+
+    # ── Надсилання ────────────────────────────────────────────────────────
+    def _send(self):
+        body = self.inp.get('1.0', 'end').strip()
+        if not body:
+            return
+        self.inp.delete('1.0', 'end')
+        peer = self.peer
+        def _bg():
+            try:
+                if not _chat_ensure_tables():
+                    raise RuntimeError("offline")
+                chat_send(self.me, self.me_name, peer, body)
+                self.after(0, lambda: self._poll())
+            except Exception as e:
+                log_error("ChatFrame send", e)
+                def _restore():
+                    self.status_lbl.configure(text="⚠ Не надіслано — перевірте зв'язок")
+                    self.inp.insert('1.0', body)
+                self.after(0, _restore)
+        threading.Thread(target=_bg, daemon=True).start()
+
+
 class NavButton(tk.Frame):
     """Кастомна кнопка лівого меню: іконка окремим (більшим) шрифтом від
     назви пункту. Звичайний CTkButton малює весь текст ОДНИМ шрифтом,
@@ -9173,6 +9550,13 @@ class NavButton(tk.Frame):
         self._name = name
         self._fit_size = 12
         self.text_lbl.bind('<Configure>', self._fit_text, add='+')
+
+    def set_label(self, text):
+        """Змінює підпис (напр. «Чат (3)» з лічильником непрочитаних)."""
+        self._name = text
+        self.text_lbl.configure(text=text)
+        self._fit_size = 12
+        self._fit_text()
 
     def _fit_text(self, e=None):
         """Автопідбір: якщо назва пункту не вміщується по ширині — зменшуємо шрифт
@@ -9242,6 +9626,7 @@ class HotelApp(ctk.CTk):
         зайти тим самим логіном) і зупиняє фонове 'серцебиття'. Викликається
         і при кнопці 'Вийти' (_quit), і при закритті вікна (_on_close)."""
         self._session_heartbeat_running = False
+        self._chat_poller_started = False
         _uname = getattr(self, '_session_username', None)
         if _uname:
             try:
@@ -10271,6 +10656,99 @@ class HotelApp(ctk.CTk):
         self._frame_cache = {}   # key → frame instance
         # Відкласти показ дашборду — вікно намалюється миттєво, вміст підвантажується
         self.after(10, lambda: self._show('dashboard'))
+        self.after(4000, self._start_chat_poller)
+
+    # ── Чат: фонове опитування, лічильник у меню, спливаюче сповіщення ──
+    def _start_chat_poller(self):
+        if getattr(self, '_chat_poller_started', False):
+            return
+        self._chat_poller_started = True
+        self._chat_pending_peer = None
+        self._chat_notified = {}      # peer -> max_id, про який вже сповіщали
+        self._chat_first_poll = True
+        self._chat_unread_total = 0
+        def _loop():
+            import time as _t
+            while getattr(self, '_session_heartbeat_running', True) and getattr(self, '_chat_poller_started', False):
+                self._chat_poll_blocking()
+                _t.sleep(5)
+        threading.Thread(target=_loop, daemon=True).start()
+
+    def _chat_poll_now(self):
+        threading.Thread(target=self._chat_poll_blocking, daemon=True).start()
+
+    def _chat_poll_blocking(self):
+        try:
+            me = self.user.get('username')
+            if not me or not _chat_ensure_tables():
+                return
+            chat_init_user(me)
+            rows = chat_unread(me)
+            info = None
+            newest = None
+            for r in rows:
+                mx = int(r['max_id'])
+                if mx > self._chat_notified.get(r['peer'], 0) and (newest is None or mx > newest[1]):
+                    newest = (r['peer'], mx)
+            if newest and not self._chat_first_poll:
+                m = chat_message_by_id(newest[1])
+                title = m.get('sender_name') or m.get('sender') or 'Повідомлення'
+                if newest[0] == '*':
+                    title += ' · Загальний чат'
+                info = (title, m.get('body') or '', newest[0])
+            first = self._chat_first_poll
+            for r in rows:
+                self._chat_notified[r['peer']] = max(self._chat_notified.get(r['peer'], 0), int(r['max_id']))
+            self._chat_first_poll = False
+            total = sum(int(r['cnt']) for r in rows)
+            self.after(0, lambda: self._chat_apply(total, info, first))
+        except Exception as e:
+            log_error("chat poll", e)
+
+    def _chat_apply(self, total, info, first):
+        try:
+            on_chat = (self.active == 'chat')
+            shown = 0 if on_chat else total
+            if 'chat' in self.nav:
+                self.nav['chat'].set_label(f"Чат ({shown})" if shown else "Чат")
+            if on_chat:
+                return
+            if first and total:
+                self._chat_toast("Чат", f"У вас непрочитаних повідомлень: {total}", None)
+            elif info:
+                self._chat_toast(info[0], info[1], info[2])
+        except Exception as e:
+            log_error("chat apply", e)
+
+    def _chat_toast(self, title, text, peer):
+        try:
+            try:
+                import winsound; winsound.MessageBeep(winsound.MB_ICONASTERISK)
+            except Exception:
+                pass
+            t = tk.Toplevel(self)
+            t.overrideredirect(True)
+            t.attributes('-topmost', True)
+            t.configure(bg=C['accent'])
+            inner = tk.Frame(t, bg=C['card2'], cursor='hand2'); inner.pack(padx=2, pady=2)
+            l1 = tk.Label(inner, text=f"💬 {title}", font=('Segoe UI', 10, 'bold'),
+                          bg=C['card2'], fg=C['text'], anchor='w'); l1.pack(fill='x', padx=12, pady=(8, 0))
+            l2 = tk.Label(inner, text=(text or '')[:140], font=('Segoe UI', 10), wraplength=300,
+                          justify='left', bg=C['card2'], fg=C['text2'], anchor='w')
+            l2.pack(fill='x', padx=12, pady=(2, 8))
+            t.update_idletasks()
+            w, h = t.winfo_reqwidth(), t.winfo_reqheight()
+            t.geometry(f"+{self.winfo_screenwidth() - w - 20}+{self.winfo_screenheight() - h - 70}")
+            def _go(e=None):
+                try: t.destroy()
+                except Exception: pass
+                self._chat_pending_peer = peer
+                self._show('chat')
+            for wdg in (inner, l1, l2):
+                wdg.bind('<Button-1>', _go)
+            t.after(6000, lambda: (t.winfo_exists() and t.destroy()))
+        except Exception as e:
+            log_error("chat toast", e)
 
     def _populate_nav(self):
         """Будує кнопки лівого меню з урахуванням налаштувань видимості (_SIDEBAR_CFG).
@@ -10356,6 +10834,7 @@ class HotelApp(ctk.CTk):
             'reports': ReportsFrame,
             'visitors': VisitorsFrame,
             'guestdb': GuestDatabaseFrame,
+            'chat': ChatFrame,
             'settings': SettingsFrame,
         }
 
