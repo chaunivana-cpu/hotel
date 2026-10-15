@@ -7258,6 +7258,103 @@ def _pg_direct_test(cfg: dict) -> tuple:
         return False, str(_e)
 
 
+# ══════════════════════════════════════════════════════
+# ОДНА АКТИВНА СЕСІЯ НА ЛОГІН (власна таблиця login_sessions в БД готелю).
+# Не залежить від app/utils/db.py. Сесія «живе», поки програма раз на ~20 с
+# оновлює last_seen; якщо 90 с тиші — вважається завислою і її можна перехопити.
+# ══════════════════════════════════════════════════════
+_LS_STALE_SEC = 90
+_LS_STATE = {'username': None, 'token': None}
+_LS_TABLE_OK = False
+
+def _ls_machine_id():
+    import socket, uuid
+    try: host = socket.gethostname()
+    except Exception: host = os.environ.get('COMPUTERNAME', 'ПК')
+    return host, f"{host}-{uuid.getnode()}"
+
+def _ls_ensure_table():
+    global _LS_TABLE_OK
+    if _LS_TABLE_OK:
+        return
+    from app.utils.db import query as _q
+    _q("""CREATE TABLE IF NOT EXISTS login_sessions (
+        username VARCHAR(100) PRIMARY KEY,
+        computer_name VARCHAR(200),
+        machine_id VARCHAR(200),
+        session_token VARCHAR(64),
+        started_at TIMESTAMPTZ DEFAULT NOW(),
+        last_seen TIMESTAMPTZ DEFAULT NOW()
+    )""", fetch=None)
+    _LS_TABLE_OK = True
+
+def _ls_acquire(username):
+    """(True, None) — сесію захоплено; (False, {computer_name, started_at, idle}) — зайнято
+    іншим ПК. Помилка зв'язку з БД → (True, None), щоб не блокувати роботу."""
+    import uuid
+    try:
+        from app.utils.db import query as _q
+        _ls_ensure_table()
+        host, mid = _ls_machine_id()
+        token = uuid.uuid4().hex
+        row = _q("""INSERT INTO login_sessions
+                      (username, computer_name, machine_id, session_token, started_at, last_seen)
+                    VALUES (%s,%s,%s,%s,NOW(),NOW())
+                    ON CONFLICT (username) DO UPDATE SET
+                      computer_name=EXCLUDED.computer_name, machine_id=EXCLUDED.machine_id,
+                      session_token=EXCLUDED.session_token, started_at=NOW(), last_seen=NOW()
+                    WHERE login_sessions.machine_id = EXCLUDED.machine_id
+                       OR login_sessions.last_seen < NOW() - (%s * INTERVAL '1 second')
+                    RETURNING session_token""",
+                 (username, host, mid, token, _LS_STALE_SEC), fetch='one')
+        if row:
+            _LS_STATE['username'] = username
+            _LS_STATE['token'] = token
+            return True, None
+        cur = _q("""SELECT computer_name, started_at,
+                           EXTRACT(EPOCH FROM (NOW()-last_seen)) AS idle
+                    FROM login_sessions WHERE username=%s""", (username,), fetch='one') or {}
+        return False, cur
+    except Exception as e:
+        log_error("login_sessions acquire", e)
+        return True, None
+
+def _ls_heartbeat():
+    """'ok' | 'lost' (сесію перехопив інший ПК) | 'error' (немає зв'язку — не виходимо)."""
+    uname, token = _LS_STATE.get('username'), _LS_STATE.get('token')
+    if not uname or not token:
+        return 'ok', None
+    try:
+        from app.utils.db import query as _q
+        row = _q("UPDATE login_sessions SET last_seen=NOW() WHERE username=%s AND session_token=%s "
+                 "RETURNING session_token", (uname, token), fetch='one')
+        if row:
+            return 'ok', None
+        cur = _q("SELECT computer_name FROM login_sessions WHERE username=%s", (uname,), fetch='one')
+        if cur:
+            return 'lost', cur
+        # запис зник (напр. очистили таблицю) — тихо відновлюємо
+        host, mid = _ls_machine_id()
+        _q("""INSERT INTO login_sessions (username, computer_name, machine_id, session_token)
+              VALUES (%s,%s,%s,%s) ON CONFLICT (username) DO NOTHING""",
+           (uname, host, mid, token), fetch=None)
+        return 'ok', None
+    except Exception:
+        return 'error', None
+
+def _ls_release():
+    uname, token = _LS_STATE.get('username'), _LS_STATE.get('token')
+    if not uname or not token:
+        return
+    try:
+        from app.utils.db import query as _q
+        _q("DELETE FROM login_sessions WHERE username=%s AND session_token=%s",
+           (uname, token), fetch=None)
+    except Exception:
+        pass
+    _LS_STATE['username'] = None; _LS_STATE['token'] = None
+
+
 class SetupWindow(ctk.CTk):
     def __init__(self):
         try: log_info("[STARTUP] SetupWindow.__init__: початок (запуск програми)")
@@ -7793,36 +7890,27 @@ class SetupWindow(ctk.CTk):
     # ── Одна активна сесія на логін (захист від входу з двох комп'ютерів) ──
     def _check_and_lock_session(self, username):
         """True — вхід дозволено (сесію зареєстровано за цим користувачем).
-        False — інший комп'ютер уже працює під цим логіном, вхід треба
-        скасувати (повідомлення користувачу вже показано тут же)."""
+        False — інший комп'ютер уже працює під цим логіном, вхід скасовано
+        (повідомлення користувачу показано тут же)."""
+        ok, info = _ls_acquire(username)
+        if ok:
+            return True
+        info = info or {}
+        _started = info.get('started_at')
         try:
-            import socket
-            computer_name = socket.gethostname()
+            if getattr(_started, 'tzinfo', None):
+                _started = _started.astimezone()
+            _started = f"{_started:%d.%m.%Y %H:%M}" if _started else ''
         except Exception:
-            computer_name = os.environ.get('COMPUTERNAME', 'Невідомий ПК')
-        try:
-            from app.utils.db import check_and_register_session, release_session
-        except Exception:
-            # Стара версія app/utils/db.py без підтримки сесій — не блокуємо.
-            return True
-        conflict = check_and_register_session(username, computer_name)
-        if not conflict:
-            return True
-        if conflict.get('computer_name') == computer_name:
-            # "Чужа" активна сесія насправді з ЦЬОГО Ж комп'ютера — типово
-            # попередній запуск програми завис/впав без нормального виходу
-            # (закрили ноутбук, вимкнули живлення тощо). Перехоплюємо сесію
-            # без питань — вхід не блокуємо.
-            release_session(username)
-            check_and_register_session(username, computer_name)
-            return True
-        _started = conflict.get('started_at')
+            _started = str(_started or '')
         messagebox.showerror(
-            "Користувач уже працює",
+            "Користувач уже працює в системі",
             f"Користувач «{username}» вже працює в системі"
-            + (f" (комп'ютер: {conflict.get('computer_name')})" if conflict.get('computer_name') else "")
-            + (f"\nВхід виконано: {_started}" if _started else "")
-            + "\n\nЗакрийте програму на тому комп'ютері й спробуйте ще раз."
+            + (f"\nКомп'ютер: {info.get('computer_name')}" if info.get('computer_name') else "")
+            + (f"\nУвійшов: {_started}" if _started else "")
+            + "\n\nОдин логін можна використовувати лише на одному комп'ютері.\n"
+              "Закрийте програму на тому комп'ютері й спробуйте ще раз.\n"
+              "Якщо там програма завісла або вимкнулась — зачекайте ~1,5 хвилини."
         )
         return False
 
@@ -7832,11 +7920,7 @@ class SetupWindow(ctk.CTk):
         логін цього користувача виглядав би 'зайнятим' до 90с даремно."""
         if is_offline_login:
             return
-        try:
-            from app.utils.db import release_session
-            release_session(username)
-        except Exception:
-            pass
+        _ls_release()
 
     def _register_receptionist_dlg(self):
         """Реєстрація нового користувача з роллю 'рецепціоніст' прямо з екрана
@@ -9178,6 +9262,8 @@ def _chat_ensure_tables():
             last_id INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (username, peer)
         )""", fetch=None)
+        # cleared_id — «очищено до цього id» (видалення чату лише для себе)
+        _cq("ALTER TABLE chat_reads ADD COLUMN IF NOT EXISTS cleared_id INTEGER NOT NULL DEFAULT 0", fetch=None)
         _CHAT_TABLES_OK = True
         return True
     except Exception as _e:
@@ -9217,15 +9303,37 @@ def chat_fetch(me, peer, after_id=0, limit=200):
     else:
         where = "((sender=%s AND recipient=%s) OR (sender=%s AND recipient=%s))"
         args = [me, peer, peer, me]
+    # приховуємо те, що користувач «видалив у себе»
+    where += " AND id > COALESCE((SELECT cleared_id FROM chat_reads WHERE username=%s AND peer=%s), 0)"
+    args += [me, peer]
     if after_id:
-        rows = _cq(f"""SELECT id, sender, sender_name, recipient, body, created_at
+        return _cq(f"""SELECT id, sender, sender_name, recipient, body, created_at
                        FROM chat_messages WHERE {where} AND id > %s ORDER BY id ASC""",
                    tuple(args + [after_id]), fetch='all') or []
-        return rows
     rows = _cq(f"""SELECT id, sender, sender_name, recipient, body, created_at
                    FROM chat_messages WHERE {where} ORDER BY id DESC LIMIT %s""",
                tuple(args + [limit]), fetch='all') or []
     return list(reversed(rows))
+
+def chat_clear(me, peer, for_all=False):
+    """Видалення чату. for_all=False — лише у себе (історія ховається, у співрозмовника
+    лишається). for_all=True — повністю видаляє повідомлення з БД для всіх."""
+    from app.utils.db import query as _cq
+    if peer == '*':
+        cond, args = "recipient IS NULL", ()
+    else:
+        cond = "((sender=%s AND recipient=%s) OR (sender=%s AND recipient=%s))"
+        args = (me, peer, peer, me)
+    if for_all:
+        _cq(f"DELETE FROM chat_messages WHERE {cond}", args, fetch=None)
+        return
+    r = _cq(f"SELECT COALESCE(MAX(id),0) AS mx FROM chat_messages WHERE {cond}", args, fetch='one') or {}
+    mx = int(r.get('mx') or 0)
+    _cq("""INSERT INTO chat_reads (username, peer, last_id, cleared_id) VALUES (%s,%s,%s,%s)
+           ON CONFLICT (username, peer) DO UPDATE SET
+             last_id = GREATEST(chat_reads.last_id, EXCLUDED.last_id),
+             cleared_id = GREATEST(chat_reads.cleared_id, EXCLUDED.cleared_id)""",
+        (me, peer, mx, mx), fetch=None)
 
 def chat_unread(me):
     """[{peer, cnt, max_id}] — непрочитані по співрозмовниках ('*' = загальний чат)."""
@@ -9237,7 +9345,7 @@ def chat_unread(me):
               FROM chat_messages m
               WHERE m.sender <> %s AND (m.recipient IS NULL OR m.recipient = %s)) u
         LEFT JOIN chat_reads r ON r.username = %s AND r.peer = u.peer
-        WHERE u.id > COALESCE(r.last_id, 0)
+        WHERE u.id > GREATEST(COALESCE(r.last_id, 0), COALESCE(r.cleared_id, 0))
         GROUP BY u.peer""", (me, me, me), fetch='all') or []
 
 def chat_mark_read(me, peer, last_id):
@@ -9294,9 +9402,12 @@ class ChatFrame(tk.Frame):
         self.list_frame.pack(fill='both', expand=True, padx=4, pady=(0, 8))
 
         right = tk.Frame(body, bg=C['card']); right.pack(side='left', fill='both', expand=True, padx=(12, 0))
-        self.title_lbl = tk.Label(right, text="Загальний чат", font=('Segoe UI', 14, 'bold'),
+        th = tk.Frame(right, bg=C['card']); th.pack(fill='x', padx=16, pady=(12, 8))
+        self.title_lbl = tk.Label(th, text="Загальний чат", font=('Segoe UI', 14, 'bold'),
                                   bg=C['card'], fg=C['text'], anchor='w')
-        self.title_lbl.pack(fill='x', padx=16, pady=(12, 8))
+        self.title_lbl.pack(side='left')
+        ctk.CTkButton(th, text="🗑 Видалити чат", width=130, height=30, fg_color=C['card2'],
+                      hover_color=C['red'], command=lambda: self._ask_clear(self.peer)).pack(side='right')
 
         mid = tk.Frame(right, bg=C['card']); mid.pack(fill='both', expand=True, padx=12)
         self.txt = tk.Text(mid, bg=C['bg'], fg=C['text'], font=('Segoe UI', 11), wrap='word',
@@ -9362,6 +9473,7 @@ class ChatFrame(tk.Frame):
                          bg=C['red'], fg='white').pack(side='right', padx=8)
             for w in (row, l1):
                 w.bind('<Button-1>', lambda e, k=key: self._open_peer(k))
+                w.bind('<Button-3>', lambda e, k=key: self._ask_clear(k))
 
     # ── Фонові запити ─────────────────────────────────────────────────────
     def _bootstrap(self):
@@ -9455,7 +9567,22 @@ class ChatFrame(tk.Frame):
             if rows:
                 self._append(rows)
                 self._last_id = max(self._last_id, max(r['id'] for r in rows))
-                if any(r['sender'] != self.me for r in rows):
+                others = [r for r in rows if r['sender'] != self.me]
+                if others:
+                    try:
+                        app = self.winfo_toplevel()
+                        if hasattr(app, '_chat_notified'):
+                            app._chat_notified[peer] = max(app._chat_notified.get(peer, 0),
+                                                           max(r['id'] for r in others))
+                        # вікно згорнуте / неактивне — показуємо листівку, хоч чат і відкритий
+                        if (not initial) and (app.state() == 'iconic' or app.focus_displayof() is None):
+                            last = others[-1]
+                            ttl = last.get('sender_name') or last['sender']
+                            if peer == '*':
+                                ttl += ' · Загальний чат'
+                            app._chat_toast(ttl, last['body'], peer)
+                    except Exception:
+                        pass
                     self._mark_read(peer, self._last_id)
             elif initial:
                 self._last_id = max(self._last_id, 0)
@@ -9497,6 +9624,53 @@ class ChatFrame(tk.Frame):
         t.configure(state='disabled')
         if at_bottom or self._last_id == 0:
             t.see('end')
+
+    # ── Видалення чату ────────────────────────────────────────────────────
+    def _conv_name(self, peer):
+        return "Загальний чат" if peer == '*' else next(
+            (u['full_name'] for u in self._users if u['username'] == peer), peer)
+
+    def _ask_clear(self, peer):
+        name = self._conv_name(peer)
+        role = (self.user.get('role') or '') if isinstance(self.user, dict) else ''
+        can_all = (peer != '*') or role in ('admin', 'manager')
+        if can_all:
+            ans = messagebox.askyesnocancel(
+                "Видалити чат",
+                f"Видалити чат «{name}»?\n\n"
+                "ТАК — видалити лише у мене (у співрозмовників історія залишиться)\n"
+                "НІ — видалити для ВСІХ (безповоротно)\n"
+                "Скасувати — нічого не робити", parent=self)
+            if ans is None:
+                return
+            for_all = (ans is False)
+        else:
+            if not messagebox.askyesno("Видалити чат",
+                                       f"Видалити чат «{name}» у вас?\n"
+                                       "(в інших користувачів історія залишиться)", parent=self):
+                return
+            for_all = False
+        if for_all and not messagebox.askyesno(
+                "Підтвердження", f"Точно видалити чат «{name}» для ВСІХ?\nЦе не можна скасувати.", parent=self):
+            return
+        def _bg():
+            try:
+                chat_clear(self.me, peer, for_all)
+                def _done():
+                    self._unread[peer] = 0
+                    if peer == self.peer:
+                        self._open_peer(peer, force=True)
+                    else:
+                        self._render_list(force=True)
+                    try:
+                        app = self.winfo_toplevel()
+                        if hasattr(app, '_chat_poll_now'): app._chat_poll_now()
+                    except Exception: pass
+                self.after(0, _done)
+            except Exception as e:
+                log_error("ChatFrame clear", e)
+                self.after(0, lambda: self.status_lbl.configure(text="⚠ Не вдалося видалити чат"))
+        threading.Thread(target=_bg, daemon=True).start()
 
     # ── Надсилання ────────────────────────────────────────────────────────
     def _send(self):
@@ -9627,13 +9801,21 @@ class HotelApp(ctk.CTk):
         і при кнопці 'Вийти' (_quit), і при закритті вікна (_on_close)."""
         self._session_heartbeat_running = False
         self._chat_poller_started = False
-        _uname = getattr(self, '_session_username', None)
-        if _uname:
-            try:
-                from app.utils.db import release_session
-                release_session(_uname)
-            except Exception:
-                pass
+        _ls_release()
+
+    def _on_session_lost(self, info):
+        """Цей логін відкрито на іншому комп'ютері (наша сесія завмерла й була
+        перехоплена) — показуємо повідомлення і закриваємо програму."""
+        try:
+            messagebox.showerror(
+                "Сесію перервано",
+                f"Користувач «{self._session_username}» увійшов у систему на іншому комп'ютері"
+                + (f" ({(info or {}).get('computer_name')})" if (info or {}).get('computer_name') else "")
+                + ".\nЦя програма буде закрита.")
+        except Exception:
+            pass
+        try: self._quit()
+        except Exception: pass
 
     def _start_session_heartbeat(self):
         """Раз на 30с оновлює 'серцебиття' сесії цього логіна в БД, поки
@@ -9643,14 +9825,13 @@ class HotelApp(ctk.CTk):
         def _loop():
             import time as _t_hb
             while getattr(self, '_session_heartbeat_running', False):
-                _uname = getattr(self, '_session_username', None)
-                if _uname:
-                    try:
-                        from app.utils.db import heartbeat_session
-                        heartbeat_session(_uname)
-                    except Exception:
-                        pass
-                _t_hb.sleep(30)
+                _st, _info = _ls_heartbeat()
+                if _st == 'lost':
+                    self._session_heartbeat_running = False
+                    try: self.after(0, lambda i=_info: self._on_session_lost(i))
+                    except Exception: pass
+                    break
+                _t_hb.sleep(20)
         threading.Thread(target=_loop, daemon=True, name="session-heartbeat").start()
 
     def __init__(self, user):
@@ -10658,7 +10839,7 @@ class HotelApp(ctk.CTk):
         self.after(10, lambda: self._show('dashboard'))
         self.after(4000, self._start_chat_poller)
 
-    # ── Чат: фонове опитування, лічильник у меню, спливаюче сповіщення ──
+    # ── Чат: фонове опитування, лічильник у меню, спливаюча «листівка» ──
     def _start_chat_poller(self):
         if getattr(self, '_chat_poller_started', False):
             return
@@ -10666,87 +10847,142 @@ class HotelApp(ctk.CTk):
         self._chat_pending_peer = None
         self._chat_notified = {}      # peer -> max_id, про який вже сповіщали
         self._chat_first_poll = True
-        self._chat_unread_total = 0
+        self._chat_inited = False
+        self._chat_toast_win = None
         def _loop():
             import time as _t
-            while getattr(self, '_session_heartbeat_running', True) and getattr(self, '_chat_poller_started', False):
+            while getattr(self, '_chat_poller_started', False):
                 self._chat_poll_blocking()
-                _t.sleep(5)
-        threading.Thread(target=_loop, daemon=True).start()
+                _t.sleep(4)
+        threading.Thread(target=_loop, daemon=True, name='chat-poller').start()
+        log_info("Чат: фоновий опитувач запущено")
 
     def _chat_poll_now(self):
         threading.Thread(target=self._chat_poll_blocking, daemon=True).start()
 
+    def _chat_is_user_looking(self, peer):
+        """True, якщо людина просто зараз дивиться саме на цю розмову
+        (вкладка «Чат» відкрита, ця розмова обрана, вікно програми активне)."""
+        try:
+            if self.active != 'chat':
+                return False
+            fr = self._frame_cache.get('chat')
+            if fr is None or getattr(fr, 'peer', None) != peer:
+                return False
+            if self.state() == 'iconic' or self.focus_displayof() is None:
+                return False
+            return True
+        except Exception:
+            return False
+
     def _chat_poll_blocking(self):
         try:
-            me = self.user.get('username')
+            u = self.user if isinstance(self.user, dict) else dict(self.user)
+            me = u.get('username')
             if not me or not _chat_ensure_tables():
                 return
-            chat_init_user(me)
+            if not self._chat_inited:
+                chat_init_user(me)
+                self._chat_inited = True
             rows = chat_unread(me)
-            info = None
             newest = None
             for r in rows:
                 mx = int(r['max_id'])
                 if mx > self._chat_notified.get(r['peer'], 0) and (newest is None or mx > newest[1]):
                     newest = (r['peer'], mx)
-            if newest and not self._chat_first_poll:
+            first = self._chat_first_poll
+            info = None
+            if newest and not first:
                 m = chat_message_by_id(newest[1])
                 title = m.get('sender_name') or m.get('sender') or 'Повідомлення'
                 if newest[0] == '*':
                     title += ' · Загальний чат'
                 info = (title, m.get('body') or '', newest[0])
-            first = self._chat_first_poll
             for r in rows:
                 self._chat_notified[r['peer']] = max(self._chat_notified.get(r['peer'], 0), int(r['max_id']))
             self._chat_first_poll = False
             total = sum(int(r['cnt']) for r in rows)
+            if info or first:
+                log_info(f"Чат: unread={total}, нове={info[2] if info else None}")
             self.after(0, lambda: self._chat_apply(total, info, first))
         except Exception as e:
             log_error("chat poll", e)
 
     def _chat_apply(self, total, info, first):
+        # 1) лічильник у меню (окремо — щоб його збій не блокував сповіщення)
         try:
             on_chat = (self.active == 'chat')
             shown = 0 if on_chat else total
             if 'chat' in self.nav:
                 self.nav['chat'].set_label(f"Чат ({shown})" if shown else "Чат")
-            if on_chat:
-                return
+        except Exception as e:
+            log_error("chat badge", e)
+        # 2) листівка в правому нижньому куті
+        try:
             if first and total:
                 self._chat_toast("Чат", f"У вас непрочитаних повідомлень: {total}", None)
-            elif info:
+            elif info and not self._chat_is_user_looking(info[2]):
                 self._chat_toast(info[0], info[1], info[2])
         except Exception as e:
             log_error("chat apply", e)
 
     def _chat_toast(self, title, text, peer):
+        """Листівка «Вам надійшло повідомлення» у правому нижньому куті екрана.
+        Клік по ній відкриває чат (саме ту розмову)."""
         try:
             try:
                 import winsound; winsound.MessageBeep(winsound.MB_ICONASTERISK)
             except Exception:
                 pass
+            old = getattr(self, '_chat_toast_win', None)
+            if old is not None:
+                try: old.destroy()
+                except Exception: pass
             t = tk.Toplevel(self)
+            self._chat_toast_win = t
             t.overrideredirect(True)
-            t.attributes('-topmost', True)
+            try: t.attributes('-topmost', True)
+            except Exception: pass
             t.configure(bg=C['accent'])
             inner = tk.Frame(t, bg=C['card2'], cursor='hand2'); inner.pack(padx=2, pady=2)
-            l1 = tk.Label(inner, text=f"💬 {title}", font=('Segoe UI', 10, 'bold'),
-                          bg=C['card2'], fg=C['text'], anchor='w'); l1.pack(fill='x', padx=12, pady=(8, 0))
-            l2 = tk.Label(inner, text=(text or '')[:140], font=('Segoe UI', 10), wraplength=300,
+            top = tk.Frame(inner, bg=C['card2']); top.pack(fill='x', padx=12, pady=(10, 0))
+            l0 = tk.Label(top, text="✉  Вам надійшло повідомлення", font=('Segoe UI', 11, 'bold'),
+                          bg=C['card2'], fg=C['accent'], anchor='w'); l0.pack(side='left')
+            x = tk.Label(top, text="✕", font=('Segoe UI', 10), bg=C['card2'], fg=C['text2'], cursor='hand2')
+            x.pack(side='right', padx=(14, 0))
+            l1 = tk.Label(inner, text=title, font=('Segoe UI', 10, 'bold'),
+                          bg=C['card2'], fg=C['text'], anchor='w', justify='left', wraplength=320)
+            l1.pack(fill='x', padx=12, pady=(6, 0))
+            l2 = tk.Label(inner, text=(text or '')[:140], font=('Segoe UI', 10), wraplength=320,
                           justify='left', bg=C['card2'], fg=C['text2'], anchor='w')
-            l2.pack(fill='x', padx=12, pady=(2, 8))
+            l2.pack(fill='x', padx=12, pady=(2, 2))
+            l3 = tk.Label(inner, text="Натисніть, щоб відкрити", font=('Segoe UI', 9, 'italic'),
+                          bg=C['card2'], fg=C['text2'], anchor='w')
+            l3.pack(fill='x', padx=12, pady=(0, 10))
             t.update_idletasks()
             w, h = t.winfo_reqwidth(), t.winfo_reqheight()
             t.geometry(f"+{self.winfo_screenwidth() - w - 20}+{self.winfo_screenheight() - h - 70}")
-            def _go(e=None):
+            try: t.lift()
+            except Exception: pass
+            def _close(e=None):
                 try: t.destroy()
                 except Exception: pass
+            def _go(e=None):
+                _close()
                 self._chat_pending_peer = peer
+                try:
+                    if self.state() == 'iconic':
+                        self.deiconify()
+                    self.lift()
+                except Exception: pass
                 self._show('chat')
-            for wdg in (inner, l1, l2):
+                if self.active == 'chat' and 'chat' in self._frame_cache:
+                    try: self._frame_cache['chat']._load_data_async()
+                    except Exception: pass
+            for wdg in (inner, top, l0, l1, l2, l3):
                 wdg.bind('<Button-1>', _go)
-            t.after(6000, lambda: (t.winfo_exists() and t.destroy()))
+            x.bind('<Button-1>', _close)
+            t.after(15000, _close)
         except Exception as e:
             log_error("chat toast", e)
 
