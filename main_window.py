@@ -16528,31 +16528,8 @@ class ChessFrame(tk.Frame):
                 # їх. Тепер створюємо його як звичайний рядок-сусід ПЕРЕД
                 # grid_wrap (через pack(before=...)) — він займає своє
                 # місце і зсуває сітку вниз, нічого не затуляючи.
-                ov = tk.Frame(self.canvas_area, bg=_bg_c,
-                              highlightbackground=_brd_c, highlightthickness=2)
-                ov.pack(in_=self.canvas_area, before=grid_wrap, fill='x', side='top')
-
-                hf = tk.Frame(ov, bg=_bg_c); hf.pack(fill='x', padx=10, pady=(6, 3))
-                tk.Label(hf, text=_btitle, bg=_bg_c, fg=_brd_c,
-                         font=('Segoe UI', 11, 'bold')).pack(side='left')
-                tk.Button(hf, text='✕', bg=_bg_c, fg='#888888',
-                          relief='flat', bd=0, cursor='hand2',
-                          font=('Segoe UI', 10),
-                          command=lambda: (_sw_note_ghost(ov), ov.pack_forget())).pack(side='right')
-
-                cf = tk.Frame(ov, bg=_bg_c); cf.pack(fill='x', padx=10, pady=(0, 6))
-                for _b in _overdue_chess[:12]:
-                    _dov = _b.get('days_late', 0)
-                    _bc = '#cc0000' if _dov > 0 else '#cc8800'
-                    _bt = f"+{_dov} дн." if _dov > 0 else "виїзд"
-                    _nm = (_b.get('guest_name') or '—').split()[0]
-                    _ch = tk.Frame(cf, bg=_bc, padx=5, pady=2)
-                    _ch.pack(side='left', padx=2, pady=2)
-                    tk.Label(_ch, text=f"{_rn(_b.get('room_number','?'))} {_nm} {_bt}",
-                             bg=_bc, fg='white', font=('Segoe UI', 9, 'bold')).pack()
-                if len(_overdue_chess) > 12:
-                    tk.Label(cf, text=f"  +{len(_overdue_chess)-12} ще",
-                             bg=_bg_c, fg='#888888', font=('Segoe UI', 9)).pack(side='left', padx=4)
+                ov = _dash_build_overdue_marquee(
+                    self.canvas_area, grid_wrap, _overdue_chess, font_size=10)
                 ov.lift()
             except Exception as _chess_err:
                 log_error("Chess: overdue overlay", _chess_err)
