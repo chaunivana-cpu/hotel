@@ -2156,6 +2156,40 @@ def _rn(number):
     return ('№' + s) if s[:1].isdigit() else s
 
 
+def _sync_cloud_to_active_profile(cloud_cfg):
+    """Дублює збережену в Налаштуваннях хмару в АКТИВНИЙ профіль підключення
+    (db_profiles.json, профіль береться з last_profile.json).
+    Раніше хмара писалась лише у спільний db.json, а профіль (Бочка/Ялинка)
+    зберігав свою СТАРУ копію — і при кожному вході/запуску
+    SetupWindow._on_profile_selected() перезаписував нову хмару старою."""
+    try:
+        base = os.path.join(os.path.expanduser('~'), '.hotel_pms')
+        lp = os.path.join(base, 'last_profile.json')
+        pp = os.path.join(base, 'db_profiles.json')
+        if not (os.path.exists(lp) and os.path.exists(pp)):
+            return False
+        with open(lp, encoding='utf-8') as f:
+            name = (json.load(f) or {}).get('name', '')
+        if not name:
+            return False
+        with open(pp, encoding='utf-8') as f:
+            profiles = json.load(f)
+        if not isinstance(profiles, list):
+            return False
+        hit = False
+        for p in profiles:
+            if p.get('name') == name:
+                p['cloud'] = dict(cloud_cfg)
+                hit = True
+        if hit:
+            with open(pp, 'w', encoding='utf-8') as f:
+                json.dump(profiles, f, ensure_ascii=False, indent=2)
+        return hit
+    except Exception as _e:
+        log_error("_sync_cloud_to_active_profile", _e)
+        return False
+
+
 def _dash_clear_overdue_overlays(master):
     """Знищує всі банери «прострочених виїздів» у контейнері дашборда."""
     try:
@@ -36053,6 +36087,7 @@ class SettingsFrame(tk.Frame):
         try:
             from app.utils.db import save_cloud_config
             save_cloud_config(cloud_cfg)
+            _sync_cloud_to_active_profile(cloud_cfg)   # щоб профіль не повернув стару хмару
             self.cloud_info.configure(text="✓ Збережено", text_color=C['green'])
             log_info(f"[CLOUD_DB] Хмару налаштовано: {cloud_cfg.get('host')}:{cloud_cfg.get('port')} db={cloud_cfg.get('dbname')}")
         except Exception as _e:
