@@ -24037,6 +24037,59 @@ class CashierFrame(tk.Frame):
 # ══════════════════════════════════════════════════════
 # РЕСТОРАН
 # ══════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════
+# РЕСТОРАН: прив'язка замовлення до номера кімнати (хто замовляв)
+# Колонки додаються в restaurant_orders автоматично: room_booking_id, room_label, room_guest.
+# ══════════════════════════════════════════════════════
+_RO_COLS_OK = False
+
+def _ro_ensure_cols():
+    global _RO_COLS_OK
+    if _RO_COLS_OK:
+        return
+    from app.utils.db import query as _q
+    for _col, _typ in (('room_booking_id', 'INTEGER'), ('room_label', 'TEXT'), ('room_guest', 'TEXT')):
+        _q(f"ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS {_col} {_typ}", fetch=None)
+    _RO_COLS_OK = True
+
+def _ro_get_room(order_id):
+    """{'room_booking_id','room_label','room_guest'} або {} якщо номер не вибрано."""
+    try:
+        from app.utils.db import query as _q
+        _ro_ensure_cols()
+        r = _q("SELECT room_booking_id, room_label, room_guest FROM restaurant_orders WHERE id=%s",
+               (order_id,), fetch='one') or {}
+        return r if r.get('room_label') else {}
+    except Exception as _e:
+        log_error("_ro_get_room", _e)
+        return {}
+
+def _ro_set_room(order_id, booking_id, room_label, guest):
+    """booking_id=None → прибрати прив'язку до номера."""
+    from app.utils.db import query as _q
+    _ro_ensure_cols()
+    _q("UPDATE restaurant_orders SET room_booking_id=%s, room_label=%s, room_guest=%s WHERE id=%s",
+       (booking_id, room_label, guest, order_id), fetch=None)
+
+def _ro_room_map(order_ids):
+    """{order_id: '№5 · Іванов'} для замовлень з вибраним номером."""
+    ids = list(order_ids or [])
+    if not ids:
+        return {}
+    try:
+        from app.utils.db import query as _q
+        _ro_ensure_cols()
+        ph = ','.join(['%s'] * len(ids))
+        rows = _q(f"SELECT id, room_label, room_guest FROM restaurant_orders "
+                  f"WHERE id IN ({ph}) AND room_label IS NOT NULL AND room_label<>''",
+                  tuple(ids), fetch='all') or []
+        return {r['id']: _rn(r['room_label']) + (f" · {r['room_guest']}" if r.get('room_guest') else '')
+                for r in rows}
+    except Exception as _e:
+        log_error("_ro_room_map", _e)
+        return {}
+
+
 class RestaurantFrame(tk.Frame):
     def __init__(self, parent, user):
         super().__init__(parent, bg=C['bg'])
@@ -24173,13 +24226,20 @@ class RestaurantFrame(tk.Frame):
         self.total_lbl = lbl(totrow, "Разом: 0.00₴", 16, True, C['accent'])
         self.total_lbl.pack(side='right')
 
+        roomrow = tk.Frame(bot, bg=C['card2']); roomrow.pack(fill='x', padx=10, pady=(0,6))
+        lbl(roomrow, "Хто замовив (номер):", 11, color=C['text2']).pack(side='left', padx=(0,6))
+        self.room_lbl = lbl(roomrow, "не вибрано", 11, True, C['text2'])
+        self.room_lbl.pack(side='left')
+        btn(roomrow, "🛎 Вибрати номер", self._pick_room, C['accent'], 150, height=28).pack(side='right')
+
         noterow = tk.Frame(bot, bg=C['card2']); noterow.pack(fill='x', padx=10, pady=(0,6))
         lbl(noterow, "Нотатка:", 11, color=C['text2']).pack(side='left', padx=(0,6))
         self.e_note_order = ent(noterow, w=260); self.e_note_order.pack(side='left')
 
         brow1 = ctk.CTkFrame(bot, fg_color='transparent'); brow1.pack(fill='x', padx=8, pady=(0,4))
         btn(brow1, "✅ Закрити замовлення", self._close_order, C['green'], 200).pack(side='left', padx=(0,4))
-        btn(brow1, "🏨 На номер готелю",   self._to_room,     C['accent'], 170).pack(side='left')
+        btn(brow1, "🏨 На номер готелю",   self._to_room,     C['accent'], 170).pack(side='left', padx=(0,4))
+        btn(brow1, "🖨 Рахунок",           self._print_bill,  '#2980b9',   120).pack(side='left')
 
         brow2 = ctk.CTkFrame(bot, fg_color='transparent'); brow2.pack(fill='x', padx=8, pady=(0,10))
         btn(brow2, "💰  Сплатити", self._pay_order, C['green'], height=42).pack(fill='x')
@@ -24383,6 +24443,8 @@ class RestaurantFrame(tk.Frame):
 
         STATUS_UA = {'open':'🟢 відкрите', 'closed':'⬛ закрите', 'paid':'✅ оплачено'}
 
+        try: _rooms_map = _ro_room_map([o['id'] for o in orders])
+        except Exception: _rooms_map = {}
         for o in orders:
             oid    = o['id']
             status = STATUS_UA.get(o.get('status',''), o.get('status',''))
@@ -24394,7 +24456,7 @@ class RestaurantFrame(tk.Frame):
             # Рядок-заголовок замовлення — вставляємо як вкладений елемент
             hdr_iid = f"o{oid}"
             self.orders_tree.insert('', 'end', iid=hdr_iid,
-                values=(f"#{oid}", f"🕐 {time_s}  {note}", '', '', f"{o_total:.0f}₴", status),
+                values=(f"#{oid}", f"🕐 {time_s}  " + (f"🏨 {_rooms_map[oid]}  " if oid in _rooms_map else '') + f"{note}", '', '', f"{o_total:.0f}₴", status),
                 tags=('order_hdr',) if is_open else ('closed_row',),
                 open=False)
             self._order_row_map[hdr_iid] = oid
@@ -24421,6 +24483,7 @@ class RestaurantFrame(tk.Frame):
                 self.orders_tree.see(hdr)
             except Exception: pass
             self._update_total_from_tree()
+        self._refresh_room_lbl()
 
     def _load_menu_data(self):
         """Завантажує меню ресторану з БД — бере кількість і залишок з налаштувань меню."""
@@ -24702,6 +24765,8 @@ class RestaurantFrame(tk.Frame):
         self._order_row_map = {}
         self._item_row_map  = {}
         import datetime as _dt_s
+        try: _rooms_map2 = _ro_room_map([o['id'] for o in orders])
+        except Exception: _rooms_map2 = {}
         for o in orders:
             oid2   = o['id']
             status = o.get('status','open')
@@ -24713,7 +24778,7 @@ class RestaurantFrame(tk.Frame):
             st_ua  = '⏳ відкрите' if status == 'open' else '✅ закрите'
             o_iid  = f"order_{oid2}"
             self.orders_tree.insert('', 'end', iid=o_iid, values=(
-                f"#{oid2}", f"🕐 {ts}", '', '', f"{total:.0f}₴", st_ua
+                f"#{oid2}", f"🕐 {ts}" + (f"  🏨 {_rooms_map2[oid2]}" if oid2 in _rooms_map2 else ''), '', '', f"{total:.0f}₴", st_ua
             ), open=(status=='open'), tags=('open_row' if status=='open' else 'closed_row',))
             self._order_row_map[o_iid] = oid2
             for it in items_map.get(oid2, []):
@@ -24756,6 +24821,7 @@ class RestaurantFrame(tk.Frame):
             try: self._order_num_lbl.configure(text=f"Замовлення: #{self.cur_order}")
             except Exception: pass
         self._update_total_from_tree()
+        self._refresh_room_lbl()
 
     def _update_total_from_tree(self):
         """Рахує загальну суму поточного замовлення з таблиці."""
@@ -24913,6 +24979,8 @@ class RestaurantFrame(tk.Frame):
                     font=('Segoe UI', 11), bd=0)
         m.add_command(label="🍽  Меню (прайс-лист)", command=self._print_menu_list)
         m.add_command(label="📦  Залишки", command=self._print_stock_list)
+        m.add_separator()
+        m.add_command(label="🧾  Рахунок поточного замовлення", command=self._print_bill)
         try:
             m.tk_popup(anchor.winfo_rootx(), anchor.winfo_rooty() + anchor.winfo_height())
         finally:
@@ -25198,6 +25266,7 @@ class RestaurantFrame(tk.Frame):
                 f"  🍽  ЧЕК РЕСТОРАНУ / БАРУ",
                 f"{'─'*48}",
                 f"  Замовлення : #{oid0}",
+                *self._room_receipt_lines(oid0),
                 f"  Дата/час   : {_dt0.datetime.now().strftime('%d.%m.%Y  %H:%M')}",
                 f"{'─'*48}",
                 f"  РАЗОМ      : 0₴",
@@ -25353,6 +25422,7 @@ class RestaurantFrame(tk.Frame):
                     f"  🍽  ЧЕК РЕСТОРАНУ / БАРУ",
                     f"{'─'*48}",
                     f"  Замовлення : #{oid}",
+                    *self._room_receipt_lines(oid),
                     f"  Дата/час   : {now_str}",
                     f"  Адмін.     : {admin_name}",
                     f"  Зміна з    : {shift_str}",
@@ -25406,6 +25476,7 @@ class RestaurantFrame(tk.Frame):
         self.order_lbl.configure(text="Замовлення: —")
         try: self.total_lbl.configure(text="Разом: 0.00₴")
         except Exception: pass
+        self._refresh_room_lbl()
         self._reload_orders_table()
 
     def _edit_item_dlg(self):
@@ -25480,6 +25551,11 @@ class RestaurantFrame(tk.Frame):
         ff,tree=mktree(win,('id','number','guest'),8,[50,80,240])
         for c,h in zip(('id','number','guest'),['ID','Кімн.','Гість']): tree.heading(c,text=h)
         for r in rooms: tree.insert('','end',iid=r['id'],values=(r['id'],r['number'],r['guest']))
+        try:
+            _pre = _ro_get_room(self.cur_order).get('room_booking_id')
+            if _pre and tree.exists(str(_pre)):
+                tree.selection_set(str(_pre)); tree.see(str(_pre))
+        except Exception: pass
         ff.pack(fill='both',expand=True,padx=10,pady=10)
         # Показати суму поточного замовлення
         try:
@@ -25571,6 +25647,163 @@ class RestaurantFrame(tk.Frame):
             self._reset_order(); self._reload_open()
             messagebox.showinfo("✅", f"Нараховано {rest_total:.0f}₴ на номер {room_num}")
         btn(win,"✅ Нарахувати на номер",charge,C['green'],200,height=42).pack(pady=8)
+
+    # ── Номер кімнати (хто замовляв) і друк незакритого замовлення ──────────
+    def _room_receipt_lines(self, order_id):
+        """Рядок «Номер : …» для чеків, якщо до замовлення прив'язано номер."""
+        try:
+            i = _ro_get_room(order_id)
+            if i:
+                g = i.get('room_guest') or ''
+                return [f"  Номер      : {_rn(i['room_label'])}" + (f"  ({g})" if g else '')]
+        except Exception:
+            pass
+        return []
+
+    def _refresh_room_lbl(self):
+        try:
+            i = _ro_get_room(self.cur_order) if self.cur_order else {}
+            if i:
+                g = i.get('room_guest') or '—'
+                self.room_lbl.configure(text=f"{_rn(i['room_label'])} · {g}", text_color=C['green'])
+            else:
+                self.room_lbl.configure(text="не вибрано", text_color=C['text2'])
+        except Exception:
+            pass
+
+    def _pick_room(self):
+        """Вибір номера кімнати гостя, який зробив замовлення (замовлення НЕ закривається)."""
+        from app.utils.db import query
+        if not self.cur_order:
+            messagebox.showinfo("", "Спочатку оберіть або створіть замовлення"); return
+        try:
+            rooms = query("SELECT b.id, r.number, g.name AS guest FROM bookings b "
+                          "JOIN rooms r ON b.room_id=r.id LEFT JOIN guests g ON b.guest_id=g.id "
+                          "WHERE b.status='checkedin' ORDER BY r.number") or []
+        except Exception as e:
+            log_error("_pick_room", e)
+            messagebox.showerror("Помилка", f"Не вдалося завантажити номери:\n{e}"); return
+        if not rooms:
+            messagebox.showinfo("", "Немає заселених гостей"); return
+        oid = self.cur_order
+        win = dlg_win(self, f"Хто замовляє — замовлення #{oid}", "480x500")
+        sv = tk.StringVar()
+        se = ctk.CTkEntry(win, textvariable=sv, placeholder_text="🔍 Пошук за номером або гостем...",
+                          fg_color=C['card2'], border_color=C['accent'], font=('Segoe UI', 11))
+        se.pack(fill='x', padx=10, pady=(10, 4))
+        ff, tree = mktree(win, ('id', 'number', 'guest'), 12, [50, 120, 260])
+        for c, h in zip(('id', 'number', 'guest'), ['ID', 'Кімн.', 'Гість']):
+            tree.heading(c, text=h)
+        ff.pack(fill='both', expand=True, padx=10, pady=4)
+        cur = _ro_get_room(oid)
+        if cur:
+            lbl(win, f"Зараз: {_rn(cur['room_label'])} · {cur.get('room_guest') or '—'}",
+                11, color=C['text2']).pack(pady=(0, 2))
+
+        def fill(*_):
+            q = sv.get().strip().lower()
+            tree.delete(*tree.get_children())
+            for r in rooms:
+                g = str(r.get('guest') or '—')
+                if q and q not in str(r['number']).lower() and q not in g.lower():
+                    continue
+                tree.insert('', 'end', iid=str(r['id']), values=(r['id'], _rn(r['number']), g))
+            bid = cur.get('room_booking_id')
+            if bid and tree.exists(str(bid)):
+                tree.selection_set(str(bid)); tree.see(str(bid))
+        sv.trace_add('write', fill); fill()
+
+        def _done():
+            try: win.destroy()
+            except Exception: pass
+            self._refresh_room_lbl()
+            self._reload_orders_table()
+
+        def save():
+            s = tree.selection()
+            if not s:
+                messagebox.showinfo("", "Оберіть номер зі списку", parent=win); return
+            bid = int(s[0])
+            r = next((x for x in rooms if int(x['id']) == bid), None)
+            if not r: return
+            try:
+                _ro_set_room(oid, bid, str(r['number']), str(r.get('guest') or ''))
+            except Exception as e:
+                log_error("_ro_set_room", e)
+                messagebox.showerror("Помилка", str(e), parent=win); return
+            _done()
+
+        def clear():
+            try:
+                _ro_set_room(oid, None, None, None)
+            except Exception as e:
+                log_error("_ro_set_room clear", e)
+            _done()
+        tree.bind('<Double-Button-1>', lambda e: save())
+        row = tk.Frame(win, bg=C['card']); row.pack(fill='x', padx=10, pady=(4, 10))
+        btn(row, "✅ Вибрати", save, C['green'], 170, height=40).pack(side='left', padx=(0, 6))
+        btn(row, "✖ Без номера", clear, C['card2'], 140, height=40).pack(side='left')
+
+    def _print_bill(self):
+        """Друк РАХУНКУ по незакритому замовленню (замовлення лишається відкритим)."""
+        oid = self.cur_order
+        if not oid:
+            messagebox.showinfo("", "Оберіть замовлення для друку"); return
+        items = []; status = 'open'
+        try:
+            from app.utils.db import get_conn as _gcB
+            with _gcB() as _cB:
+                with _cB.cursor() as _curB:
+                    try:
+                        _curB.execute("SELECT COALESCE(s.name, roi.name, '—'), roi.quantity, roi.price "
+                                      "FROM restaurant_order_items roi LEFT JOIN services s ON roi.service_id=s.id "
+                                      "WHERE roi.order_id=%s ORDER BY roi.id", (oid,))
+                    except Exception:
+                        try: _cB.rollback()
+                        except Exception: pass
+                        _curB.execute("SELECT name, qty, price FROM restaurant_order_items "
+                                      "WHERE order_id=%s ORDER BY id", (oid,))
+                    items = [dict(zip(['name', 'qty', 'price'], r)) for r in _curB.fetchall()]
+                    try:
+                        _curB.execute("SELECT status FROM restaurant_orders WHERE id=%s", (oid,))
+                        _r = _curB.fetchone()
+                        if _r: status = _r[0] or 'open'
+                    except Exception:
+                        try: _cB.rollback()
+                        except Exception: pass
+        except Exception as e:
+            log_error("_print_bill", e)
+            messagebox.showerror("Помилка", f"Не вдалося завантажити замовлення:\n{e}"); return
+        if not items:
+            messagebox.showinfo("", "У замовленні немає позицій"); return
+        import datetime as _dtb
+        now_str = _dtb.datetime.now().strftime('%d.%m.%Y  %H:%M')
+        admin = self.user.get('full_name', self.user.get('username', '—'))
+        total = 0.0
+        body = []
+        for it in items:
+            q = float(it.get('qty') or 1); p = float(it.get('price') or 0)
+            total += q * p
+            qs = int(q) if q == int(q) else q
+            body.append(f"  {str(it.get('name',''))[:28]:<28} {qs}x{p:.0f}₴ = {q*p:.0f}₴")
+        opened = (status == 'open')
+        lines = [
+            f"{'─'*48}",
+            f"  🧾  РАХУНОК РЕСТОРАНУ / БАРУ",
+            (f"  (замовлення не закрите — попередній рахунок)" if opened else f"  (замовлення вже закрите)"),
+            f"{'─'*48}",
+            f"  Замовлення : #{oid}",
+            *self._room_receipt_lines(oid),
+            f"  Дата/час   : {now_str}",
+            f"  Адмін.     : {admin}",
+            f"{'─'*48}",
+            *body,
+            f"{'─'*48}",
+            f"  РАЗОМ      : {total:.0f}₴",
+            f"  Статус     : {'НЕ ОПЛАЧЕНО' if opened else 'закрито'}",
+            f"{'─'*48}",
+        ]
+        print_text(f"Рахунок ресторан #{oid}" + (" (не закрито)" if opened else ""), lines)
 
     def _edit_order(self):
         """Редагувати вибране замовлення — тепер через orders_tree."""
@@ -25733,6 +25966,7 @@ class RestaurantFrame(tk.Frame):
                 f"  🍽  ЧЕК РЕСТОРАНУ / БАРУ",
                 f"{'─'*48}",
                 f"  Замовлення : #{self.cur_order}",
+                *self._room_receipt_lines(self.cur_order),
                 f"  Дата/час   : {now_str}",
                 f"  Адмін.     : {admin_name}",
                 f"  Зміна з    : {shift_str}",
