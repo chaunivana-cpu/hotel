@@ -8196,6 +8196,7 @@ _NAV_ITEMS = [
     ("🧺","Прибирання","cleaning"),
     ("🛏️","Номери","rooms"),
     ("💵","Каса","cashier"),
+    ("🧾","Рахунки","invoices"),
     ("🍴","Ресторан","restaurant"),
     ("🌿","Бесідки","gazebo"),
     ("🌊","Бані","sauna"),
@@ -8216,6 +8217,7 @@ _NAV_ICON_COLORS = {
     "cleaning":   "#5FD0D0",
     "rooms":      "#C9A24B",
     "cashier":    "#52C97A",
+    "invoices":   "#6CB4EE",
     "restaurant": "#E8915F",
     "gazebo":     "#7BC267",
     "sauna":      "#E8775F",
@@ -9226,6 +9228,12 @@ _NAV_ICONS_3D_B64 = {
         'UMGcIQ1xaqnz525Hh7b2/vQJAJEoEzKV1FFsePnniyUp37VKJJvilTe9O+NteiyNK3b//RFb7vX8aae+LOYpkRqCf/w+d+/8DjeNy8mV+be1Ov'
         'pTQvvZW/ONkcc2RE4gjebBKKM8ng4Fv8q7P/eP0SXv8XH+Ikx2/0BHIAAAAASUVORK5CYII='
     ),
+    'invoices': (
+        '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'
+    ),
+    'chat': (
+        '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'
+    ),
 }
 
 
@@ -9952,6 +9960,93 @@ class ChatFrame(tk.Frame):
                         self.inp.insert('1.0', body)
                 self.after(0, _restore)
         threading.Thread(target=_bg, daemon=True).start()
+
+
+# ══════════════════════════════════════════════════════
+# Сторінка «Рахунки» (ліве меню): створення рахунку + історія виданих рахунків
+# ══════════════════════════════════════════════════════
+def _build_invoices_history_into(p):
+    """Будує в контейнері p пошук + таблицю історії рахунків + кнопки (друк/редагування).
+    Повертає функцію _refresh для оновлення списку."""
+    top = tk.Frame(p, bg=C['bg']); top.pack(fill='x', padx=10, pady=(10, 4))
+    lbl(top, "📜  Історія рахунків", 14, True).pack(side='left')
+    lbl(top, "🔍 Пошук:", 11, color=C['text2']).pack(side='left', padx=(20, 6))
+    e_srch = ent(top, "Гість або номер рахунку", w=280); e_srch.pack(side='left')
+
+    cols = ('number', 'inv_date', 'guest', 'fiscal', 'period', 'total', 'created_at')
+    widths = [60, 90, 220, 90, 160, 90, 140]
+    ff, tree = mktree(p, cols, 18, widths)
+    for c, h in zip(cols, ['№', 'Дата', 'Гість', 'Фіск.чек', 'Період', 'Сума', 'Створено']):
+        tree.heading(c, text=h)
+
+    _rows_cache = {}
+    def _refresh(*_):
+        try:
+            tree.delete(*tree.get_children())
+        except Exception:
+            return
+        _rows_cache.clear()
+        for r in _load_invoices(e_srch.get().strip() or None):
+            iid = str(r['id'])
+            _rows_cache[iid] = r
+            period = f"{str(r.get('period_from') or '')[:10]} → {str(r.get('period_to') or '')[:10]}"
+            tree.insert('', 'end', iid=iid, values=(
+                r.get('number'), str(r.get('inv_date') or '')[:10], r.get('guest_name') or '',
+                r.get('fiscal_check') or '', period, f"{float(r.get('total') or 0):.2f}₴",
+                str(r.get('created_at') or '')[:16]))
+    e_srch.bind('<Return>', _refresh)
+
+    def _reprint():
+        s = tree.selection()
+        if not s:
+            messagebox.showwarning("", "Оберіть рахунок зі списку"); return
+        r = _rows_cache.get(s[0])
+        if not r: return
+        try:
+            _reopen_invoice_from_row(r)
+        except Exception as _ex:
+            messagebox.showerror("Помилка", str(_ex))
+    tree.bind('<Double-1>', lambda e: _reprint())
+
+    def _edit():
+        s = tree.selection()
+        if not s:
+            messagebox.showwarning("", "Оберіть рахунок зі списку"); return
+        r = _rows_cache.get(s[0])
+        if not r: return
+        _open_invoice_edit_dlg(p, r, on_saved=_refresh)
+
+    bot = tk.Frame(p, bg=C['bg']); bot.pack(side='bottom', fill='x', padx=10, pady=(6, 10))
+    btn(bot, "🖨️ Відкрити / Друк", _reprint, C['accent'], 170, height=36).pack(side='left', padx=4)
+    btn(bot, "✏️ Редагувати", _edit, C['card2'], 150, height=36).pack(side='left', padx=4)
+    btn(bot, "🔄 Оновити", _refresh, C['card2'], 130, height=36).pack(side='left', padx=4)
+    ff.pack(fill='both', expand=True, padx=10, pady=6)
+    p.after(80, _refresh)
+    return _refresh
+
+
+class InvoicesFrame(tk.Frame):
+    """Вкладка «Рахунки»: кнопка створення нового рахунку (Форма №4-Г) та історія."""
+    def __init__(self, parent, user):
+        super().__init__(parent, bg=C['bg'])
+        self.user = user
+        hdr = ctk.CTkFrame(self, fg_color=C['card'])
+        hdr.pack(fill='x', padx=15, pady=(15, 5))
+        lbl(hdr, "🧾  Рахунки", 18, True).pack(side='left', padx=15, pady=12)
+        btn(hdr, "➕ Новий рахунок", self._new_invoice, C['accent'], 180, height=36).pack(side='right', padx=12, pady=10)
+        body = tk.Frame(self, bg=C['bg']); body.pack(fill='both', expand=True, padx=5)
+        self._refresh = _build_invoices_history_into(body)
+
+    def _new_invoice(self):
+        try:
+            _open_invoice_dlg(self)
+        finally:
+            try: self.after(300, self._refresh)
+            except Exception: pass
+
+    def _load_data_async(self):
+        try: self._refresh()
+        except Exception: pass
 
 
 class NavButton(tk.Frame):
@@ -10971,25 +11066,37 @@ class HotelApp(ctk.CTk):
         sb = ctk.CTkFrame(self, width=210, fg_color=C['card'], corner_radius=0)
         sb.pack(side='left', fill='y'); sb.pack_propagate(False)
 
+        # Права частина вікна: тонка верхня панель (БД · Синхронізація · Вийти) + вміст сторінок
+        right_wrap = tk.Frame(self, bg=C['bg'])
+        right_wrap.pack(side='left', fill='both', expand=True)
+        self._topbar = tk.Frame(right_wrap, bg=C['bg'])
+        self._topbar.pack(side='top', fill='x')
+
         # Верхня частина (логотип + юзер + кнопка виходу) — фіксована
         sb_top = tk.Frame(sb, bg=C['card'])
         sb_top.pack(fill='x', side='top')
-        # 3D-іконка готелю (кольорова, з вбудованого PNG); запасний варіант — звичайний емодзі
+        # Компактна шапка: маленька 3D-іконка готелю ЗЛІВА, назва — СПРАВА (у два рядки:
+        # «Готель» / «Королівська Бочка»). Так меню нижче піднімається вгору.
+        _hrow = tk.Frame(sb_top, bg=C['card'])
+        _hrow.pack(fill='x', padx=12, pady=(10, 2))
         try:
             import base64 as _b64_ic, io as _io_ic
             from PIL import Image as _PILImg_ic
             _ic_img = _PILImg_ic.open(_io_ic.BytesIO(_b64_ic.b64decode(_HOTEL_ICON_3D_B64))).convert('RGBA')
-            self._sb_icon_img = ctk.CTkImage(light_image=_ic_img, dark_image=_ic_img, size=(64, 64))
-            ctk.CTkLabel(sb_top, text="", image=self._sb_icon_img).pack(pady=(16,0))
+            self._sb_icon_img = ctk.CTkImage(light_image=_ic_img, dark_image=_ic_img, size=(40, 40))
+            ctk.CTkLabel(_hrow, text="", image=self._sb_icon_img).pack(side='left')
         except Exception:
-            ctk.CTkLabel(sb_top, text="🏨", font=('Segoe UI',40)).pack(pady=(20,0))
-        self._sb_hotel_lbl = lbl(sb_top, _HOTEL_INFO.get('name','Готель\nКоролівська Бочка').replace(' ','\n',1), 11, True, C['accent'])
-        self._sb_hotel_lbl.pack()
+            ctk.CTkLabel(_hrow, text="🏨", font=('Segoe UI', 26)).pack(side='left')
+        self._sb_hotel_lbl = ctk.CTkLabel(
+            _hrow, text=_HOTEL_INFO.get('name', 'Готель\nКоролівська Бочка').replace(' ', '\n', 1),
+            font=('Segoe UI', 12, 'bold'), text_color=C['accent'],
+            justify='left', anchor='w', wraplength=135)
+        self._sb_hotel_lbl.pack(side='left', padx=(8, 0))
 
         # 🕒 Годинник із секундами під назвою готелю
         self._sb_clock = ctk.CTkLabel(sb_top, text="", font=('Segoe UI', 20, 'bold'),
                                       text_color=C['text'])
-        self._sb_clock.pack(pady=(4,0))
+        self._sb_clock.pack(pady=(2,0))
         self._sb_date = ctk.CTkLabel(sb_top, text="", font=('Segoe UI', 10),
                                      text_color=C['text2'])
         self._sb_date.pack(pady=(0,0))
@@ -11010,9 +11117,8 @@ class HotelApp(ctk.CTk):
         lbl(sb_top,f"👤 {self.user['full_name']}",11,color=C['text2']).pack(pady=(3,3))
 
         # ── Статус БД — бейдж-хмарка ─────────────────────
-        self._db_badge = ctk.CTkFrame(sb_top, fg_color=C['card2'], corner_radius=12)
-        self._db_badge.pack(fill='x', padx=10, pady=(0,5))
-        db_inner = tk.Frame(self._db_badge, bg=C['card2']); db_inner.pack(padx=8, pady=5)
+        self._db_badge = ctk.CTkFrame(self._topbar, fg_color=C['card2'], corner_radius=12)
+        db_inner = tk.Frame(self._db_badge, bg=C['card2']); db_inner.pack(padx=8, pady=4)
         self._db_dot = ctk.CTkLabel(db_inner, text="⬤", font=('Segoe UI', 11),
                                     text_color=C['gray'], width=16)
         self._db_dot.pack(side='left')
@@ -11023,7 +11129,7 @@ class HotelApp(ctk.CTk):
                                           font=('Segoe UI', 9, 'bold'), text_color=C['text2'])
         self._db_ping_lbl.pack(side='left', padx=(4,0))
 
-        btn(sb_top,"🚪 Вийти",self._quit,C['red'],190,height=34).pack(padx=10,pady=(2,12))
+        self._logout_btn = btn(self._topbar, "🚪 Вийти", self._quit, C['red'], 110, height=32)
 
         # ── Банер тестового режиму (прихований якщо режим вимкнено) ──
         self._test_banner = ctk.CTkFrame(sb_top, fg_color='#7c3a00', corner_radius=0)
@@ -11052,8 +11158,7 @@ class HotelApp(ctk.CTk):
         self.after(500, self._check_db_status)
 
         # ── Індикатор offline-синхронізації ──────────────────────────────────
-        self._sync_badge = ctk.CTkFrame(sb_top, fg_color=C['card2'], corner_radius=12)
-        self._sync_badge.pack(fill='x', padx=10, pady=(0, 4))
+        self._sync_badge = ctk.CTkFrame(self._topbar, fg_color=C['card2'], corner_radius=12)
         sync_inner = tk.Frame(self._sync_badge, bg=C['card2']); sync_inner.pack(padx=8, pady=4)
         self._sync_dot = ctk.CTkLabel(sync_inner, text="⬤", font=('Segoe UI', 11),
                                       text_color=C['green'], width=16)
@@ -11064,6 +11169,22 @@ class HotelApp(ctk.CTk):
         self._sync_count_lbl = ctk.CTkLabel(sync_inner, text="",
                                              font=('Segoe UI', 9, 'bold'), text_color=C['yellow'])
         self._sync_count_lbl.pack(side='left', padx=(4, 0))
+
+        # Верхня панель справа: [БД] [Синхронізовано] [Вийти] (pack справа наліво)
+        self._logout_btn.pack(side='right', padx=(4, 14), pady=7)
+        self._sync_badge.pack(side='right', padx=4, pady=7)
+        self._db_badge.pack(side='right', padx=4, pady=7)
+
+        # ── Z-звіт / X-звіт у самому верху, ліворуч від «БД: підключено» ──
+        # Видимі лише на Дашборді (див. _update_topbar_zx у _show).
+        self._zx_wrap = tk.Frame(self._topbar, bg=C['bg'])
+        btn_fit(self._zx_wrap, "🔒 Z звіт", lambda: self._open_x_or_z('Z-звіт'),
+                C['red']).pack(side='right', padx=(4, 0))
+        btn_fit(self._zx_wrap, "📋 X-звіт", lambda: self._open_x_or_z('X-звіт'),
+                C['card2']).pack(side='right', padx=(4, 0))
+        self._zx_visible = False
+        # Лівий край верхньої панелі: сюди Дашборд кладе заголовок/дату/зміну
+        self._dash_hdr_wrap = tk.Frame(self._topbar, bg=C['bg'])
 
         # Реєстрація callback зміни статусу онлайн/офлайн
         _sync_mgr._on_status_change = self._on_sync_status_change
@@ -11092,8 +11213,8 @@ class HotelApp(ctk.CTk):
             sb_nav._mw_bound = True
         except Exception: pass
 
-        self.content = tk.Frame(self, bg=C['bg'])
-        self.content.pack(side='left', fill='both', expand=True)
+        self.content = tk.Frame(right_wrap, bg=C['bg'])
+        self.content.pack(side='top', fill='both', expand=True)
         self._frame_cache = {}   # key → frame instance
         # Відкласти показ дашборду — вікно намалюється миттєво, вміст підвантажується
         self.after(10, lambda: self._show('dashboard'))
@@ -11301,10 +11422,40 @@ class HotelApp(ctk.CTk):
                     text=_HOTEL_INFO.get('name','Готель\nКоролівська Бочка').replace(' ','\n',1))
         except Exception: pass
 
+    def _open_x_or_z(self, report_type):
+        """Переходить до Звітів і вибирає X-звіт або Z-звіт."""
+        try:
+            self._show('reports')
+            def _set_type():
+                try:
+                    rf = self._frame_cache.get('reports')
+                    if rf and hasattr(rf, 'rep_type'):
+                        rf.rep_type.set(report_type)
+                        if hasattr(rf, '_show_report'):
+                            rf._show_report()
+                except Exception: pass
+            self.after(500, _set_type)
+        except Exception: pass
+
+    def _update_topbar_zx(self, key):
+        """Показує кнопки Z/X у верхній панелі лише на Дашборді."""
+        try:
+            want = (key == 'dashboard')
+            if want and not self._zx_visible:
+                self._zx_wrap.pack(side='right', padx=(4, 6), pady=7, after=self._db_badge)
+                self._dash_hdr_wrap.pack(side='left', padx=(14, 0), pady=7)
+                self._zx_visible = True
+            elif not want and self._zx_visible:
+                self._zx_wrap.pack_forget()
+                self._dash_hdr_wrap.pack_forget()
+                self._zx_visible = False
+        except Exception: pass
+
     def _show(self, key):
         # 0. Захист: якщо пункт меню вимкнений в налаштуваннях — на дашборд
         if key not in self.nav:
             key = 'dashboard'
+        self._update_topbar_zx(key)
         # 1. Оновити підсвітку кнопок навігації
         if self.active and self.active in self.nav:
             _c = _NAV_ICON_COLORS.get(self.active, C['text'])
@@ -11331,6 +11482,7 @@ class HotelApp(ctk.CTk):
             'visitors': VisitorsFrame,
             'guestdb': GuestDatabaseFrame,
             'chat': ChatFrame,
+            'invoices': InvoicesFrame,
             'settings': SettingsFrame,
         }
 
@@ -11944,40 +12096,42 @@ class DashboardFrame(tk.Frame):
         self._dep_tree         = None
         self._first_render     = True  # перший раз будуємо сітку, далі оновлюємо
 
-        self._hdr = tk.Frame(self, bg=C['bg']); self._hdr.pack(fill='x', padx=20, pady=(10,4))
-        lbl(self._hdr, f"🏠  Дашборд — {today.strftime('%d.%m.%Y')}", 22, True).pack(side='left')
-        self._shift_lbl = lbl(self._hdr, f"👤 {self.user.get('full_name','')}", 11, color=C['text2'])
-        self._shift_lbl.pack(side='left', padx=15)
-        lbl(self._hdr, f"v{APP_VERSION}", 11, color=C['text2']).pack(side='left', padx=(0, 15))
-        refresh_btn(self._hdr, self._load_data_async, side='right', padx=8)
-        # ── Кнопки X-звіт і Закрити зміну ──────────────────────────────
-        def _open_x_or_z(report_type):
-            """Переходить до Звітів і вибирає X-звіт або Z-звіт."""
+        # Заголовок живе у верхній панелі вікна (в одному рядку з Z/X, БД, Вийти)
+        _app = self.winfo_toplevel()
+        _host = getattr(_app, '_dash_hdr_wrap', None)
+        if _host is None:
+            _host = tk.Frame(self, bg=C['bg']); _host.pack(fill='x', padx=20, pady=(10,4))
+        else:
+            for _w in _host.winfo_children():
+                try: _w.destroy()
+                except Exception: pass
+        self._hdr = _host
+        self._title_lbl = lbl(self._hdr, f"🏠 Дашборд — {today.strftime('%d.%m.%Y')}", 16, True)
+        self._title_lbl.pack(side='left')
+        # Дата в заголовку оновлюється автоматично (також після опівночі)
+        def _tick_title():
             try:
-                app = self.winfo_toplevel()
-                if hasattr(app, '_show'):
-                    app._show('reports')
-                    def _set_type():
-                        try:
-                            rf = app._frame_cache.get('reports')
-                            if rf and hasattr(rf, 'rep_type'):
-                                rf.rep_type.set(report_type)
-                                if hasattr(rf, '_show_report'):
-                                    rf._show_report()
-                        except Exception: pass
-                    self.after(500, _set_type)
+                if not self.winfo_exists(): return
+                _t = date.today().strftime('%d.%m.%Y')
+                _txt = f"🏠 Дашборд — {_t}"
+                if self._title_lbl.cget('text') != _txt:
+                    self._title_lbl.configure(text=_txt)
+                self.after(30_000, _tick_title)
             except Exception: pass
-        btn_fit(self._hdr, "📋 X-звіт",  lambda: _open_x_or_z('X-звіт'), C['card2']).pack(side='right', padx=(0,4))
-        btn_fit(self._hdr, "🔒 Z звіт",  lambda: _open_x_or_z('Z-звіт'), C['red']).pack(side='right', padx=(0,4))
-        btn_fit(self._hdr, "🧾 Рахунок", lambda: _open_invoice_dlg(self), C['accent']).pack(side='right', padx=(0,4))
-        btn_fit(self._hdr, "📜 Історія", lambda: _open_invoices_history_dlg(self), C['card2']).pack(side='right', padx=(0,4))
+        self.after(30_000, _tick_title)
+        self._shift_lbl = lbl(self._hdr, f"👤 {self.user.get('full_name','')}", 10, color=C['text2'])
+        self._shift_lbl.pack(side='left', padx=(10, 6))
+        lbl(self._hdr, f"v{APP_VERSION}", 10, color=C['text2']).pack(side='left')
+        # Кнопки Z/X тепер у верхній панелі вікна (поруч із «БД: підключено»)
 
         # ── Банер "Готівка в касі / Залоги в касі" (як у Касі) ──
         # Контейнер тримає місце смуги в розкладці: при «Сховати/Показати» смуга
         # не «стрибає» в кінець (порядок pack важливий), а на її місці лишається
         # тонка смужка з кнопкою «Показати касу».
         self._cash_holder = tk.Frame(self, bg=C['bg'])
-        self._cash_holder.pack(fill='x', padx=20, pady=(0, 6))
+        self._cash_holder.pack(fill='x', padx=20, pady=(8, 6))
+        # Кнопка «Оновити» (раніше була в заголовку, який піднято у верхню панель)
+        refresh_btn(self._cash_holder, self._load_data_async, side='right', padx=(8, 0), pady=0)
         self._cash_banner = ctk.CTkFrame(self._cash_holder, fg_color=C['card2'], corner_radius=12)
         self._cash_strip = tk.Frame(self._cash_holder, bg=C['bg'])
         btn(self._cash_strip, "👁  Показати касу", lambda: self._set_cash_banner(True),
@@ -24090,6 +24244,73 @@ def _ro_room_map(order_ids):
         return {}
 
 
+# ══════════════════════════════════════════════════════
+# РЕСТОРАН: журнал «нараховано на номер» — щоб замовлення, нараховане на номер,
+# не зникало зі списку «Замовлення зміни» (навіть якщо close_order прибирає його з БД).
+# ══════════════════════════════════════════════════════
+_RRC_OK = False
+
+def _rrc_ensure():
+    global _RRC_OK
+    if _RRC_OK:
+        return
+    from app.utils.db import query as _q
+    _q("""CREATE TABLE IF NOT EXISTS restaurant_room_charges (
+        id SERIAL PRIMARY KEY,
+        order_id INTEGER,
+        booking_id INTEGER,
+        room_label TEXT,
+        guest TEXT,
+        total NUMERIC(12,2) DEFAULT 0,
+        items TEXT,
+        charged_by TEXT,
+        charged_at TIMESTAMPTZ DEFAULT NOW()
+    )""", fetch=None)
+    _RRC_OK = True
+
+def _rrc_save(order_id, booking_id, room_label, guest, total, items, by):
+    from app.utils.db import query as _q
+    _rrc_ensure()
+    data = [{'name': str(i.get('name', '')), 'qty': float(i.get('qty') or 1),
+             'price': float(i.get('price') or 0)} for i in (items or [])]
+    _q("""INSERT INTO restaurant_room_charges
+            (order_id, booking_id, room_label, guest, total, items, charged_by)
+          VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+       (order_id, booking_id, str(room_label), str(guest or ''), float(total or 0),
+        json.dumps(data, ensure_ascii=False), by), fetch=None)
+
+def _rrc_recent(exclude_ids=(), hours=24):
+    """Нарахування на номери за останні N годин (крім замовлень, що й так є у списку)."""
+    try:
+        from app.utils.db import query as _q
+        _rrc_ensure()
+        rows = _q("SELECT id, order_id, booking_id, room_label, guest, total, items, charged_at "
+                  "FROM restaurant_room_charges "
+                  "WHERE charged_at >= NOW() - (%s * INTERVAL '1 hour') ORDER BY id DESC",
+                  (hours,), fetch='all') or []
+        ex = set(exclude_ids or ())
+        seen, out = set(), []
+        for r in rows:
+            if r['order_id'] in ex or r['order_id'] in seen:
+                continue
+            seen.add(r['order_id']); out.append(r)
+        return out
+    except Exception as _e:
+        log_error("_rrc_recent", _e)
+        return []
+
+def _rrc_get(order_id):
+    try:
+        from app.utils.db import query as _q
+        _rrc_ensure()
+        return _q("SELECT id, order_id, room_label, guest, total, items, charged_at "
+                  "FROM restaurant_room_charges WHERE order_id=%s ORDER BY id DESC LIMIT 1",
+                  (order_id,), fetch='one') or None
+    except Exception as _e:
+        log_error("_rrc_get", _e)
+        return None
+
+
 class RestaurantFrame(tk.Frame):
     def __init__(self, parent, user):
         super().__init__(parent, bg=C['bg'])
@@ -24349,39 +24570,54 @@ class RestaurantFrame(tk.Frame):
         import threading
         threading.Thread(target=self._reload_orders_table_bg, daemon=True).start()
 
+    @staticmethod
+    def _order_recent(o, hours=24):
+        """Відкриті — завжди; решта — якщо створені за останні N годин (або час не розпізнано)."""
+        if (o.get('status') or '') == 'open':
+            return True
+        ca = o.get('created_at')
+        try:
+            import datetime as _dtr
+            if isinstance(ca, str):
+                ca = _dtr.datetime.fromisoformat(ca.strip().replace('Z', '+00:00').replace(' ', 'T', 1))
+            if ca is None:
+                return True
+            if getattr(ca, 'tzinfo', None):
+                return (_dtr.datetime.now(ca.tzinfo) - ca) < _dtr.timedelta(hours=hours)
+            # без часового поясу: час сервера може бути UTC — беремо запас +4 год
+            return abs(_dtr.datetime.now() - ca) < _dtr.timedelta(hours=hours + 4)
+        except Exception:
+            return True
+
     def _reload_orders_table_bg(self):
         try:
             from app.utils.db import get_conn as _gc
             with _gc() as _c:
                 with _c.cursor() as _cur:
-                    # Всі замовлення: відкриті ЗАВЖДИ + закриті за останні 24 год
+                    # Всі замовлення: відкриті ЗАВЖДИ + закриті за останні 24 год.
+                    # Фільтр за часом робимо в Python: у деяких БД created_at має текстовий тип,
+                    # і порівняння «created_at >= NOW() - INTERVAL» падало, через що закриті
+                    # (в т.ч. нараховані на номер) замовлення зникали зі списку.
+                    _sql_o = """
+                        SELECT ro.id, ro.status,
+                               COALESCE(ro.total,0) as total,
+                               ro.created_at,
+                               {note} as note
+                        FROM restaurant_orders ro
+                        WHERE ro.status = 'open'
+                           OR ro.id IN (SELECT id FROM restaurant_orders ORDER BY id DESC LIMIT 200)
+                        ORDER BY ro.id DESC
+                    """
                     try:
-                        _cur.execute("""
-                            SELECT ro.id, ro.status,
-                                   COALESCE(ro.total,0) as total,
-                                   ro.created_at,
-                                   COALESCE(ro.note,'') as note
-                            FROM restaurant_orders ro
-                            WHERE ro.status = 'open'
-                               OR ro.created_at >= NOW() - INTERVAL '24 hours'
-                            ORDER BY ro.id DESC
-                        """)
-                    except Exception:
-                        # Rollback перед fallback щоб скинути aborted transaction
+                        _cur.execute(_sql_o.format(note="COALESCE(ro.note,'')"))
+                    except Exception as _e_o1:
+                        log_error("Ресторан: список замовлень (з note)", _e_o1)
                         try: _c.rollback()
                         except Exception: pass
-                        # Fallback: просто всі відкриті
-                        _cur.execute("""
-                            SELECT id, status,
-                                   COALESCE(total,0) as total,
-                                   created_at,
-                                   COALESCE(note,'') as note
-                            FROM restaurant_orders
-                            WHERE status = 'open'
-                            ORDER BY id DESC
-                        """)
+                        _cur.execute(_sql_o.format(note="''"))
                     cols_o = [d[0] for d in _cur.description]
                     orders = [dict(zip(cols_o, r)) for r in _cur.fetchall()]
+                    orders = [o for o in orders if self._order_recent(o)]
 
                     # Всі позиції для цих замовлень
                     if orders:
@@ -24441,10 +24677,16 @@ class RestaurantFrame(tk.Frame):
         self._order_row_map = {}   # iid → order_id
         self._item_row_map  = {}   # iid → {'order_id':..,'item_id':..,'is_open':..}
 
-        STATUS_UA = {'open':'🟢 відкрите', 'closed':'⬛ закрите', 'paid':'✅ оплачено'}
+        STATUS_UA = {'open':'🟢 відкрите', 'closed':'⬛ закрите', 'paid':'✅ оплачено', 'room':'🏨 на номер'}
 
+        try:
+            orders, items_by_order, _snap_rooms = self._merge_room_charges(orders, items_by_order)
+        except Exception as _em:
+            log_error("merge_room_charges", _em); _snap_rooms = {}
         try: _rooms_map = _ro_room_map([o['id'] for o in orders])
         except Exception: _rooms_map = {}
+        for _k, _v in _snap_rooms.items():
+            _rooms_map.setdefault(_k, _v)
         for o in orders:
             oid    = o['id']
             status = STATUS_UA.get(o.get('status',''), o.get('status',''))
@@ -24468,7 +24710,7 @@ class RestaurantFrame(tk.Frame):
                 price = float(it.get('price') or 0)
                 total = float(it.get('total') or qty*price)
                 self.orders_tree.insert(hdr_iid, 'end', iid=item_iid,
-                    values=('', it.get('name','—'),
+                    values=('', _fix_mojibake(it.get('name','—')),
                             int(qty) if qty == int(qty) else qty,
                             f"{price:.0f}₴", f"{total:.0f}₴", ''),
                     tags=() if is_open else ('closed_row',))
@@ -24559,6 +24801,19 @@ class RestaurantFrame(tk.Frame):
                 if _k in s:
                     try: s[_k] = float(s[_k] or 0)
                     except Exception: s[_k] = 0.0
+        # Кракозябри в назвах (UTF-8, прочитане як cp1251) — виправляємо для показу
+        _bad = []
+        for s in self._svcs_cache:
+            try:
+                _nn = _fix_mojibake(s.get('name')); _cc = _fix_mojibake(s.get('category'))
+                if _nn != s.get('name') or _cc != s.get('category'):
+                    _bad.append((s.get('id'), s.get('name'), _nn, s.get('category'), _cc))
+                    s['name'] = _nn; s['category'] = _cc
+            except Exception: pass
+        self._mojibake_bad = _bad
+        if _bad and not getattr(self, '_mojibake_asked', False):
+            try: self.after(600, self._mojibake_prompt)
+            except Exception: pass
         self.menu_map = {s['name']: s for s in self._svcs_cache}
 
     # Словник перекладів категорій (технічна назва → красива українська)
@@ -24705,6 +24960,8 @@ class RestaurantFrame(tk.Frame):
 
     def _reload_orders_table_bg_sync(self):
         """Синхронне оновлення таблиці замовлень — виконується в головному потоці."""
+        self._reload_orders_table()   # єдиний шлях (з урахуванням нарахованих на номер)
+        return
         try:
             from app.utils.db import get_conn as _gc_s
             with _gc_s() as _c_s:
@@ -25092,6 +25349,7 @@ class RestaurantFrame(tk.Frame):
         return RestaurantFrame._roi_columns_cache
 
     def _add_item(self):
+        if self._rest_locked(): return
         if not self.cur_order:
             messagebox.showwarning("","Спочатку створіть замовлення (кнопка ➕ Нове)")
             return
@@ -25236,6 +25494,7 @@ class RestaurantFrame(tk.Frame):
         from app.modules.logic import close_order
         from app.utils.db import query
         if not self.cur_order: return
+        if self._rest_locked(): return
         try:
             query("UPDATE restaurant_orders SET total=(SELECT COALESCE(SUM(total),0) FROM restaurant_order_items WHERE order_id=%s) WHERE id=%s",(self.cur_order,self.cur_order),fetch=None)
         except Exception: pass
@@ -25474,6 +25733,10 @@ class RestaurantFrame(tk.Frame):
     def _reset_order(self):
         self.cur_order = None
         self.order_lbl.configure(text="Замовлення: —")
+        try:
+            self._order_num_lbl.configure(text="Замовлення: —")
+            self._order_status_lbl.configure(text="")
+        except Exception: pass
         try: self.total_lbl.configure(text="Разом: 0.00₴")
         except Exception: pass
         self._refresh_room_lbl()
@@ -25545,6 +25808,7 @@ class RestaurantFrame(tk.Frame):
         from app.utils.db import query
         from app.modules.logic import close_order
         if not self.cur_order: return
+        if self._rest_locked(): return
         rooms=query("SELECT b.id,r.number,g.name as guest FROM bookings b JOIN rooms r ON b.room_id=r.id JOIN guests g ON b.guest_id=g.id WHERE b.status='checkedin' ORDER BY r.number")
         if not rooms: messagebox.showinfo("","Немає заселених гостей"); return
         win=dlg_win(self,"На який номер?","420x320")
@@ -25606,6 +25870,20 @@ class RestaurantFrame(tk.Frame):
             except Exception as e:
                 messagebox.showerror("❌", f"Помилка нарахування:\n{e}"); return
 
+            try:
+                _by = self.user.get('full_name', self.user.get('username', '—'))
+                _rrc_save(self.cur_order, bid_sel, room_num, guest_name, rest_total, items, _by)
+                log_info(f"Ресторан: замовлення #{self.cur_order} нараховано на номер {room_num} (журнал збережено)")
+            except Exception as _er:
+                log_error("restaurant_room_charges save", _er)
+                messagebox.showwarning(
+                    "Журнал нарахувань",
+                    "Замовлення нараховано на номер, але запис у журнал не збережено —\n"
+                    f"воно не з'явиться у списку «Замовлення зміни».\n\nПричина: {_er}")
+            try:
+                _ro_set_room(self.cur_order, bid_sel, str(room_num), str(guest_name))
+            except Exception as _er2:
+                log_error("ro_set_room after charge", _er2)
             # ── ВИПРАВЛЕННЯ: Видалення дублювання запису платежу ──
             # close_order вже записує платіж, тому не потрібно записувати ще раз
             # (це причина чому дохід дублювався)
@@ -25775,6 +26053,14 @@ class RestaurantFrame(tk.Frame):
             log_error("_print_bill", e)
             messagebox.showerror("Помилка", f"Не вдалося завантажити замовлення:\n{e}"); return
         if not items:
+            _sn = _rrc_get(oid)
+            if _sn:
+                try:
+                    items = [{'name': i.get('name'), 'qty': i.get('qty'), 'price': i.get('price')}
+                             for i in json.loads(_sn.get('items') or '[]')]
+                    status = 'room'
+                except Exception: items = []
+        if not items:
             messagebox.showinfo("", "У замовленні немає позицій"); return
         import datetime as _dtb
         now_str = _dtb.datetime.now().strftime('%d.%m.%Y  %H:%M')
@@ -25785,12 +26071,13 @@ class RestaurantFrame(tk.Frame):
             q = float(it.get('qty') or 1); p = float(it.get('price') or 0)
             total += q * p
             qs = int(q) if q == int(q) else q
-            body.append(f"  {str(it.get('name',''))[:28]:<28} {qs}x{p:.0f}₴ = {q*p:.0f}₴")
+            body.append(f"  {_fix_mojibake(str(it.get('name','')))[:28]:<28} {qs}x{p:.0f}₴ = {q*p:.0f}₴")
         opened = (status == 'open')
         lines = [
             f"{'─'*48}",
             f"  🧾  РАХУНОК РЕСТОРАНУ / БАРУ",
-            (f"  (замовлення не закрите — попередній рахунок)" if opened else f"  (замовлення вже закрите)"),
+            (f"  (замовлення не закрите — попередній рахунок)" if opened else
+             (f"  (нараховано на номер)" if status == 'room' else f"  (замовлення вже закрите)")),
             f"{'─'*48}",
             f"  Замовлення : #{oid}",
             *self._room_receipt_lines(oid),
@@ -25800,10 +26087,78 @@ class RestaurantFrame(tk.Frame):
             *body,
             f"{'─'*48}",
             f"  РАЗОМ      : {total:.0f}₴",
-            f"  Статус     : {'НЕ ОПЛАЧЕНО' if opened else 'закрито'}",
+            f"  Статус     : {'НЕ ОПЛАЧЕНО' if opened else ('нараховано на номер' if status == 'room' else 'закрито')}",
             f"{'─'*48}",
         ]
         print_text(f"Рахунок ресторан #{oid}" + (" (не закрито)" if opened else ""), lines)
+
+    def _mojibake_prompt(self):
+        """Пропонує один раз за сеанс виправити кракозябри в назвах меню прямо в БД."""
+        bad = getattr(self, '_mojibake_bad', None) or []
+        if not bad or getattr(self, '_mojibake_asked', False):
+            return
+        self._mojibake_asked = True
+        ex = "\n".join(f"   {b[1]}  →  {b[2]}" for b in bad[:4])
+        if not messagebox.askyesno(
+                "Кракозябри в меню",
+                f"Знайдено позицій із пошкодженим кодуванням: {len(bad)}\n\n{ex}\n\n"
+                "У списку вони вже показуються правильно.\n"
+                "Виправити їх у базі даних назавжди\n"
+                "(щоб правильно було і в замовленнях, чеках та звітах)?", parent=self):
+            return
+        from app.utils.db import query
+        ok = fail = 0
+        for sid, old_n, new_n, old_c, new_c in bad:
+            try:
+                if new_n != old_n:
+                    query("UPDATE services SET name=%s WHERE id=%s", (new_n, sid), fetch=None)
+                if new_c != old_c:
+                    query("UPDATE services SET category=%s WHERE id=%s", (new_c, sid), fetch=None)
+                ok += 1
+            except Exception as e:
+                fail += 1
+                log_error("mojibake fix", e)
+        messagebox.showinfo("Готово", f"Виправлено в БД: {ok}" + (f"\nНе вдалося: {fail} (див. лог)" if fail else ""))
+        try: self._reload_menu()
+        except Exception: pass
+
+    def _merge_room_charges(self, orders, items_by_order):
+        """Додає до списку замовлень зміни ті, що нараховані на номер (з журналу)."""
+        snaps = _rrc_recent({o['id'] for o in orders})
+        self._room_charged_ids = {s['order_id'] for s in snaps}
+        if not snaps:
+            return orders, items_by_order, {}
+        orders = list(orders)
+        ibo = {k: list(v) for k, v in items_by_order.items()}
+        rooms = {}
+        for s in snaps:
+            oid = s['order_id']
+            ca = s.get('charged_at')
+            try:
+                if getattr(ca, 'tzinfo', None): ca = ca.astimezone()
+            except Exception: pass
+            orders.append({'id': oid, 'status': 'room', 'total': float(s.get('total') or 0),
+                           'created_at': ca, 'note': ''})
+            try: its = json.loads(s.get('items') or '[]')
+            except Exception: its = []
+            lst = []
+            for n, it in enumerate(its):
+                q = float(it.get('qty') or 1); p = float(it.get('price') or 0)
+                lst.append({'id': f"s{s['id']}_{n}", 'order_id': oid, 'name': it.get('name', '—'),
+                            'quantity': q, 'price': p, 'total': q * p})
+            ibo[oid] = lst
+            rooms[oid] = _rn(s['room_label']) + (f" · {s['guest']}" if s.get('guest') else '')
+        orders.sort(key=lambda o: o['id'], reverse=True)
+        return orders, ibo, rooms
+
+    def _rest_locked(self):
+        """True (і повідомлення), якщо поточне замовлення вже нараховане на номер."""
+        if self.cur_order and self.cur_order in getattr(self, '_room_charged_ids', set()):
+            messagebox.showinfo("🏨 Вже нараховано",
+                                f"Замовлення #{self.cur_order} уже нараховано на номер.\n"
+                                "Його не можна змінювати. Для нового замовлення натисніть «➕ Нове».")
+            return True
+        return False
 
     def _edit_order(self):
         """Редагувати вибране замовлення — тепер через orders_tree."""
@@ -25853,6 +26208,7 @@ class RestaurantFrame(tk.Frame):
         if not self.cur_order:
             messagebox.showwarning("", "Немає активного замовлення")
             return
+        if self._rest_locked(): return
         
         # Діалог вибору методу оплати
         win = tk.Toplevel(self)
