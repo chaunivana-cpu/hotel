@@ -11090,8 +11090,9 @@ class HotelApp(ctk.CTk):
         self._sb_hotel_lbl = ctk.CTkLabel(
             _hrow, text=_HOTEL_INFO.get('name', 'Готель\nКоролівська Бочка').replace(' ', '\n', 1),
             font=('Segoe UI', 12, 'bold'), text_color=C['accent'],
-            justify='left', anchor='w', wraplength=135)
-        self._sb_hotel_lbl.pack(side='left', padx=(8, 0))
+            justify='center', anchor='center', wraplength=135)
+        # «Готель» по центру, нижче — «Королівська Бочка» (обидва рядки вирівняні по центру)
+        self._sb_hotel_lbl.pack(side='left', expand=True, fill='x', padx=(4, 0))
 
         # 🕒 Годинник із секундами під назвою готелю
         self._sb_clock = ctk.CTkLabel(sb_top, text="", font=('Segoe UI', 20, 'bold'),
@@ -25844,17 +25845,7 @@ class RestaurantFrame(tk.Frame):
                 from app.utils.db import get_conn as _gcR2
                 with _gcR2() as _cR:
                     with _cR.cursor() as _curR:
-                        try:
-                            _curR.execute(
-                                "SELECT COALESCE(s.name, roi.name, '—'), roi.quantity, roi.price "
-                                "FROM restaurant_order_items roi "
-                                "LEFT JOIN services s ON roi.service_id=s.id "
-                                "WHERE roi.order_id=%s ORDER BY roi.id", (self.cur_order,))
-                        except Exception:
-                            _curR.execute(
-                                "SELECT name, qty, price FROM restaurant_order_items WHERE order_id=%s ORDER BY id",
-                                (self.cur_order,))
-                        items = [dict(zip(['name','qty','price'], r)) for r in _curR.fetchall()]
+                        items = self._fetch_order_items_dicts(_curR, _cR, self.cur_order)
             except Exception:
                 items = []
 
@@ -26022,6 +26013,33 @@ class RestaurantFrame(tk.Frame):
         btn(row, "✅ Вибрати", save, C['green'], 170, height=40).pack(side='left', padx=(0, 6))
         btn(row, "✖ Без номера", clear, C['card2'], 140, height=40).pack(side='left')
 
+    def _fetch_order_items_dicts(self, cur, conn, oid):
+        """Позиції замовлення для чека/рахунку: [{'name','qty','price'}].
+        Реальні колонки restaurant_order_items визначаються динамічно
+        (name/qty можуть бути відсутні — тоді назва береться з services)."""
+        try:
+            cols = self._get_roi_columns(cur)
+        except Exception:
+            try: conn.rollback()
+            except Exception: pass
+            cols = set()
+        qty_col  = 'quantity' if 'quantity' in cols else ('qty' if 'qty' in cols else None)
+        name_col = next((c for c in ('name', 'item_name', 'title', 'service_name') if c in cols), None)
+        name_expr = f"COALESCE(s.name, roi.{name_col}, '—')" if name_col else "COALESCE(s.name, '—')"
+        qty_expr  = f"roi.{qty_col}" if qty_col else "1"
+        try:
+            cur.execute(
+                f"SELECT {name_expr}, {qty_expr}, roi.price "
+                "FROM restaurant_order_items roi "
+                "LEFT JOIN services s ON roi.service_id=s.id "
+                "WHERE roi.order_id=%s ORDER BY roi.id", (oid,))
+            return [dict(zip(['name', 'qty', 'price'], r)) for r in cur.fetchall()]
+        except Exception as _e:
+            log_error("_fetch_order_items_dicts", _e)
+            try: conn.rollback()
+            except Exception: pass
+            return []
+
     def _print_bill(self):
         """Друк РАХУНКУ по незакритому замовленню (замовлення лишається відкритим)."""
         oid = self.cur_order
@@ -26032,16 +26050,7 @@ class RestaurantFrame(tk.Frame):
             from app.utils.db import get_conn as _gcB
             with _gcB() as _cB:
                 with _cB.cursor() as _curB:
-                    try:
-                        _curB.execute("SELECT COALESCE(s.name, roi.name, '—'), roi.quantity, roi.price "
-                                      "FROM restaurant_order_items roi LEFT JOIN services s ON roi.service_id=s.id "
-                                      "WHERE roi.order_id=%s ORDER BY roi.id", (oid,))
-                    except Exception:
-                        try: _cB.rollback()
-                        except Exception: pass
-                        _curB.execute("SELECT name, qty, price FROM restaurant_order_items "
-                                      "WHERE order_id=%s ORDER BY id", (oid,))
-                    items = [dict(zip(['name', 'qty', 'price'], r)) for r in _curB.fetchall()]
+                    items = self._fetch_order_items_dicts(_curB, _cB, oid)
                     try:
                         _curB.execute("SELECT status FROM restaurant_orders WHERE id=%s", (oid,))
                         _r = _curB.fetchone()
