@@ -35440,9 +35440,70 @@ class SettingsFrame(tk.Frame):
             self._load_rooms()
         except Exception as e:
             log_error("_room_del", e)
-            messagebox.showerror("Помилка",str(e))
+            _msg = str(e).lower()
+            if 'foreign key' in _msg or 'violates' in _msg:
+                # Номер має історію (завершені бронювання тощо) — пропонуємо перенести її на інший номер
+                try: self._room_del_merge(rid, _name)
+                except Exception as _e2:
+                    log_error("_room_del_merge", _e2)
+                    messagebox.showerror("Помилка", str(_e2))
+            else:
+                messagebox.showerror("Помилка",str(e))
             try: self._load_rooms()
             except Exception: pass
+
+    def _room_del_merge(self, rid, name):
+        """Номер не можна видалити, бо на нього посилається історія (bookings тощо).
+        Переносимо всю історію на обраний номер і видаляємо цей — звіти й каса лишаються цілими."""
+        import difflib
+        from app.modules.logic import delete_room
+        from app.utils.db import query as _qm
+        others = _qm("SELECT id, number FROM rooms WHERE id<>%s ORDER BY number", (rid,), fetch='all') or []
+        if not others:
+            messagebox.showwarning("Не можна видалити", "Іншого номера для переносу історії немає."); return
+        try:
+            _cnt = _qm("SELECT COUNT(*) AS c FROM bookings WHERE room_id=%s", (rid,), fetch='one')
+            _hist = int(_cnt['c'] if isinstance(_cnt, dict) else _cnt[0])
+        except Exception:
+            _hist = 0
+        labels = {f"{o['number']} (id {o['id']})": int(o['id']) for o in others}
+        _close = difflib.get_close_matches(str(name), [str(o['number']) for o in others], n=1, cutoff=0.4)
+        _first = next((k for k in labels if _close and k.startswith(_close[0] + ' (')), list(labels.keys())[0])
+
+        win = dlg_win(self, "Видалення номера", "480x300")
+        f = card(win); f.pack(fill='both', expand=True, padx=12, pady=12)
+        lbl(f, f"Номер «{name}» має історію ({_hist} бронювань) —", 12, True).pack(anchor='w', padx=10, pady=(10, 0))
+        lbl(f, "її не можна просто стерти (зламаються звіти й каса).", 11, color=C['text2']).pack(anchor='w', padx=10)
+        lbl(f, "Перенести історію на номер:", 11).pack(anchor='w', padx=10, pady=(14, 4))
+        _var = tk.StringVar(value=_first)
+        ctk.CTkComboBox(f, values=list(labels.keys()), variable=_var, width=400, state='readonly').pack(padx=10)
+
+        def _do():
+            try:
+                target = labels[_var.get()]
+                from app.utils.db import get_conn as _gcm
+                with _gcm() as _cm:
+                    with _cm.cursor() as _cu:
+                        _cu.execute("""SELECT c.conrelid::regclass::text, a.attname
+                                       FROM pg_constraint c
+                                       JOIN pg_attribute a ON a.attrelid=c.conrelid AND a.attnum = ANY(c.conkey)
+                                       WHERE c.contype='f' AND c.confrelid='rooms'::regclass""")
+                        refs = _cu.fetchall()
+                        for _row in refs:
+                            _t, _c = (_row[0], _row[1]) if not isinstance(_row, dict) else list(_row.values())[:2]
+                            _cu.execute(f'UPDATE {_t} SET "{_c}"=%s WHERE "{_c}"=%s', (target, rid))
+                    _cm.commit()
+                delete_room(rid)
+                try: _invalidate_rooms_cache()
+                except Exception: pass
+                win.destroy()
+                self._load_rooms()
+            except Exception as e:
+                log_error("_room_del_merge._do", e)
+                messagebox.showerror("Помилка", str(e))
+        row = tk.Frame(f, bg=C['card']); row.pack(pady=18)
+        btn(row, "🗑 Перенести і видалити", _do, C['red'], 200).pack(side='left', padx=6)
+        btn(row, "Скасувати", win.destroy, C['card2'], 120).pack(side='left', padx=6)
 
     def _load_cleaning_log(self):
         if not hasattr(self,'clean_t'): return
