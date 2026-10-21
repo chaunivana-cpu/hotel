@@ -1069,8 +1069,66 @@ def _room_category_map():
 _cat_price_cache = {'t': 0.0, 'v': {}}
 
 
+_wk_price_cache = {'t': 0.0, 'v': {}}
+_wk_col_ready = {'ok': False}
+WEEKEND_WEEKDAYS = (5, 6)     # Сб, Нд: ніч, що ПОЧИНАЄТЬСЯ в ці дні, — за ціною вихідних
+
+
+def _ensure_weekend_col():
+    """Додає колонку room_categories.weekend_price (ціна вихідних), якщо її ще немає."""
+    if _wk_col_ready['ok']:
+        return
+    try:
+        from app.utils.db import get_conn as _gcw
+        with _gcw() as _cw:
+            with _cw.cursor() as _cuw:
+                _cuw.execute("ALTER TABLE room_categories ADD COLUMN IF NOT EXISTS weekend_price NUMERIC(10,2)")
+                try:
+                    _cuw.execute("CREATE OR REPLACE VIEW categories AS SELECT * FROM room_categories")
+                except Exception:
+                    _cw.rollback()
+                    _cuw.execute("ALTER TABLE room_categories ADD COLUMN IF NOT EXISTS weekend_price NUMERIC(10,2)")
+            _cw.commit()
+        _wk_col_ready['ok'] = True
+    except Exception as _e:
+        try: log_error("_ensure_weekend_col", _e)
+        except Exception: pass
+
+
+def _category_weekend_map(force=False):
+    """{category_id: ціна_вихідних} лише для категорій, де вона задана (>0). Кеш 30 с."""
+    if (not force) and _ph_time.time() - _wk_price_cache['t'] < 30:
+        return _wk_price_cache['v']
+    m = {}
+    try:
+        from app.utils.db import query as _qw
+        try:
+            rows = _qw("SELECT id, weekend_price FROM room_categories", fetch='all')
+        except Exception:
+            _ensure_weekend_col()
+            rows = _qw("SELECT id, weekend_price FROM room_categories", fetch='all')
+        for r in (rows or []):
+            try:
+                v = float(r.get('weekend_price') or 0)
+                if v > 0: m[int(r['id'])] = v
+            except Exception: pass
+    except Exception:
+        m = _wk_price_cache['v']
+    _wk_price_cache['t'] = _ph_time.time(); _wk_price_cache['v'] = m
+    return m
+
+
+def _stay_nights_total(cat_id, stored_price, check_in, nights):
+    """Сума за n ночей від check_in з урахуванням ціни вихідних (по кожній ночі окремо)."""
+    if hasattr(check_in, 'date') and callable(getattr(check_in, 'date')):
+        check_in = check_in.date()
+    n = max(int(nights or 1), 1)
+    return sum(_night_price(cat_id, stored_price, check_in + timedelta(days=i)) for i in range(n))
+
+
 def _invalidate_price_caches():
     """Скидає кеші цін/категорій (викликати після зміни ціни категорії)."""
+    _wk_price_cache['t'] = 0.0
     _cat_price_cache['t'] = 0.0
     _room_cat_cache['t'] = 0.0
     _price_hist['t'] = 0.0
@@ -1124,6 +1182,12 @@ def _night_price(cat_id, stored_price, night_date):
         cur, hourly = 0.0, False
     if hourly or cur <= 0:
         return stored
+    try:
+        if night_date is not None and night_date.weekday() in WEEKEND_WEEKDAYS:
+            wk = _category_weekend_map().get(int(cat_id))
+            if wk: return float(wk)
+    except Exception:
+        pass
     return cur
 
 
@@ -1160,27 +1224,49 @@ def _sync_booking_prices_with_categories(force=False):
     n = 0
     try:
         from app.utils.db import query as _q
-        for _tbl in ('room_categories', 'categories'):
+        pm = _category_price_map(force=True)
+        _category_weekend_map(force=True)
+        # точність колонки price_per_day (щоб середня ціна не «гойдалась» через округлення)
+        scale = 2
+        try:
+            _r = _q("SELECT numeric_scale FROM information_schema.columns "
+                    "WHERE table_name='bookings' AND column_name='price_per_day' LIMIT 1", fetch='one')
+            if _r and _r.get('numeric_scale') is not None:
+                scale = int(_r['numeric_scale'])
+            elif _r:
+                scale = 0
+        except Exception:
+            pass
+        rows = _q("""SELECT b.id, b.check_in, b.check_out, COALESCE(b.price_per_day,0) AS ppd,
+                            r.category_id AS cid
+                     FROM bookings b JOIN rooms r ON r.id = b.room_id
+                     WHERE b.status IN ('confirmed','checkedin') AND r.category_id IS NOT NULL""",
+                  (), fetch='all') or []
+        for row in rows:
             try:
-                rows = _q(f"""
-                    UPDATE bookings b
-                    SET total_amount = CASE WHEN COALESCE(b.total_amount, 0) > 0
-                            THEN b.total_amount
-                                 + (rc.base_price - COALESCE(b.price_per_day, 0))
-                                   * GREATEST(b.check_out - b.check_in, 1)
-                            ELSE b.total_amount END,
-                        price_per_day = rc.base_price
-                    FROM rooms r JOIN {_tbl} rc ON rc.id = r.category_id
-                    WHERE b.room_id = r.id
-                      AND b.status IN ('confirmed', 'checkedin')
-                      AND rc.base_price > 0
-                      AND POSITION('[tariff:hour]' IN COALESCE(rc.description, '')) = 0
-                      AND ABS(COALESCE(b.price_per_day, 0) - rc.base_price) > 0.004
-                    RETURNING b.id""", (), fetch='all')
-                n = len(rows or [])
-                break
-            except Exception:
-                continue
+                cid = int(row['cid'])
+                cur, hourly = pm.get(cid, (0.0, False))
+                if hourly or cur <= 0:
+                    continue
+                ci, co = row['check_in'], row['check_out']
+                if hasattr(ci, 'date') and callable(getattr(ci, 'date')): ci = ci.date()
+                if hasattr(co, 'date') and callable(getattr(co, 'date')): co = co.date()
+                nights = max((co - ci).days, 1)
+                total_new = _stay_nights_total(cid, cur, ci, nights)
+                new_ppd = round(total_new / nights, scale)
+                old_ppd = round(float(row['ppd'] or 0), scale)
+                if new_ppd == old_ppd:
+                    continue
+                delta = (new_ppd - float(row['ppd'] or 0)) * nights
+                _q("""UPDATE bookings
+                      SET total_amount = CASE WHEN COALESCE(total_amount,0) > 0
+                                              THEN total_amount + %s ELSE total_amount END,
+                          price_per_day = %s
+                      WHERE id = %s""", (delta, new_ppd, row['id']), fetch=None)
+                n += 1
+            except Exception as _eb:
+                try: log_error("_sync_booking_prices: бронь", _eb)
+                except Exception: pass
     except Exception as _e:
         try: log_error("_sync_booking_prices_with_categories", _e)
         except Exception: pass
@@ -35966,15 +36052,19 @@ class SettingsFrame(tk.Frame):
 
     def _load_cats(self):
         from app.modules.logic import get_categories
+        try: _category_weekend_map(force=True)
+        except Exception: pass
         self.cats_t.delete(*self.cats_t.get_children())
         for c in (get_categories() or []):
             _desc = (c.get('description','') or '').replace('[tariff:hour]','').replace('[tariff:night]','').strip()
             _tariff = '⏱год' if '[tariff:hour]' in (c.get('description','') or '') else '🌙ніч'
-            self.cats_t.insert('','end',iid=c['id'],values=(c['id'],c['name'],_desc,f"{float(c['base_price'] or 0):.0f}₴ ({_tariff})",c['capacity']))
+            _wk = _category_weekend_map().get(int(c['id'])) if _tariff != '⏱год' else None
+            _ptxt = f"{float(c['base_price'] or 0):.0f}₴ ({_tariff})" + (f" · вих. {_wk:.0f}₴" if _wk else "")
+            self.cats_t.insert('','end',iid=c['id'],values=(c['id'],c['name'],_desc,_ptxt,c['capacity']))
 
     def _cat_dlg(self,p,cat=None):
         from app.modules.logic import save_category
-        win=dlg_win(self,"Категорія","420x360"); f=card(win); f.pack(fill='both',expand=True,padx=15,pady=15)
+        win=dlg_win(self,"Категорія","520x420"); f=card(win); f.pack(fill='both',expand=True,padx=15,pady=15)
         flds={}
 
         # Визначити тариф з тегу в описі (тег має пріоритет над назвою)
@@ -36019,6 +36109,20 @@ class SettingsFrame(tk.Frame):
         price_unit_lbl.pack(side='left',padx=6)
         flds['base_price'] = e_price
 
+        # Ціна вихідних (ночі Сб і Нд). Порожньо = така сама, як у будні.
+        r_wk = row_frm(f)
+        ctk.CTkLabel(r_wk,text="Ціна вихідних",font=('Segoe UI',11),text_color=C['text2'],width=130,anchor='w').pack(side='left')
+        e_wk = ent(r_wk,w=140)
+        try:
+            _ensure_weekend_col()
+            _wk0 = _category_weekend_map(force=True).get(int(cat['id'])) if cat else None
+        except Exception:
+            _wk0 = None
+        if _wk0: e_wk.insert(0, '%g' % _wk0)
+        e_wk.pack(side='left')
+        ctk.CTkLabel(r_wk,text="₴ (Сб, Нд; порожньо = як у будні)",font=('Segoe UI',10),text_color=C['text2']).pack(side='left',padx=6)
+        flds['weekend_price'] = e_wk
+
         def _on_tariff_change(*a):
             price_unit_lbl.configure(text="₴/год" if tariff_var.get()=='hour' else "₴/ніч")
         tariff_var.trace_add('write', _on_tariff_change)
@@ -36034,6 +36138,12 @@ class SettingsFrame(tk.Frame):
                 _cap_val = int(flds['capacity'].get() or 2)
             except ValueError:
                 messagebox.showerror("","Місць має бути цілим числом"); return
+            try:
+                _wk_txt = flds['weekend_price'].get().strip().replace(',', '.')
+                _wk_val = float(_wk_txt) if _wk_txt else None
+                if _wk_val is not None and _wk_val < 0: raise ValueError
+            except ValueError:
+                messagebox.showerror("","Ціна вихідних має бути числом"); return
 
             # Зміна ціни діє З ДАТИ ЗМІНИ: чинні заселення (оплачені за старою ціною) не
             # перераховуються; продовження та прострочені ночі від цієї дати — за новою ціною.
@@ -36054,6 +36164,20 @@ class SettingsFrame(tk.Frame):
                                'capacity':_cap_val}, cat['id'] if cat else None)
                 if _rec_hist:
                     _record_price_change(cat['id'], _old_p, _price_val)
+                # Ціна вихідних: зберігаємо окремо (id нової категорії шукаємо за назвою)
+                try:
+                    from app.utils.db import query as _qwk
+                    _ensure_weekend_col()
+                    _cid = cat['id'] if cat else None
+                    if _cid is None:
+                        _rr = _qwk("SELECT id FROM room_categories WHERE name=%s ORDER BY id DESC LIMIT 1",
+                                   (flds['name'].get().strip(),), fetch='one')
+                        _cid = _rr['id'] if _rr else None
+                    if _cid is not None:
+                        _qwk("UPDATE room_categories SET weekend_price=%s WHERE id=%s",
+                             (_wk_val if (_wk_val and tariff_var.get() != 'hour') else None, _cid), fetch=None)
+                except Exception as _ew:
+                    log_error("зберігання ціни вихідних", _ew)
                 _invalidate_price_caches()
                 _sync_booking_prices_with_categories(force=True)
 
