@@ -14219,16 +14219,25 @@ class CleaningFrame(tk.Frame):
             variable=self._filter_var,width=140,fg_color=C['card2'],button_color=C['accent'],
             command=lambda v:self._load_log()).pack(side='left',padx=4)
         btn(ff,"🗑 Очистити журнал",self._clear_log,C['red'],160).pack(side='right',padx=10,pady=8)
+        # Масова зміна статусу вибраних (галочками) номерів
+        self._sel_lbl = lbl(ff,"Вибрано: 0",11,True,C['text2']); self._sel_lbl.pack(side='left',padx=(18,6))
+        btn(ff,"✅ Вільний",lambda: self._bulk_status('free'),C['green'],110).pack(side='left',padx=3,pady=8)
+        btn(ff,"🔧 Ремонт",lambda: self._bulk_status('repair'),C['gray'],110).pack(side='left',padx=3,pady=8)
+        btn(ff,"🔒 Заблоковано",lambda: self._bulk_status('blocked'),C['red'],140).pack(side='left',padx=3,pady=8)
 
         # Таблиця
         main=tk.Frame(self,bg=C['bg']); main.pack(fill='both',expand=True,padx=15,pady=5)
-        ff2,self.clean_t=mktree(main,('room','cleaner','started','finished','status','note'),
-                                20,[70,160,130,130,110,200])
-        for c,h in zip(('room','cleaner','started','finished','status','note'),
-                       ['Кімн.','Прибиральник','Початок','Кінець','Статус після','Нотатка']):
+        ff2,self.clean_t=mktree(main,('chk','room','cleaner','started','finished','status','note'),
+                                20,[40,70,160,130,130,110,200])
+        for c,h in zip(('chk','room','cleaner','started','finished','status','note'),
+                       ['☐','Кімн.','Прибиральник','Початок','Кінець','Статус після','Нотатка']):
             self.clean_t.heading(c,text=h)
+        self.clean_t.column('chk', width=40, minwidth=40, stretch=False)
         ff2.pack(fill='both',expand=True)
         self.clean_t.bind('<Double-1>', self._edit_log_row)
+        # Галочки вибору номерів: клік по першій колонці (по заголовку «☐» — вибрати/зняти всі)
+        self._checked = set()
+        self.clean_t.bind('<Button-1>', self._on_tree_click, add='+')
         self._log=log
         self._load_log()
 
@@ -14357,15 +14366,118 @@ class CleaningFrame(tk.Frame):
                     last_shift = shift_name
                     _shift_txt = f"Зміна: {shift_name}" if shift_name else "Зміна: —"
                     self.clean_t.insert('', 'end', iid=f'__day_{day}_{idx}', tags=('day_header',),
-                                        values=('📅 ' + day, _shift_txt, f'Прибирань: {counts.get(day, 0)}', '', '', ''))
+                                        values=('☐', '📅 ' + day, _shift_txt, f'Прибирань: {counts.get(day, 0)}', '', '', ''))
                 ns = e.get('new_status', '')
                 self.clean_t.insert('','end', iid=str(idx), values=(
+                    '☑' if str(idx) in getattr(self, '_checked', set()) else '☐',
                     e.get('room',''), e.get('cleaner',''),
                     e.get('started',''), e.get('finished',''),
                     status_map.get(ns,ns), e.get('note','')))
             except Exception as _row_err:
                 log_error("CleaningFrame._load_log row", _row_err)
                 continue
+
+    # ── Галочки вибору та масова зміна статусу ────────────────────────────────
+    def _group_rows(self, header_iid):
+        """Рядки запису, що належать заголовку дня/зміни (до наступного заголовка)."""
+        out = []; seen = False
+        for iid in self.clean_t.get_children(''):
+            if iid == header_iid: seen = True; continue
+            if seen:
+                if str(iid).startswith('__day_'): break
+                out.append(iid)
+        return out
+
+    def _refresh_checks(self):
+        for iid in self.clean_t.get_children(''):
+            if str(iid).startswith('__day_'):
+                rows = self._group_rows(iid)
+                mark = '☑' if rows and all(r in self._checked for r in rows) else '☐'
+            else:
+                mark = '☑' if iid in self._checked else '☐'
+            try: self.clean_t.set(iid, 'chk', mark)
+            except Exception: pass
+        try: self._sel_lbl.configure(text=f"Вибрано: {len(self._checked)}")
+        except Exception: pass
+
+    def _on_tree_click(self, event):
+        t = self.clean_t
+        col = t.identify_column(event.x)
+        if col != '#1':
+            return
+        region = t.identify_region(event.x, event.y)
+        if region == 'heading':          # ☐ у заголовку — вибрати/зняти всі видимі
+            rows = [i for i in t.get_children('') if not str(i).startswith('__day_')]
+            if rows and all(r in self._checked for r in rows): self._checked.difference_update(rows)
+            else: self._checked.update(rows)
+        elif region == 'cell':
+            iid = t.identify_row(event.y)
+            if not iid: return
+            if str(iid).startswith('__day_'):    # галочка заголовка дня — весь блок
+                rows = self._group_rows(iid)
+                if rows and all(r in self._checked for r in rows): self._checked.difference_update(rows)
+                else: self._checked.update(rows)
+            elif iid in self._checked: self._checked.discard(iid)
+            else: self._checked.add(iid)
+        else:
+            return
+        self._refresh_checks()
+        return 'break'
+
+    def _bulk_status(self, new_st):
+        """Встановлює статус усім номерам, відміченим галочками (унікальні номери)."""
+        import datetime as _dtb
+        from app.utils.db import query as _qb
+        checked = [i for i in self._checked if not str(i).startswith('__day_')]
+        if not checked:
+            messagebox.showinfo("", "Відмітьте галочками записи з потрібними номерами"); return
+        wanted = []
+        for iid in checked:
+            try:
+                r = str(self._log[int(iid)].get('room', '')).replace('№', '').strip()
+                if r and r not in wanted: wanted.append(r)
+            except Exception: pass
+        try:
+            rows = _qb("SELECT id, number, status FROM rooms", fetch='all') or []
+        except Exception as e:
+            messagebox.showerror("Помилка БД", str(e)); return
+        by_num = {}
+        for rm in rows:
+            by_num[str(rm['number']).replace('№', '').strip()] = rm
+            by_num[str(_rn(rm['number'])).replace('№', '').strip()] = rm
+        targets, missing, busy = [], [], []
+        for r in wanted:
+            rm = by_num.get(r)
+            if not rm: missing.append(r); continue
+            if rm['status'] in ('occupied', 'checkedin') and new_st != 'repair':
+                busy.append(r); continue
+            if rm['id'] not in [t['id'] for t in targets]: targets.append(rm)
+        if not targets:
+            messagebox.showwarning("Немає що змінювати",
+                "Жоден з вибраних номерів не можна змінити" + (f"\nЗайняті: {', '.join(busy)}" if busy else "")); return
+        _ua = STATUS_UA.get(new_st, new_st)
+        _txt = ', '.join(_rn(t['number']) for t in targets[:12]) + (f" … (+{len(targets)-12})" if len(targets) > 12 else '')
+        _extra = (f"\n\nПропущено (зайняті): {', '.join(busy)}" if busy else '') + \
+                 (f"\nНе знайдено: {', '.join(missing)}" if missing else '')
+        if not messagebox.askyesno("Змінити статус?",
+                f"Встановити статус «{_ua}» для номерів ({len(targets)}):\n{_txt}{_extra}"):
+            return
+        try:
+            ids = [t['id'] for t in targets]
+            _qb("UPDATE rooms SET status=%s WHERE id = ANY(%s)", (new_st, ids), fetch=None)
+            _now = _dtb.datetime.now()
+            for t in targets:
+                _cl_append({'room': str(_rn(t['number'])).replace('№', '').strip(), 'cleaner': '',
+                            'started': _now.strftime('%d.%m.%Y %H:%M'), 'finished': _now.strftime('%d.%m.%Y %H:%M'),
+                            'new_status': new_st, 'note': 'Масова зміна статусу',
+                            'logged_at': _now.strftime('%d.%m.%Y %H:%M:%S')})
+            try: _invalidate_rooms_cache()
+            except Exception: pass
+        except Exception as e:
+            log_error("_bulk_status", e)
+            messagebox.showerror("Помилка БД", str(e)); return
+        self._checked = set()
+        self._rebuild()
 
     def _clear_log(self):
         import os, json
@@ -14638,8 +14750,8 @@ class CleaningFrame(tk.Frame):
         if str(sel[0]).startswith('__day_'):
             return  # клік по заголовку дати — нічого редагувати
         vals = self.clean_t.item(sel[0], 'values')
-        # vals: (room, cleaner, started, finished, status_ua, note)
-        room_num = vals[0] if vals else ''
+        # vals: (chk, room, cleaner, started, finished, status_ua, note)
+        room_num = vals[1] if len(vals) > 1 else ''
 
         # Запис беремо ТОЧНО за клікнутим рядком (iid = індекс у self._log),
         # а не "останній запис цієї кімнати" — інакше при кількох прибираннях
@@ -14974,6 +15086,7 @@ class RoomsFrame(tk.Frame):
         refresh_btn(tb, self._rebuild, side='right', padx=10, pady=10)
         btn(tb,"⚠️ Штрафи",self._fine_room_dlg,C['red'],130).pack(side='right',padx=4,pady=10)
         btn(tb,"🛎 Послуги",self._add_service_dlg,C['accent'],120).pack(side='right',padx=4,pady=10)
+        btn(tb,"🔁 Статус",self._set_status_quick_dlg,C['green'],120).pack(side='right',padx=4,pady=10)
         btn(tb,"💛 Залог",self._deposit_room_dlg,C['yellow'],120).pack(side='right',padx=4,pady=10)
         btn(tb,"🧹 Прибирання",self._cleaning_dlg,C['yellow'],140).pack(side='right',padx=4,pady=10)
 
@@ -15089,6 +15202,65 @@ class RoomsFrame(tk.Frame):
         _,self.fines_t  = mktree(_dummy,('room','reason','amount','date'),1,[50,120,60,80])
         self._load_room_deposits()
         self._load_room_fines()
+
+    def _set_status_quick_dlg(self):
+        """Швидка зміна статусу номера: Вільний / Прибирання / Ремонт / Блок."""
+        from app.utils.db import query as _qs
+        rooms = list(getattr(self, '_rooms_cache', []) or [])
+        if not rooms:
+            messagebox.showinfo("", "Список номерів ще завантажується"); return
+        labels = {f"{_rn(r['number'])} — {r.get('cat_name','') or ''}": int(r['id']) for r in rooms}
+        keys = list(labels.keys())
+        first = keys[0]
+        try:
+            _sel = self._map_tree.selection()
+            if _sel:
+                first = next((k for k, v in labels.items() if v == int(_sel[0])), first)
+        except Exception: pass
+
+        win = dlg_win(self, "Статус номера", "440x300")
+        f = card(win); f.pack(fill='both', expand=True, padx=12, pady=12)
+        lbl(f, "Номер:", 11, color=C['text2']).pack(anchor='w', padx=12, pady=(12, 4))
+        _var = tk.StringVar(value=first)
+        ctk.CTkComboBox(f, values=keys, variable=_var, width=390, state='readonly').pack(padx=12)
+        _info = lbl(f, "", 11); _info.pack(anchor='w', padx=12, pady=(8, 2))
+
+        def _cur_status():
+            rid = labels[_var.get()]
+            r = next((x for x in rooms if int(x['id']) == rid), {})
+            try:
+                _row = _qs("SELECT status FROM rooms WHERE id=%s", (rid,), fetch='one')
+                return rid, (_row['status'] if _row else r.get('status', 'free'))
+            except Exception:
+                return rid, r.get('status', 'free')
+
+        def _refresh_info(*a):
+            _rid, st = _cur_status()
+            _info.configure(text=f"Зараз: {STATUS_UA.get(st, st)}", text_color=STATUS_COLOR.get(st, C['text2']))
+        _var.trace_add('write', _refresh_info); _refresh_info()
+
+        def _apply(new_st):
+            rid, st = _cur_status()
+            if st in ('checkedin', 'occupied'):
+                messagebox.showwarning("Номер зайнятий",
+                    "У номері є заселений гість. Спершу виселіть його (Заселені → Виселити).")
+                return
+            try:
+                _qs("UPDATE rooms SET status=%s WHERE id=%s", (new_st, rid), fetch=None)
+                try: _invalidate_rooms_cache()
+                except Exception: pass
+                _refresh_info()
+                self._rebuild()
+            except Exception as e:
+                log_error("_set_status_quick_dlg", e)
+                messagebox.showerror("Помилка", str(e))
+
+        row = tk.Frame(f, bg=C['card']); row.pack(pady=14)
+        btn(row, "✅ Вільний", lambda: _apply('free'), C['green'], 100).pack(side='left', padx=3)
+        btn(row, "🧹 Прибирання", lambda: _apply('cleaning'), C['yellow'], 120).pack(side='left', padx=3)
+        btn(row, "🔧 Ремонт", lambda: _apply('repair'), C['gray'], 90).pack(side='left', padx=3)
+        btn(row, "⛔ Блок", lambda: _apply('blocked'), C['red'], 80).pack(side='left', padx=3)
+        btn(f, "Закрити", win.destroy, C['card2'], 120).pack(pady=(0, 8))
 
     def _load_cleaning_log(self):
         import os,json
