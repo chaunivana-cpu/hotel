@@ -11781,13 +11781,12 @@ class HotelApp(ctk.CTk):
         self._sync_badge.pack(side='right', padx=4, pady=7)
         self._db_badge.pack(side='right', padx=4, pady=7)
 
-        # ── Z-звіт / X-звіт у самому верху, ліворуч від «БД: підключено» ──
-        # Видимі лише на Дашборді (див. _update_topbar_zx у _show).
+        # ── Підтримка (завжди) та «Закрити зміну ▾» (X/Z-звіти; лише на Дашборді) ──
+        self._support_btn = btn_fit(self._topbar, "🆘 Підтримка", self._support_dlg, C['accent'])
+        self._support_btn.pack(side='right', padx=(4, 2), pady=7, after=self._db_badge)
         self._zx_wrap = tk.Frame(self._topbar, bg=C['bg'])
-        btn_fit(self._zx_wrap, "🔒 Z звіт", lambda: self._open_x_or_z('Z-звіт'),
-                C['red']).pack(side='right', padx=(4, 0))
-        btn_fit(self._zx_wrap, "📋 X-звіт", lambda: self._open_x_or_z('X-звіт'),
-                C['card2']).pack(side='right', padx=(4, 0))
+        self._close_shift_btn = btn_fit(self._zx_wrap, "🔴 Закрити зміну ▾", self._close_shift_menu, C['red'])
+        self._close_shift_btn.pack(side='right', padx=(4, 0))
         self._zx_visible = False
         # Лівий край верхньої панелі: сюди Дашборд кладе заголовок/дату/зміну
         self._dash_hdr_wrap = tk.Frame(self._topbar, bg=C['bg'])
@@ -12043,12 +12042,73 @@ class HotelApp(ctk.CTk):
             self.after(500, _set_type)
         except Exception: pass
 
+    def _close_shift_menu(self):
+        """Кнопка «Закрити зміну ▾»: X-звіт, Z-звіт і закриття зміни (у Звітах)."""
+        m = tk.Menu(self, tearoff=0, bg=C['card2'], fg=C['text'], activebackground=C['accent'],
+                    activeforeground='white', font=('Segoe UI', 11), bd=0)
+        m.add_command(label="📋  X-звіт (проміжний, зміна не закривається)",
+                      command=lambda: self._open_x_or_z('X-звіт'))
+        m.add_command(label="🧾  Z-звіт",
+                      command=lambda: self._open_x_or_z('Z-звіт'))
+        m.add_separator()
+        m.add_command(label="🔴  Закрити зміну (відкрити Z-звіт)",
+                      command=lambda: self._open_x_or_z('Z-звіт'))
+        try:
+            b = self._close_shift_btn
+            m.tk_popup(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height() + 2)
+        finally:
+            try: m.grab_release()
+            except Exception: pass
+
+    def _support_dlg(self):
+        """Підтримка: обрати адміністратора й надіслати йому повідомлення в внутрішній чат."""
+        from app.utils.db import query as _qsu
+        me = (self.user or {}).get('username', '')
+        me_name = (self.user or {}).get('full_name') or me
+        try:
+            admins = _qsu("""SELECT username, COALESCE(NULLIF(full_name,''), username) AS name
+                             FROM users WHERE active=TRUE AND role='admin' AND username<>%s
+                             ORDER BY 2""", (me,), fetch='all') or []
+        except Exception as e:
+            messagebox.showerror("Помилка БД", str(e)); return
+        if not admins:
+            messagebox.showinfo("Підтримка", "Немає інших адміністраторів, яким можна написати."); return
+        labels = {a['name']: a['username'] for a in admins}
+        win = dlg_win(self, "🆘 Підтримка", "480x380")
+        f = card(win); f.pack(fill='both', expand=True, padx=12, pady=12)
+        lbl(f, "🆘  Зв'язок з адміністратором", 14, True).pack(anchor='w', padx=12, pady=(12, 2))
+        lbl(f, "Опишіть проблему — повідомлення прийде адміністратору в чат.", 10,
+            color=C['text2']).pack(anchor='w', padx=12, pady=(0, 8))
+        lbl(f, "Кому:", 11, color=C['text2']).pack(anchor='w', padx=12)
+        _var = tk.StringVar(value=list(labels.keys())[0])
+        ctk.CTkComboBox(f, values=list(labels.keys()), variable=_var, width=420, state='readonly').pack(padx=12, pady=(2, 8))
+        lbl(f, "Повідомлення:", 11, color=C['text2']).pack(anchor='w', padx=12)
+        txt = tk.Text(f, height=6, bg=C['card2'], fg=C['text'], font=('Segoe UI', 11), wrap='word',
+                      relief='flat', insertbackground=C['text'])
+        txt.pack(fill='x', padx=12, pady=(2, 8)); txt.focus_set()
+
+        def _send():
+            body = txt.get('1.0', 'end').strip()
+            if not body:
+                messagebox.showwarning("", "Напишіть повідомлення", parent=win); return
+            try:
+                peer = labels[_var.get()]
+                chat_send(me, me_name, peer, "🆘 Підтримка: " + body)
+            except Exception as e:
+                log_error("_support_dlg send", e)
+                messagebox.showerror("Помилка", str(e), parent=win); return
+            messagebox.showinfo("✅", f"Повідомлення надіслано: {_var.get()}", parent=win)
+            win.destroy()
+        row = tk.Frame(f, bg=C['card']); row.pack(pady=6)
+        btn(row, "📨 Надіслати", _send, C['green'], 160, height=38).pack(side='left', padx=4)
+        btn(row, "Скасувати", win.destroy, C['card2'], 120, height=38).pack(side='left', padx=4)
+
     def _update_topbar_zx(self, key):
         """Показує кнопки Z/X у верхній панелі лише на Дашборді."""
         try:
             want = (key == 'dashboard')
             if want and not self._zx_visible:
-                self._zx_wrap.pack(side='right', padx=(4, 6), pady=7, after=self._db_badge)
+                self._zx_wrap.pack(side='right', padx=(4, 6), pady=7, after=self._support_btn)
                 self._dash_hdr_wrap.pack(side='left', padx=(14, 0), pady=7)
                 self._zx_visible = True
             elif not want and self._zx_visible:
@@ -14120,7 +14180,10 @@ def _CleaningFrame_seed_log_from_rooms():
             healed = []
             for room_id, room_num in cleaning_rooms:
                 resolved = last_resolved.get(room_num)
-                if resolved:
+                # Є ВІДКРИТИЙ запис (щойно виселили, прибирання ще триває) — це НОВЕ прибирання:
+                # статус «cleaning» правильний, повертати його до старого підсумку не можна
+                # (раніше номер/бесідка/баня одразу ставали «Вільний», хоч прибирання не завершено).
+                if resolved and room_num not in in_log:
                     try:
                         _sql_heal = "UPDATE rooms SET status=%s WHERE id=%s"
                         _params_heal = (resolved['new_status'], room_id)
@@ -15142,12 +15205,20 @@ class RoomsFrame(tk.Frame):
         rg=card(self); rg.pack(fill='both',expand=True,padx=15,pady=5)
         hf=tk.Frame(rg,bg=C['card']); hf.pack(fill='x',padx=12,pady=(8,4))
         lbl(hf,"🗺️  Карта номерів",12,True).pack(side='left')
-        lbl(hf,"← клік на рядок для дій з номером",10,color=C['text2']).pack(side='left',padx=10)
+        lbl(hf,"← клік на рядок для дій з номером · ☐ — вибір кількох",10,color=C['text2']).pack(side='left',padx=10)
+        # Масова зміна статусу для номерів, відмічених галочками
+        self._checked = set()
+        btn(hf,"Зняти вибір",lambda: self._set_all_checked(False),C['card2'],110,height=28).pack(side='right',padx=(4,0))
+        btn(hf,"🧹 Прибирання",lambda: self._bulk_room_status('cleaning'),C['yellow'],130,height=28).pack(side='right',padx=3)
+        btn(hf,"🔒 Блок",lambda: self._bulk_room_status('blocked'),C['red'],90,height=28).pack(side='right',padx=3)
+        btn(hf,"🔧 Ремонт",lambda: self._bulk_room_status('repair'),C['gray'],100,height=28).pack(side='right',padx=3)
+        btn(hf,"✅ Вільний",lambda: self._bulk_room_status('free'),C['green'],100,height=28).pack(side='right',padx=3)
+        self._chk_lbl = lbl(hf,"Вибрано: 0",11,True,C['text2']); self._chk_lbl.pack(side='right',padx=10)
 
         # Кольорові теги для статусів
-        _map_cols  = ['room','cat','floor','status','price']
-        _map_heads = ['Кімн.','Категорія','Пов.','Статус','Ціна/ніч']
-        _map_widths= [100, 160, 50, 110, 80]
+        _map_cols  = ['chk','room','cat','floor','status','price']
+        _map_heads = ['☐','Кімн.','Категорія','Пов.','Статус','Ціна/ніч']
+        _map_widths= [40, 100, 160, 50, 110, 80]
         _twrap = tk.Frame(rg, bg=C['card']); _twrap.pack(fill='both', expand=True, padx=10, pady=(0,8))
         _th = tk.Scrollbar(_twrap, orient='horizontal')
         _th.pack(side='bottom', fill='x')
@@ -15177,10 +15248,31 @@ class RoomsFrame(tk.Frame):
         _th.pack(side='bottom', fill='x')
         # Клік на рядок → дія з номером
         def _map_click(e):
+            # клік по колонці з галочкою не відкриває вікно дій
+            try:
+                if self._map_tree.identify_column(e.x) == '#1': return
+                if self._map_tree.identify_region(e.x, e.y) == 'heading': return
+            except Exception: pass
             sel = self._map_tree.selection()
             if sel:
                 try: self._status_dlg(int(sel[0]))
                 except Exception: pass
+        def _map_press(e):
+            t = self._map_tree
+            if t.identify_column(e.x) != '#1': return
+            region = t.identify_region(e.x, e.y)
+            if region == 'heading':
+                rows = list(t.get_children(''))
+                self._set_all_checked(not (rows and all(r in self._checked for r in rows)))
+            elif region == 'cell':
+                iid = t.identify_row(e.y)
+                if iid:
+                    if iid in self._checked: self._checked.discard(iid)
+                    else: self._checked.add(iid)
+                    self._refresh_checks()
+            return 'break'
+        self._map_tree.column('chk', width=40, minwidth=40, stretch=False)
+        self._map_tree.bind('<Button-1>', _map_press)
         self._map_tree.bind('<ButtonRelease-1>', _map_click)
         self._map_tree.bind('<Double-1>', _map_click)
         self._render_tiles(rooms)
@@ -15202,6 +15294,59 @@ class RoomsFrame(tk.Frame):
         _,self.fines_t  = mktree(_dummy,('room','reason','amount','date'),1,[50,120,60,80])
         self._load_room_deposits()
         self._load_room_fines()
+
+    def _refresh_checks(self):
+        t = self._map_tree
+        for iid in t.get_children(''):
+            try: t.set(iid, 'chk', '☑' if iid in self._checked else '☐')
+            except Exception: pass
+        try: self._chk_lbl.configure(text=f"Вибрано: {len(self._checked)}")
+        except Exception: pass
+
+    def _set_all_checked(self, on):
+        rows = list(self._map_tree.get_children(''))
+        if on: self._checked.update(rows)
+        else: self._checked.difference_update(rows)
+        self._refresh_checks()
+
+    def _bulk_room_status(self, new_st):
+        """Статус усім номерам, відміченим галочками. Заселені (з гостем) пропускаються."""
+        import datetime as _dtb
+        from app.utils.db import query as _qb
+        ids = [int(i) for i in self._checked]
+        if not ids:
+            messagebox.showinfo("", "Відмітьте номери галочками (☐ зліва)"); return
+        try:
+            rows = _qb("SELECT id, number, status FROM rooms WHERE id = ANY(%s)", (ids,), fetch='all') or []
+        except Exception as e:
+            messagebox.showerror("Помилка БД", str(e)); return
+        ok = [r for r in rows if r['status'] not in ('checkedin', 'occupied')]
+        busy = [str(_rn(r['number'])) for r in rows if r['status'] in ('checkedin', 'occupied')]
+        if not ok:
+            messagebox.showwarning("Немає що змінювати",
+                "Усі вибрані номери зайняті гостями: " + ', '.join(busy[:10])); return
+        _ua = STATUS_UA.get(new_st, new_st)
+        _names = ', '.join(str(_rn(r['number'])) for r in ok[:12]) + (f" … (+{len(ok)-12})" if len(ok) > 12 else '')
+        _extra = (f"\n\nПропущено (є гість): {', '.join(busy[:10])}" if busy else '')
+        if not messagebox.askyesno("Змінити статус?",
+                f"Статус «{_ua}» для номерів ({len(ok)}):\n{_names}{_extra}"):
+            return
+        try:
+            _qb("UPDATE rooms SET status=%s WHERE id = ANY(%s)", (new_st, [r['id'] for r in ok]), fetch=None)
+            _now = _dtb.datetime.now()
+            for r in ok:
+                _cl_append({'room': str(r['number']), 'cleaner': '',
+                            'started': _now.strftime('%d.%m.%Y %H:%M'),
+                            'finished': '' if new_st == 'cleaning' else _now.strftime('%d.%m.%Y %H:%M'),
+                            'new_status': new_st, 'note': 'Масова зміна статусу',
+                            'logged_at': _now.strftime('%d.%m.%Y %H:%M:%S')})
+            try: _invalidate_rooms_cache()
+            except Exception: pass
+        except Exception as e:
+            log_error("_bulk_room_status", e)
+            messagebox.showerror("Помилка БД", str(e)); return
+        self._checked = set()
+        self._rebuild()
 
     def _set_status_quick_dlg(self):
         """Швидка зміна статусу номера: Вільний / Прибирання / Ремонт / Блок."""
@@ -15677,17 +15822,23 @@ class RoomsFrame(tk.Frame):
             'free': 'free', 'checkedin': 'checkedin', 'cleaning': 'cleaning',
             'confirmed': 'confirmed', 'repair': 'repair', 'blocked': 'blocked',
         }
+        _ids_now = {str(r['id']) for r in rooms}
+        if hasattr(self, '_checked'):
+            self._checked &= _ids_now
         for r in rooms:
             rid_ = r['id']
             st = r.get('status', 'free')
             tag = _status_tag.get(st, 'free')
             self._map_tree.insert('', 'end', iid=str(rid_), tags=(tag,), values=(
+                '☑' if str(rid_) in getattr(self, '_checked', set()) else '☐',
                 f"{_rn(r['number'])}",
                 r.get('cat_name', '—'),
                 r.get('floor', 1),
                 STATUS_UA.get(st, st),
                 f"{float(r.get('base_price') or 0):.0f}₴"
             ))
+        try: self._refresh_checks()
+        except Exception: pass
 
     def _rebuild(self):
         """Оновлює дані у фоні — не блокує UI."""
@@ -27717,11 +27868,12 @@ class _BookableObjectFrame(tk.Frame):
         return objects
 
     def _build(self):
-        self._objects = []; self._bof_cur_tab = 'main'
+        self._objects = []; self._bof_cur_tab = 'main'; self._bof_checked = set()
         tb = ctk.CTkFrame(self, fg_color=C['card']); tb.pack(fill='x', padx=15, pady=(15,5))
         lbl(tb, f"{self.OBJ_ICON}  {self.TITLE}", 18, True).pack(side='left', padx=15, pady=12)
         refresh_btn(tb, self._rebuild, side='right', padx=10, pady=10)
         btn(tb, "🛎 Послуга", self._quick_add_service, C['accent'], 110).pack(side='right', padx=3, pady=8)
+        btn(tb, "🔁 Статус", self._bof_status_dlg, C['green'], 110).pack(side='right', padx=3, pady=8)
         self._top_tab_btns = {}
         for _tk, _tl in [('main', f"{self.OBJ_ICON} Головна"),('deposit','💛 Залог'),('services','🛎 Послуги')]:
             _b = ctk.CTkButton(tb, text=_tl, width=110, height=30,
@@ -27923,15 +28075,23 @@ class _BookableObjectFrame(tk.Frame):
         two.columnconfigure(0, weight=3); two.columnconfigure(1, weight=2); two.rowconfigure(0, weight=1)
         left = card(two); left.grid(row=0, column=0, padx=(0,5), sticky='nsew')
         lbl(left, f"📋  Список", 13, True).pack(anchor='w', padx=12, pady=(10,4))
-        ff,self.obj_t = mktree(left, ('number','cat','status','price'), 16, [80,160,130,90])
-        for c,h in zip(('number','cat','status','price'),(self.OBJ_LABEL,'Категорія','Статус','Ціна')):
+        ff,self.obj_t = mktree(left, ('chk','number','cat','status','price'), 16, [40,80,160,130,90])
+        for c,h in zip(('chk','number','cat','status','price'),('☐',self.OBJ_LABEL,'Категорія','Статус','Ціна')):
             self.obj_t.heading(c, text=h)
-        for r in self._objects:
-            self.obj_t.insert('','end', iid=r['id'], values=(f"{r['number']}", r.get('cat_name','—'),STATUS_UA.get(r.get('status',''),''), f"{float(r.get('base_price') or 0):.0f}₴"))
+        self.obj_t.column('chk', width=40, minwidth=40, stretch=False)
+        self._bof_fill_list()
         ff.pack(fill='both', expand=True, padx=8, pady=(0,8))
-        self.obj_t.bind('<Double-1>', lambda e: self._quick_action())
-        bf = ctk.CTkFrame(left, fg_color='transparent'); bf.pack(fill='x', padx=8, pady=(0,10))
+        self.obj_t.bind('<Button-1>', self._bof_press)
+        self.obj_t.bind('<Double-1>', self._bof_dbl)
+        bf = ctk.CTkFrame(left, fg_color='transparent'); bf.pack(fill='x', padx=8, pady=(0,4))
         btn(bf,"📅 Забронювати / Заселити", self._quick_action, C['accent'], 230).pack(side='left', padx=4)
+        bf2 = ctk.CTkFrame(left, fg_color='transparent'); bf2.pack(fill='x', padx=8, pady=(0,10))
+        self._bof_chk_lbl = lbl(bf2, "Вибрано: 0", 11, True, C['text2']); self._bof_chk_lbl.pack(side='left', padx=(4,8))
+        btn(bf2,"✅ Вільний", lambda: self._bof_bulk('free'), C['green'], 100, height=30).pack(side='left', padx=2)
+        btn(bf2,"🔧 Ремонт", lambda: self._bof_bulk('repair'), C['gray'], 100, height=30).pack(side='left', padx=2)
+        btn(bf2,"🔒 Блок", lambda: self._bof_bulk('blocked'), C['red'], 90, height=30).pack(side='left', padx=2)
+        btn(bf2,"🧹 Прибирання", lambda: self._bof_bulk('cleaning'), C['yellow'], 130, height=30).pack(side='left', padx=2)
+        btn(bf2,"Зняти", lambda: self._bof_set_all(False), C['card2'], 70, height=30).pack(side='left', padx=2)
         right = card(two); right.grid(row=0, column=1, sticky='nsew')
         lbl(right, "📅  Активні бронювання", 13, True).pack(anchor='w', padx=12, pady=(10,4))
         ff2,self.book_t = mktree(right, ('room','guest','cin','cout','status'), 12, [65,120,85,85,85])
@@ -28128,11 +28288,7 @@ class _BookableObjectFrame(tk.Frame):
                         return
                     self._render_bof_stats()
                     self._render_bof_tiles()
-                    self.obj_t.delete(*self.obj_t.get_children())
-                    for r in self._objects:
-                        self.obj_t.insert('','end', iid=r['id'], values=(
-                            f"{r['number']}", r.get('cat_name','—'),
-                            STATUS_UA.get(r.get('status',''),''), f"{float(r.get('base_price') or 0):.0f}₴"))
+                    self._bof_fill_list()
                     if hasattr(self, 'book_t'):
                         self._load_bookings()
                 except Exception as e:
@@ -28210,6 +28366,125 @@ class _BookableObjectFrame(tk.Frame):
         s = self.obj_t.selection()
         if not s: messagebox.showwarning("", f"Оберіть {self.OBJ_LABEL.lower()}"); return
         self._obj_action(int(s[0]))
+
+    # ── Галочки вибору та статус (Бесідки / Бані) ─────────────────────────────
+    def _bof_fill_list(self):
+        t = self.obj_t
+        self._bof_checked &= {str(r['id']) for r in self._objects}
+        t.delete(*t.get_children())
+        for r in self._objects:
+            t.insert('', 'end', iid=r['id'], values=(
+                '☑' if str(r['id']) in self._bof_checked else '☐',
+                f"{r['number']}", r.get('cat_name', '—'),
+                STATUS_UA.get(r.get('status', ''), ''), f"{float(r.get('base_price') or 0):.0f}₴"))
+        self._bof_refresh_checks()
+
+    def _bof_refresh_checks(self):
+        try:
+            for iid in self.obj_t.get_children(''):
+                self.obj_t.set(iid, 'chk', '☑' if iid in self._bof_checked else '☐')
+            self._bof_chk_lbl.configure(text=f"Вибрано: {len(self._bof_checked)}")
+        except Exception: pass
+
+    def _bof_set_all(self, on):
+        rows = list(self.obj_t.get_children(''))
+        if on: self._bof_checked.update(rows)
+        else: self._bof_checked.difference_update(rows)
+        self._bof_refresh_checks()
+
+    def _bof_press(self, e):
+        t = self.obj_t
+        if t.identify_column(e.x) != '#1': return
+        region = t.identify_region(e.x, e.y)
+        if region == 'heading':
+            rows = list(t.get_children(''))
+            self._bof_set_all(not (rows and all(r in self._bof_checked for r in rows)))
+        elif region == 'cell':
+            iid = t.identify_row(e.y)
+            if iid:
+                if iid in self._bof_checked: self._bof_checked.discard(iid)
+                else: self._bof_checked.add(iid)
+                self._bof_refresh_checks()
+        return 'break'
+
+    def _bof_dbl(self, e):
+        try:
+            if self.obj_t.identify_column(e.x) == '#1': return
+        except Exception: pass
+        self._quick_action()
+
+    def _bof_bulk(self, new_st, ids=None):
+        """Статус усім відміченим об'єктам (або переданим ids). Заселені пропускаються."""
+        import datetime as _dtb
+        from app.utils.db import query as _qb
+        ids = [int(i) for i in (ids if ids is not None else self._bof_checked)]
+        if not ids:
+            messagebox.showinfo("", f"Відмітьте {self.OBJ_LABEL.lower()} галочками (☐ зліва)"); return
+        try:
+            rows = _qb("SELECT id, number, status FROM rooms WHERE id = ANY(%s)", (ids,), fetch='all') or []
+        except Exception as e:
+            messagebox.showerror("Помилка БД", str(e)); return
+        ok = [r for r in rows if r['status'] not in ('checkedin', 'occupied')]
+        busy = [str(r['number']) for r in rows if r['status'] in ('checkedin', 'occupied')]
+        if not ok:
+            messagebox.showwarning("Немає що змінювати", "Усі вибрані зайняті гостями: " + ', '.join(busy[:10])); return
+        _names = ', '.join(str(r['number']) for r in ok[:12]) + (f" … (+{len(ok)-12})" if len(ok) > 12 else '')
+        _extra = (f"\n\nПропущено (є гість): {', '.join(busy[:10])}" if busy else '')
+        if not messagebox.askyesno("Змінити статус?",
+                f"Статус «{STATUS_UA.get(new_st, new_st)}» для ({len(ok)}):\n{_names}{_extra}"):
+            return
+        try:
+            _qb("UPDATE rooms SET status=%s WHERE id = ANY(%s)", (new_st, [r['id'] for r in ok]), fetch=None)
+            _now = _dtb.datetime.now()
+            for r in ok:
+                _cl_append({'room': str(r['number']), 'cleaner': '',
+                            'started': _now.strftime('%d.%m.%Y %H:%M'),
+                            'finished': '' if new_st == 'cleaning' else _now.strftime('%d.%m.%Y %H:%M'),
+                            'new_status': new_st, 'note': 'Масова зміна статусу',
+                            'logged_at': _now.strftime('%d.%m.%Y %H:%M:%S')})
+            try: _invalidate_rooms_cache()
+            except Exception: pass
+        except Exception as e:
+            log_error("_bof_bulk", e)
+            messagebox.showerror("Помилка БД", str(e)); return
+        self._bof_checked = set()
+        self._rebuild()
+
+    def _bof_status_dlg(self):
+        """Кнопка «Статус»: для відмічених галочками, а якщо нічого не відмічено — для обраного зі списку."""
+        objs = list(self._objects or [])
+        if not objs:
+            messagebox.showinfo("", "Список ще завантажується"); return
+        labels = {f"{r['number']} — {r.get('cat_name','') or ''}": int(r['id']) for r in objs}
+        keys = list(labels.keys())
+        first = keys[0]
+        try:
+            _sel = self.obj_t.selection()
+            if _sel: first = next((k for k, v in labels.items() if v == int(_sel[0])), first)
+        except Exception: pass
+        win = dlg_win(self, "Статус", "460x290")
+        f = card(win); f.pack(fill='both', expand=True, padx=12, pady=12)
+        _n = len(self._bof_checked)
+        if _n:
+            lbl(f, f"Буде застосовано до відмічених: {_n}", 12, True, C['yellow']).pack(anchor='w', padx=12, pady=(14, 4))
+            _var = None
+        else:
+            lbl(f, f"{self.OBJ_LABEL}:", 11, color=C['text2']).pack(anchor='w', padx=12, pady=(12, 4))
+            _var = tk.StringVar(value=first)
+            ctk.CTkComboBox(f, values=keys, variable=_var, width=400, state='readonly').pack(padx=12)
+            lbl(f, "Підказка: відмітьте кілька галочками — статус застосується до всіх.", 10,
+                color=C['text2']).pack(anchor='w', padx=12, pady=(6, 0))
+
+        def _go(st):
+            ids = None if _n else [labels[_var.get()]]
+            win.destroy()
+            self._bof_bulk(st, ids)
+        row = tk.Frame(f, bg=C['card']); row.pack(pady=18)
+        btn(row, "✅ Вільний", lambda: _go('free'), C['green'], 100).pack(side='left', padx=3)
+        btn(row, "🧹 Прибирання", lambda: _go('cleaning'), C['yellow'], 120).pack(side='left', padx=3)
+        btn(row, "🔧 Ремонт", lambda: _go('repair'), C['gray'], 90).pack(side='left', padx=3)
+        btn(row, "🔒 Блок", lambda: _go('blocked'), C['red'], 80).pack(side='left', padx=3)
+        btn(f, "Закрити", win.destroy, C['card2'], 120).pack(pady=(0, 8))
 
     def _booking_action(self):
         s = self.book_t.selection()
@@ -35933,7 +36208,7 @@ class SettingsFrame(tk.Frame):
         hdr_f = tk.Frame(sc, bg=C['bg'])
         hdr_f.pack(fill='x', padx=6, pady=(6, 2))
         lbl(hdr_f, "💛  Налаштування залогів", 16, True, C['yellow']).pack(side='left')
-        lbl(hdr_f, "  Один залог на тип — підставляється автоматично при заселенні.",
+        lbl(hdr_f, "  Залог на тип або на окремий номер — підставляється автоматично при заселенні.",
             10, color=C['text2']).pack(side='left')
 
         _entries  = {}
@@ -36021,6 +36296,95 @@ class SettingsFrame(tk.Frame):
 
         btn(save_all_f, "💾 Зберегти всі залоги", _save_all_deposits,
             C['yellow'], 220, height=40).pack(side='left', padx=4)
+
+        # ── Залог по окремих номерах (індивідуально, поверх залогу «типу») ──
+        pr_card = card(sc)
+        pr_card.pack(fill='x', padx=6, pady=(10, 6))
+        lbl(pr_card, "🎯  Залог по окремих номерах", 14, True).pack(anchor='w', padx=12, pady=(10, 0))
+        lbl(pr_card, "Виберіть один або кілька номерів (Ctrl/Shift), введіть суму й натисніть «Задати». "
+                     "Кнопки «Зберегти» вище перезаписують залог усім номерам типу.",
+            9, color=C['text2']).pack(anchor='w', padx=14, pady=(0, 6))
+
+        pr_top = tk.Frame(pr_card, bg=C['card']); pr_top.pack(fill='x', padx=12, pady=(0, 6))
+        lbl(pr_top, "🔍", 12).pack(side='left')
+        _pr_search = ent(pr_top, "Номер або категорія", w=220); _pr_search.pack(side='left', padx=(4, 14))
+        lbl(pr_top, "Залог (₴):", 12, True).pack(side='left', padx=(0, 6))
+        _pr_amount = ent(pr_top, "0", w=100); _pr_amount.pack(side='left')
+
+        _pr_wrap, _pr_tree = mktree(pr_card, ('id', 'num', 'cat', 'dep'), 12, [60, 200, 260, 110])
+        for _c, _h in zip(('id', 'num', 'cat', 'dep'), ['ID', 'Номер', 'Категорія', 'Залог']):
+            _pr_tree.heading(_c, text=_h)
+        _pr_tree.configure(selectmode='extended')
+        _pr_wrap.pack(fill='x', padx=12, pady=(0, 6))
+        _pr_rows = {'data': []}
+
+        def _pr_load(*_a):
+            try:
+                from app.utils.db import query as _qpr
+                _pr_rows['data'] = _qpr("""SELECT r.id, r.number, COALESCE(rc.name,'') AS cat,
+                                              COALESCE(r.deposit_amount,0) AS dep
+                                       FROM rooms r LEFT JOIN room_categories rc ON rc.id=r.category_id
+                                       ORDER BY r.number""", fetch='all') or []
+            except Exception as _e:
+                log_error("залог по номерах: завантаження", _e); _pr_rows['data'] = []
+            _pr_fill()
+
+        def _pr_fill(*_a):
+            q = _pr_search.get().strip().lower()
+            if q == "номер або категорія": q = ''
+            keep = set(_pr_tree.selection())
+            _pr_tree.delete(*_pr_tree.get_children())
+            for r in _pr_rows['data']:
+                num = str(_rn(r['number']))
+                if q and q not in num.lower() and q not in str(r['cat']).lower():
+                    continue
+                dep = float(r['dep'] or 0)
+                _pr_tree.insert('', 'end', iid=str(r['id']),
+                                values=(r['id'], num, r['cat'], f"{dep:.0f}₴" if dep else "—"))
+            for i in keep:
+                if _pr_tree.exists(i): _pr_tree.selection_add(i)
+
+        _pr_search.bind('<KeyRelease>', _pr_fill)
+
+        def _pr_on_select(_e=None):
+            sel = _pr_tree.selection()
+            if len(sel) == 1:
+                try:
+                    _v = next(float(r['dep'] or 0) for r in _pr_rows['data'] if str(r['id']) == sel[0])
+                    _pr_amount.delete(0, 'end'); _pr_amount.insert(0, str(int(_v)))
+                except Exception: pass
+        _pr_tree.bind('<<TreeviewSelect>>', _pr_on_select)
+
+        def _pr_apply():
+            sel = [int(i) for i in _pr_tree.selection()]
+            if not sel:
+                messagebox.showinfo("", "Виберіть номери у списку (Ctrl/Shift — кілька)"); return
+            try:
+                amount = float(_pr_amount.get().strip().replace(',', '.'))
+                if amount < 0: raise ValueError
+            except ValueError:
+                messagebox.showerror("", "Введіть залог числом (0 = без залогу)"); return
+            try:
+                from app.utils.db import query as _qpr2
+                _qpr2("UPDATE rooms SET deposit_amount=%s WHERE id = ANY(%s)", (amount, sel), fetch=None)
+                try: _invalidate_rooms_cache()
+                except Exception: pass
+            except Exception as _e:
+                log_error("залог по номерах: збереження", _e)
+                messagebox.showerror("Помилка БД", str(_e)); return
+            _pr_load()
+            try: _refresh_report()
+            except Exception: pass
+            try: self._load_room_deposits()
+            except Exception: pass
+            messagebox.showinfo("✅", f"Залог {amount:.0f}₴ встановлено для номерів: {len(sel)}")
+
+        _pr_btns = tk.Frame(pr_card, bg=C['card']); _pr_btns.pack(fill='x', padx=12, pady=(0, 12))
+        btn(_pr_btns, "💾 Задати вибраним", _pr_apply, C['green'], 190, height=36).pack(side='left')
+        btn(_pr_btns, "Вибрати всі", lambda: _pr_tree.selection_set(_pr_tree.get_children()),
+            C['card2'], 130, height=36).pack(side='left', padx=8)
+        btn(_pr_btns, "🔄 Оновити", _pr_load, C['card2'], 120, height=36).pack(side='left')
+        p.after(120, _pr_load)
 
         # ── Звіт ──────────────────────────────────────────────────────────
         rep_card = card(sc)
