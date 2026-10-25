@@ -1083,11 +1083,13 @@ def _ensure_weekend_col():
         with _gcw() as _cw:
             with _cw.cursor() as _cuw:
                 _cuw.execute("ALTER TABLE room_categories ADD COLUMN IF NOT EXISTS weekend_price NUMERIC(10,2)")
+                _cuw.execute("ALTER TABLE room_categories ADD COLUMN IF NOT EXISTS chan_price NUMERIC(10,2)")
                 try:
                     _cuw.execute("CREATE OR REPLACE VIEW categories AS SELECT * FROM room_categories")
                 except Exception:
                     _cw.rollback()
                     _cuw.execute("ALTER TABLE room_categories ADD COLUMN IF NOT EXISTS weekend_price NUMERIC(10,2)")
+                _cuw.execute("ALTER TABLE room_categories ADD COLUMN IF NOT EXISTS chan_price NUMERIC(10,2)")
             _cw.commit()
         _wk_col_ready['ok'] = True
     except Exception as _e:
@@ -1118,6 +1120,44 @@ def _category_weekend_map(force=False):
     return m
 
 
+_chan_price_cache = {'t': 0.0, 'v': {}}
+
+
+def _category_chan_map(force=False):
+    """{category_id: ціна/год «+ Чан»} для категорій, де вона задана (>0). Кеш 30 с."""
+    if (not force) and _ph_time.time() - _chan_price_cache['t'] < 30:
+        return _chan_price_cache['v']
+    m = {}
+    try:
+        from app.utils.db import query as _qc2
+        try:
+            rows = _qc2("SELECT id, chan_price FROM room_categories", fetch='all')
+        except Exception:
+            _ensure_weekend_col()
+            rows = _qc2("SELECT id, chan_price FROM room_categories", fetch='all')
+        for r in (rows or []):
+            try:
+                v = float(r.get('chan_price') or 0)
+                if v > 0: m[int(r['id'])] = v
+            except Exception: pass
+    except Exception:
+        m = _chan_price_cache['v']
+    _chan_price_cache['t'] = _ph_time.time(); _chan_price_cache['v'] = m
+    return m
+
+
+def _room_chan_price(room_id):
+    """Ціна/год «+ Чан» для об'єкта (0 — якщо в його категорії не задана)."""
+    try:
+        from app.utils.db import query as _qc3
+        r = _qc3("SELECT category_id FROM rooms WHERE id=%s", (room_id,), fetch='one')
+        if r and r.get('category_id') is not None:
+            return float(_category_chan_map(force=True).get(int(r['category_id'])) or 0)
+    except Exception:
+        pass
+    return 0.0
+
+
 def _stay_nights_total(cat_id, stored_price, check_in, nights):
     """Сума за n ночей від check_in з урахуванням ціни вихідних (по кожній ночі окремо)."""
     if hasattr(check_in, 'date') and callable(getattr(check_in, 'date')):
@@ -1129,6 +1169,7 @@ def _stay_nights_total(cat_id, stored_price, check_in, nights):
 def _invalidate_price_caches():
     """Скидає кеші цін/категорій (викликати після зміни ціни категорії)."""
     _wk_price_cache['t'] = 0.0
+    _chan_price_cache['t'] = 0.0
     _cat_price_cache['t'] = 0.0
     _room_cat_cache['t'] = 0.0
     _price_hist['t'] = 0.0
@@ -8315,6 +8356,393 @@ _NAV_ICON_COLORS = {
 }
 
 
+# 3D-іконки для «Підтримки» (Microsoft Fluent Emoji, MIT), PNG 64×64 у base64
+_SUPPORT_ICONS_B64 = {
+    'operator': (
+        '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'
+    ),
+    'headset': (
+        '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'
+        'bZlWrPRf9gAAAABJRU5ErkJggg=='
+    ),
+    'phone': (
+        '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'
+        'HwjCGWzxtW/IAAAAAElFTkSuQmCC'
+    ),
+    'desktop': (
+        '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'
+        '5oSwAAAABJRU5ErkJggg=='
+    ),
+}
+_support_img_cache = {}
+
+
+def _support_img(key, size=24):
+    """CTkImage 3D-іконки підтримки (гарнітура / телефон / ПК)."""
+    k = (key, size)
+    if k in _support_img_cache: return _support_img_cache[k]
+    try:
+        import base64 as _b, io as _io
+        from PIL import Image as _I
+        pil = _I.open(_io.BytesIO(_b.b64decode(_SUPPORT_ICONS_B64[key]))).convert('RGBA')
+        img = ctk.CTkImage(light_image=pil, dark_image=pil, size=(size, size))
+    except Exception:
+        img = None
+    _support_img_cache[k] = img
+    return img
+
+
 # 3D-іконки вкладок Налаштувань (Microsoft Fluent Emoji, MIT), PNG 48×48 у base64
 _SETTINGS_TAB_ICONS_B64 = {
     '🛏 Номери': (
@@ -11782,7 +12210,11 @@ class HotelApp(ctk.CTk):
         self._db_badge.pack(side='right', padx=4, pady=7)
 
         # ── Підтримка (завжди) та «Закрити зміну ▾» (X/Z-звіти; лише на Дашборді) ──
-        self._support_btn = btn_fit(self._topbar, "🆘 Підтримка", self._support_dlg, C['accent'])
+        self._support_btn = btn_fit(self._topbar, "Підтримка", self._support_dlg, C['card2'], pad=22 + 28)
+        try:
+            self._support_btn.configure(image=_support_img('operator', 24), compound='left')
+        except Exception:
+            self._support_btn.configure(text="🎧 Підтримка")
         self._support_btn.pack(side='right', padx=(4, 2), pady=7, after=self._db_badge)
         self._zx_wrap = tk.Frame(self._topbar, bg=C['bg'])
         self._close_shift_btn = btn_fit(self._zx_wrap, "🔴 Закрити зміну ▾", self._close_shift_menu, C['red'])
@@ -12061,47 +12493,219 @@ class HotelApp(ctk.CTk):
             except Exception: pass
 
     def _support_dlg(self):
-        """Підтримка: обрати адміністратора й надіслати йому повідомлення в внутрішній чат."""
-        from app.utils.db import query as _qsu
+        """🎧 Підтримка: голосовий зв'язок з адміністратором + віддалений доступ + повідомлення в чат."""
+        import os, sys, shutil, subprocess, threading
         me = (self.user or {}).get('username', '')
         me_name = (self.user or {}).get('full_name') or me
-        try:
-            admins = _qsu("""SELECT username, COALESCE(NULLIF(full_name,''), username) AS name
-                             FROM users WHERE active=TRUE AND role='admin' AND username<>%s
-                             ORDER BY 2""", (me,), fetch='all') or []
-        except Exception as e:
-            messagebox.showerror("Помилка БД", str(e)); return
-        if not admins:
-            messagebox.showinfo("Підтримка", "Немає інших адміністраторів, яким можна написати."); return
-        labels = {a['name']: a['username'] for a in admins}
-        win = dlg_win(self, "🆘 Підтримка", "480x380")
-        f = card(win); f.pack(fill='both', expand=True, padx=12, pady=12)
-        lbl(f, "🆘  Зв'язок з адміністратором", 14, True).pack(anchor='w', padx=12, pady=(12, 2))
-        lbl(f, "Опишіть проблему — повідомлення прийде адміністратору в чат.", 10,
-            color=C['text2']).pack(anchor='w', padx=12, pady=(0, 8))
-        lbl(f, "Кому:", 11, color=C['text2']).pack(anchor='w', padx=12)
-        _var = tk.StringVar(value=list(labels.keys())[0])
-        ctk.CTkComboBox(f, values=list(labels.keys()), variable=_var, width=420, state='readonly').pack(padx=12, pady=(2, 8))
-        lbl(f, "Повідомлення:", 11, color=C['text2']).pack(anchor='w', padx=12)
-        txt = tk.Text(f, height=6, bg=C['card2'], fg=C['text'], font=('Segoe UI', 11), wrap='word',
-                      relief='flat', insertbackground=C['text'])
-        txt.pack(fill='x', padx=12, pady=(2, 8)); txt.focus_set()
+        is_admin = (self.user or {}).get('role') in ('admin',)
 
-        def _send():
-            body = txt.get('1.0', 'end').strip()
-            if not body:
-                messagebox.showwarning("", "Напишіть повідомлення", parent=win); return
+        win = dlg_win(self, "Підтримка", "600x720")
+        hdr = tk.Frame(win, bg=C['bg']); hdr.pack(fill='x', padx=16, pady=(14, 6))
+        _img = _support_img('operator', 56)
+        if _img is not None:
+            ctk.CTkLabel(hdr, image=_img, text="").pack(side='left')
+        _t = tk.Frame(hdr, bg=C['bg']); _t.pack(side='left', padx=12)
+        lbl(_t, "Служба підтримки", 17, True).pack(anchor='w')
+        lbl(_t, "Голосовий зв'язок та віддалений доступ до цього ПК", 10, color=C['text2']).pack(anchor='w')
+
+        body = tk.Frame(win, bg=C['bg']); body.pack(fill='both', expand=True, padx=12, pady=(0, 6))
+
+        def _open(target):
+            # webbrowser у зібраному exe (PyInstaller) може бути відсутній — тому лише як запасний варіант
             try:
-                peer = labels[_var.get()]
-                chat_send(me, me_name, peer, "🆘 Підтримка: " + body)
+                if sys.platform.startswith('win'):
+                    os.startfile(target)
+                else:
+                    import webbrowser as _wb; _wb.open(target)
+            except Exception as e1:
+                try:
+                    import webbrowser as _wb2; _wb2.open(target)
+                except Exception:
+                    messagebox.showerror("Помилка", f"Не вдалося відкрити: {target}\n{e1}", parent=win)
+
+        # ── 1. Голосовий зв'язок ──
+        c1 = card(body); c1.pack(fill='x', pady=(0, 8))
+        h1 = tk.Frame(c1, bg=C['card']); h1.pack(fill='x', padx=12, pady=(10, 2))
+        _pi = _support_img('phone', 22)
+        if _pi is not None: ctk.CTkLabel(h1, image=_pi, text="").pack(side='left', padx=(0, 8))
+        lbl(h1, "Голосовий зв'язок з адміністратором", 13, True).pack(side='left')
+        contacts_box = tk.Frame(c1, bg=C['card']); contacts_box.pack(fill='x', padx=12, pady=(2, 6))
+
+        def _contacts():
+            try: return list(_load_app_settings().get('support_contacts') or [])
+            except Exception: return []
+
+        def _render_contacts():
+            for w in contacts_box.winfo_children(): w.destroy()
+            cs = _contacts()
+            if not cs:
+                lbl(contacts_box, "Контакти ще не задано." + (" Натисніть «⚙ Контакти» нижче." if is_admin else
+                    " Попросіть адміністратора додати їх."), 10, color=C['text2']).pack(anchor='w', pady=6)
+                return
+            for c in cs:
+                r = tk.Frame(contacts_box, bg=C['card']); r.pack(fill='x', pady=3)
+                lbl(r, c.get('name', ''), 12, True).pack(side='left')
+                lbl(r, c.get('phone', ''), 10, color=C['text2']).pack(side='left', padx=8)
+                ph = ''.join(ch for ch in str(c.get('phone', '')) if ch.isdigit() or ch == '+')
+                tg = str(c.get('telegram', '')).strip().lstrip('@')
+                if tg:
+                    btn(r, "✈ Telegram", lambda t=tg: _open(f"https://t.me/{t}"), C['accent'], 100, height=28).pack(side='right', padx=2)
+                if ph:
+                    _ph_plus = ph if ph.startswith('+') else '+' + ph
+                    btn(r, "💜 Viber", lambda p=_ph_plus: _open(f"viber://chat?number={p.replace('+', '%2B')}"), C['gray'], 80, height=28).pack(side='right', padx=2)
+                    btn(r, "📞 Дзвінок", lambda p=ph: _open(f"tel:{p}"), C['green'], 100, height=28).pack(side='right', padx=2)
+        _render_contacts()
+
+        def _edit_contacts():
+            ew = dlg_win(win, "Контакти підтримки", "560x340")
+            fe = card(ew); fe.pack(fill='both', expand=True, padx=12, pady=12)
+            lbl(fe, "Один контакт на рядок:  Ім'я | телефон | @telegram", 11, True).pack(anchor='w', padx=10, pady=(10, 2))
+            lbl(fe, "Приклад:  Іван | +380671234567 | @ivan_admin   (telegram не обов'язковий)", 9,
+                color=C['text2']).pack(anchor='w', padx=10)
+            t = tk.Text(fe, height=8, bg=C['card2'], fg=C['text'], font=('Segoe UI', 11), relief='flat',
+                        insertbackground=C['text'])
+            t.pack(fill='both', expand=True, padx=10, pady=8)
+            t.insert('1.0', '\n'.join(f"{c.get('name','')} | {c.get('phone','')} | {c.get('telegram','')}" for c in _contacts()))
+            def _save():
+                out = []
+                for line in t.get('1.0', 'end').splitlines():
+                    parts = [x.strip() for x in line.split('|')]
+                    if not parts or not parts[0]: continue
+                    out.append({'name': parts[0], 'phone': parts[1] if len(parts) > 1 else '',
+                                'telegram': parts[2] if len(parts) > 2 else ''})
+                try: _save_app_settings({'support_contacts': out})
+                except Exception as e: messagebox.showerror("Помилка", str(e), parent=ew); return
+                ew.destroy(); _render_contacts()
+            btn(fe, "💾 Зберегти", _save, C['green'], 160, height=36).pack(pady=(0, 8))
+
+        # ── 2. Віддалений доступ ──
+        c2 = card(body); c2.pack(fill='x', pady=(0, 8))
+        h2 = tk.Frame(c2, bg=C['card']); h2.pack(fill='x', padx=12, pady=(10, 2))
+        _di = _support_img('desktop', 22)
+        if _di is not None: ctk.CTkLabel(h2, image=_di, text="").pack(side='left', padx=(0, 8))
+        lbl(h2, "Віддалений доступ (адміністратор бачить ваш екран)", 13, True).pack(side='left')
+        rem = tk.Frame(c2, bg=C['card']); rem.pack(fill='x', padx=12, pady=(2, 10))
+
+        def _find(paths, names):
+            for p_ in paths:
+                if p_ and os.path.exists(p_): return p_
+            for n_ in names:
+                w_ = shutil.which(n_)
+                if w_: return w_
+            return None
+        pf86 = os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)')
+        pf = os.environ.get('ProgramFiles', r'C:\Program Files')
+        # «Вбудований» варіант: кладете AnyDesk.exe / rustdesk.exe в папку tools поруч із програмою —
+        # програма знайде їх сама (без встановлення в систему).
+        try:
+            _app_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) \
+                else os.path.dirname(os.path.abspath(__file__))
+        except Exception:
+            _app_dir = os.getcwd()
+        _tool_dirs = [os.path.join(_app_dir, 'tools'), os.path.join(os.path.dirname(_app_dir), 'tools'),
+                      os.path.join(_app_dir, '..', '..', 'tools')]
+        def _local(*names):
+            return [os.path.join(d_, n_) for d_ in _tool_dirs for n_ in names]
+        tools = {
+            'AnyDesk': _find(_local('AnyDesk.exe', 'anydesk.exe') +
+                             [os.path.join(pf86, 'AnyDesk', 'AnyDesk.exe'), os.path.join(pf, 'AnyDesk', 'AnyDesk.exe')], ['AnyDesk']),
+            'RustDesk': _find(_local('rustdesk.exe', 'RustDesk.exe') +
+                              [os.path.join(pf, 'RustDesk', 'rustdesk.exe')], ['rustdesk']),
+            'TeamViewer': _find([os.path.join(pf86, 'TeamViewer', 'TeamViewer.exe'), os.path.join(pf, 'TeamViewer', 'TeamViewer.exe')], ['TeamViewer']),
+        }
+        found = {k: v for k, v in tools.items() if v}
+        id_var = tk.StringVar(value="")
+        if found:
+            first = next(iter(found))
+            idrow = tk.Frame(rem, bg=C['card']); idrow.pack(fill='x', pady=(0, 6))
+            lbl(idrow, f"Ваш ID ({first}):", 11, color=C['text2']).pack(side='left')
+            id_lbl = lbl(idrow, "визначаю…", 14, True, C['yellow']); id_lbl.pack(side='left', padx=8)
+
+            def _copy_id():
+                v = id_var.get()
+                if v:
+                    try: win.clipboard_clear(); win.clipboard_append(v); win.update()
+                    except Exception: pass
+                    id_lbl.configure(text=v + "  ✔ скопійовано")
+            btn(idrow, "📋 Копіювати", _copy_id, C['card2'], 110, height=28).pack(side='right')
+
+            def _get_id():
+                try:
+                    exe = found[first]
+                    r = subprocess.run([exe, '--get-id'], capture_output=True, text=True, timeout=6,
+                                       creationflags=(0x08000000 if sys.platform.startswith('win') else 0))
+                    v = (r.stdout or '').strip().splitlines()[-1].strip() if (r.stdout or '').strip() else ''
+                except Exception:
+                    v = ''
+                def _set():
+                    try:
+                        if v: id_var.set(v); id_lbl.configure(text=v)
+                        else: id_lbl.configure(text="запустіть програму й скажіть ID вручну", text_color=C['text2'])
+                    except Exception: pass
+                try: win.after(0, _set)
+                except Exception: pass
+            threading.Thread(target=_get_id, daemon=True).start()
+            br = tk.Frame(rem, bg=C['card']); br.pack(fill='x')
+            for name, exe in found.items():
+                btn(br, f"▶ Запустити {name}", lambda e=exe: subprocess.Popen([e]), C['accent'], 170, height=32).pack(side='left', padx=(0, 6))
+        else:
+            lbl(rem, "Програми віддаленого доступу не знайдено (AnyDesk / RustDesk / TeamViewer).", 10,
+                color=C['yellow']).pack(anchor='w')
+            lbl(rem, "Порада: покладіть AnyDesk.exe у папку «tools» поруч із програмою — вона знайде його сама.", 9,
+                color=C['text2']).pack(anchor='w')
+            btn(rem, "⬇ Завантажити AnyDesk", lambda: _open("https://anydesk.com/uk/downloads/windows"),
+                C['accent'], 190, height=32).pack(anchor='w', pady=(6, 0))
+        # Вбудований у Windows варіант — працює без встановлення
+        qa = tk.Frame(rem, bg=C['card']); qa.pack(fill='x', pady=(8, 0))
+        def _quick_assist():
+            try:
+                if sys.platform.startswith('win'):
+                    try: os.startfile("ms-quick-assist:")
+                    except Exception: subprocess.Popen(['quickassist.exe'])
+                else:
+                    messagebox.showinfo("", "Швидка допомога доступна лише у Windows", parent=win)
             except Exception as e:
-                log_error("_support_dlg send", e)
-                messagebox.showerror("Помилка", str(e), parent=win); return
-            messagebox.showinfo("✅", f"Повідомлення надіслано: {_var.get()}", parent=win)
-            win.destroy()
-        row = tk.Frame(f, bg=C['card']); row.pack(pady=6)
-        btn(row, "📨 Надіслати", _send, C['green'], 160, height=38).pack(side='left', padx=4)
-        btn(row, "Скасувати", win.destroy, C['card2'], 120, height=38).pack(side='left', padx=4)
+                messagebox.showerror("Помилка", str(e), parent=win)
+        btn(qa, "🪟 Швидка допомога Windows", _quick_assist, C['card2'], 230, height=32).pack(side='left')
+        lbl(qa, "  вбудована, без встановлення", 9, color=C['text2']).pack(side='left')
+
+        # ── 3. Повідомлення в чат ──
+        c3 = card(body); c3.pack(fill='both', expand=True, pady=(0, 4))
+        lbl(c3, "💬  Написати адміністратору в чат", 13, True).pack(anchor='w', padx=12, pady=(10, 4))
+        try:
+            from app.utils.db import query as _qsu
+            admins = _qsu("""SELECT username, COALESCE(NULLIF(full_name,''), username) AS name
+                             FROM users WHERE active=TRUE AND role='admin' AND username<>%s ORDER BY 2""",
+                          (me,), fetch='all') or []
+        except Exception:
+            admins = []
+        if admins:
+            labels = {a['name']: a['username'] for a in admins}
+            _var = tk.StringVar(value=list(labels.keys())[0])
+            ctk.CTkComboBox(c3, values=list(labels.keys()), variable=_var, width=400,
+                            state='readonly').pack(anchor='w', padx=12)
+            txt = tk.Text(c3, height=3, bg=C['card2'], fg=C['text'], font=('Segoe UI', 11), wrap='word',
+                          relief='flat', insertbackground=C['text'])
+            txt.pack(fill='x', padx=12, pady=6)
+            def _send():
+                bodyt = txt.get('1.0', 'end').strip()
+                if not bodyt:
+                    messagebox.showwarning("", "Напишіть повідомлення", parent=win); return
+                try:
+                    chat_send(me, me_name, labels[_var.get()], "🎧 Підтримка: " + bodyt)
+                except Exception as e:
+                    log_error("_support_dlg send", e)
+                    messagebox.showerror("Помилка", str(e), parent=win); return
+                txt.delete('1.0', 'end')
+                messagebox.showinfo("✅", f"Надіслано: {_var.get()}", parent=win)
+            btn(c3, "📨 Надіслати", _send, C['green'], 150, height=32).pack(anchor='w', padx=12, pady=(0, 10))
+        else:
+            lbl(c3, "Інших адміністраторів у системі немає.", 10, color=C['text2']).pack(anchor='w', padx=12, pady=(0, 10))
+
+        bot = tk.Frame(win, bg=C['bg']); bot.pack(fill='x', padx=12, pady=(0, 10))
+        if is_admin:
+            btn(bot, "⚙ Контакти", _edit_contacts, C['card2'], 130, height=32).pack(side='left')
+        btn(bot, "Закрити", win.destroy, C['card2'], 120, height=32).pack(side='right')
 
     def _update_topbar_zx(self, key):
         """Показує кнопки Z/X у верхній панелі лише на Дашборді."""
@@ -17457,6 +18061,46 @@ def _make_scroll_picker(parent, items, height=140, bg=None):
 
     return wrap, get_idx
 
+def _ensure_room_category(parent, room):
+    """Номер без категорії (немає ціни) не можна заселяти: пропонуємо одразу призначити категорію.
+    Повертає True, якщо можна продовжувати. Оновлює room['cat_name'] / room['base_price']."""
+    try: _price = float(room.get('base_price') or 0)
+    except Exception: _price = 0.0
+    if room.get('cat_name') and _price > 0:
+        return True
+    from app.utils.db import query as _qe
+    try:
+        cats = _qe("SELECT id, name, base_price FROM room_categories ORDER BY name", fetch='all') or []
+    except Exception as e:
+        messagebox.showerror("Помилка БД", str(e)); return False
+    if not cats:
+        messagebox.showwarning("Немає категорій", "Спершу створіть категорію: Налаштування → Категорії."); return False
+    labels = {f"{c['name']} — {float(c['base_price'] or 0):.0f}₴": c for c in cats}
+    res = {'ok': False}
+    win = dlg_win(parent, "Категорія номера", "460x270")
+    f = card(win); f.pack(fill='both', expand=True, padx=12, pady=12)
+    lbl(f, f"У номера {_rn(room.get('number',''))} не задано категорію (ціну).", 12, True, C['yellow']).pack(anchor='w', padx=12, pady=(14, 2))
+    lbl(f, "Оберіть категорію — ціна підставиться автоматично:", 11, color=C['text2']).pack(anchor='w', padx=12, pady=(0, 6))
+    _var = tk.StringVar(value=list(labels.keys())[0])
+    ctk.CTkComboBox(f, values=list(labels.keys()), variable=_var, width=400, state='readonly').pack(padx=12)
+    def _ok():
+        c = labels[_var.get()]
+        try:
+            _qe("UPDATE rooms SET category_id=%s WHERE id=%s", (c['id'], room['id']), fetch=None)
+            try: _invalidate_rooms_cache()
+            except Exception: pass
+        except Exception as e:
+            messagebox.showerror("Помилка БД", str(e), parent=win); return
+        room['category_id'] = c['id']; room['cat_name'] = c['name']; room['base_price'] = float(c['base_price'] or 0)
+        res['ok'] = True; win.destroy()
+    row = tk.Frame(f, bg=C['card']); row.pack(pady=16)
+    btn(row, "✅ Призначити й продовжити", _ok, C['green'], 230, height=36).pack(side='left', padx=4)
+    btn(row, "Скасувати", win.destroy, C['card2'], 110, height=36).pack(side='left', padx=4)
+    try: win.wait_window()
+    except Exception: pass
+    return res['ok']
+
+
 def _open_checkin_dlg(parent, room, click_date, on_save=None):
     """Вікно заселення: паспорт + оплата + залог → заселення + чек."""
     from app.utils.db import query
@@ -17464,6 +18108,8 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
     import datetime as _dt
 
     if _block_if_room_occupied(room['id']):
+        return
+    if not _ensure_room_category(parent, room):
         return
 
     win = dlg_win(parent, "✅ Заселення", "500x640")
@@ -17493,7 +18139,7 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
     # Заголовок
     hdr = card(sc); hdr.pack(fill='x', padx=12, pady=(10,5))
     lbl(hdr, f"✅  Заселення — Номер {_rn(room['number'])}", 15, True, C['green']).pack(anchor='w', padx=12, pady=(10,3))
-    lbl(hdr, f"🏷 {room.get('cat_name','')}  |  💰 {float(room.get('base_price',0)):.0f}₴/ніч",
+    lbl(hdr, f"🏷 {room.get('cat_name','')}  |  💰 {float(room.get('base_price') or 0):.0f}₴/ніч",
         11, color=C['text2']).pack(anchor='w', padx=12, pady=(0,10))
 
     # Гість
@@ -21138,7 +21784,7 @@ class BookingDlg(ctk.CTkToplevel):
 
     def _fill_price(self,choice):
         if choice in self.room_map:
-            p=self.room_map[choice].get('base_price',0)
+            p=self.room_map[choice].get('base_price') or 0
             self.fields['price'].delete(0,'end'); self.fields['price'].insert(0,str(p or 0))
             # Автоматично підтягуємо аванс
             dep = 0
@@ -25327,8 +25973,9 @@ class RestaurantFrame(tk.Frame):
         self._order_status_lbl = lbl(tb, "", 11, color=C['text2'])
         self._order_status_lbl.pack(side='right', padx=(0,6))
         btn(tb, "🔄 Меню", self._reload_menu, C['card2'], 100).pack(side='right', padx=4, pady=10)
-        btn(tb, "📤 Імпорт з Excel", self._import_menu_excel, '#16a085', 130).pack(side='right', padx=4, pady=10)
-        btn(tb, "📥 Excel залишки", self._export_stock_excel, '#27ae60', 140).pack(side='right', padx=4, pady=10)
+        btn(tb, "✏️ Зміна меню", self._open_menu_editor, '#e67e22', 140).pack(side='right', padx=4, pady=10)
+        _xl_btn = btn(tb, "⇅ Вигрузка/Загрузка ▾", lambda: self._xl_popup(_xl_btn), '#16a085', 190)
+        _xl_btn.pack(side='right', padx=4, pady=10)
         _print_btn = btn(tb, "🖨 Друк ▾", lambda: self._print_popup(_print_btn), '#2980b9', 110)
         _print_btn.pack(side='right', padx=4, pady=10)
         btn(tb, "📊 Звіт", self._restaurant_report, '#8e44ad', 90).pack(side='right', padx=4, pady=10)
@@ -26306,6 +26953,35 @@ class RestaurantFrame(tk.Frame):
         except Exception as _ex:
             log_error("RestaurantFrame._import_menu_excel", _ex)
             messagebox.showerror("Помилка імпорту", str(_ex))
+
+    def _xl_popup(self, anchor):
+        """Меню «Вигрузка/Загрузка»: Excel залишки (вигрузка) та Імпорт з Excel (загрузка)."""
+        m = tk.Menu(self, tearoff=0, bg=C['card2'], fg=C['text'], activebackground=C['accent'],
+                    activeforeground='white', font=('Segoe UI', 11), bd=0)
+        m.add_command(label="📥  Вигрузка: Excel залишки", command=self._export_stock_excel)
+        m.add_command(label="📤  Загрузка: Імпорт з Excel", command=self._import_menu_excel)
+        try:
+            m.tk_popup(anchor.winfo_rootx(), anchor.winfo_rooty() + anchor.winfo_height() + 2)
+        finally:
+            try: m.grab_release()
+            except Exception: pass
+
+    def _open_menu_editor(self):
+        """Редактор меню прямо з Ресторану: додати / змінити (в т.ч. ціну) / видалити позиції,
+        категорії, штрих-коди — без переходу в Налаштування."""
+        ex = getattr(self, '_menu_editor_win', None)
+        try:
+            if ex is not None and ex.winfo_exists():
+                ex.deiconify(); ex.lift(); ex.focus_force(); return
+        except Exception: pass
+        win = dlg_win(self, "✏️ Зміна меню", "1180x700")
+        self._menu_editor_win = win
+        _MenuEditorFrame(win, self.user).pack(fill='both', expand=True, padx=10, pady=10)
+        def _on_close(e):
+            if e.widget is win:
+                try: self._reload_menu()
+                except Exception: pass
+        win.bind('<Destroy>', _on_close, add='+')
 
     def _reload_menu(self):
         """Оновлює список меню з БД."""
@@ -28305,7 +28981,7 @@ class _BookableObjectFrame(tk.Frame):
         win = dlg_win(self, f"{self.OBJ_ICON} {self.OBJ_LABEL} {room['number']}", "340x290")
         f = tk.Frame(win, bg=C['bg']); f.pack(fill='both', expand=True, padx=15, pady=15)
         lbl(f, f"{self.OBJ_ICON}  {self.OBJ_LABEL} {room['number']}", 16, True, C['accent']).pack(pady=(0,4))
-        lbl(f, f"Категорія: {room.get('cat_name','—')}  |  {float(room.get('base_price',0)):.0f}₴/ніч", 11, color=C['text2']).pack()
+        lbl(f, f"Категорія: {room.get('cat_name','—')}  |  {float(room.get('base_price') or 0):.0f}₴/ніч", 11, color=C['text2']).pack()
         lbl(f, f"Статус: {STATUS_UA.get(status, status)}", 12, color=STATUS_COLOR.get(status, C['gray'])).pack(pady=(0,12))
         import datetime as _dt
         today = _dt.date.today()
@@ -28784,7 +29460,29 @@ def _open_sauna_checkin_dlg(parent, room, on_save=None, booking=None):
         except Exception: pass
 
     lbl(pf,"Ціна/год:",12).grid(row=0,column=0,sticky='w',pady=4)
-    lbl(pf,f"{default_price:.0f} ₴/год",12,True,C['accent']).grid(row=0,column=1,sticky='w',padx=15,pady=4)
+    lbl_price = lbl(pf,f"{default_price:.0f} ₴/год",12,True,C['accent'])
+    lbl_price.grid(row=0,column=1,sticky='w',padx=15,pady=4)
+    # 🛁 «+ Чан»: ціна з чаном береться з категорії (Налаштування → Категорії → «+ Чан»)
+    _base_price = default_price
+    _chan_price = _room_chan_price(room['id'])
+    chan_var = tk.BooleanVar(value=False)
+    if _chan_price > 0:
+        try:
+            if booking and abs(float(booking.get('price_per_day') or 0) - _chan_price) < 0.5:
+                chan_var.set(True)
+        except Exception: pass
+        def _on_chan():
+            nonlocal default_price
+            default_price = _chan_price if chan_var.get() else _base_price
+            lbl_price.configure(text=f"{default_price:.0f} ₴/год")
+            try: _update_total()
+            except NameError: pass
+        ctk.CTkCheckBox(pf, text=f"🛁 + Чан ({_chan_price:.0f}₴/год)", variable=chan_var,
+                        command=_on_chan, font=('Segoe UI',12,'bold'), text_color=C['yellow'],
+                        fg_color=C['accent']).grid(row=0,column=2,sticky='w',padx=8)
+        if chan_var.get():
+            default_price = _chan_price
+            lbl_price.configure(text=f"{default_price:.0f} ₴/год")
 
     lbl(pf,"Сума:",12).grid(row=1,column=0,sticky='w',pady=4)
     lbl_total = lbl(pf,"",13,True,C['green']); lbl_total.grid(row=1,column=1,padx=15,sticky='w')
@@ -28986,7 +29684,7 @@ def _open_sauna_checkin_dlg(parent, room, on_save=None, booking=None):
             g = query("SELECT id FROM guests WHERE phone=%s", (phone,), fetch='one')
             gid = g['id']
 
-        note_text = f"Баня: {h:.2f} год ({ci_dt.strftime('%H:%M')}–{co_dt.strftime('%H:%M')})"
+        note_text = f"Баня{' + Чан' if chan_var.get() else ''}: {h:.2f} год ({ci_dt.strftime('%H:%M')}–{co_dt.strftime('%H:%M')})"
         if discount_h > 0:
             note_text = f"Знижка: {discount_h:.0f}₴ ({discount_comment_h})  " + note_text
         extra = e_note.get().strip()
@@ -29221,7 +29919,22 @@ def _open_sauna_booking_dlg(parent, room, on_save=None):
     pf = tk.Frame(p_card, bg=C['card']); pf.pack(fill='x', padx=12, pady=(0,10))
 
     lbl(pf,"Ціна/год:",11,color=C['text2']).grid(row=0,column=0,sticky='w',pady=4)
-    lbl(pf,f"{default_price:.0f} ₴/год",12,True,C['accent']).grid(row=0,column=1,padx=15,sticky='w')
+    lbl_price2 = lbl(pf,f"{default_price:.0f} ₴/год",12,True,C['accent'])
+    lbl_price2.grid(row=0,column=1,padx=15,sticky='w')
+    # 🛁 «+ Чан» — ціна з чаном з категорії
+    _base_price2 = default_price
+    _chan_price2 = _room_chan_price(room['id'])
+    chan_var2 = tk.BooleanVar(value=False)
+    if _chan_price2 > 0:
+        def _on_chan2():
+            nonlocal default_price
+            default_price = _chan_price2 if chan_var2.get() else _base_price2
+            lbl_price2.configure(text=f"{default_price:.0f} ₴/год")
+            try: _upd()
+            except NameError: pass
+        ctk.CTkCheckBox(pf, text=f"🛁 + Чан ({_chan_price2:.0f}₴/год)", variable=chan_var2,
+                        command=_on_chan2, font=('Segoe UI',12,'bold'), text_color=C['yellow'],
+                        fg_color=C['accent']).grid(row=0,column=2,sticky='w',padx=8)
 
     lbl(pf,"Сума:",11,color=C['text2']).grid(row=1,column=0,sticky='w',pady=4)
     lbl_total2 = lbl(pf,"",13,True,C['green']); lbl_total2.grid(row=1,column=1,padx=15,sticky='w')
@@ -29312,7 +30025,7 @@ def _open_sauna_booking_dlg(parent, room, on_save=None):
                         r = _cur.fetchone()
                         gid = r[0] if isinstance(r, (list,tuple)) else r['id']
 
-                    note = f"Баня: {h:.2f} год ({start_dt.strftime('%H:%M')}–{end_dt.strftime('%H:%M')})"
+                    note = f"Баня{' + Чан' if chan_var2.get() else ''}: {h:.2f} год ({start_dt.strftime('%H:%M')}–{end_dt.strftime('%H:%M')})"
                     if e_note2.get().strip(): note += f". {e_note2.get().strip()}"
 
                     _cur.execute("""INSERT INTO bookings
@@ -29442,7 +30155,7 @@ class SaunaFrame(_BookableObjectFrame):
         win = dlg_win(self, f"🔥 Баня {room['number']}", "320x310")
         f = tk.Frame(win, bg=C['bg']); f.pack(fill='both', expand=True, padx=15, pady=15)
         lbl(f, f"🔥  Баня {room['number']}", 16, True, C['accent']).pack(pady=(0,4))
-        lbl(f, f"Категорія: {room.get('cat_name','—')}  |  {float(room.get('base_price',0)):.0f}{price_label}", 11, color=C['text2']).pack()
+        lbl(f, f"Категорія: {room.get('cat_name','—')}  |  {float(room.get('base_price') or 0):.0f}{price_label}", 11, color=C['text2']).pack()
         lbl(f, f"Статус: {STATUS_UA.get(status, status)}", 12, color=STATUS_COLOR.get(status, C['gray'])).pack(pady=(0,12))
         if status == 'free':
             if is_hourly:
@@ -36649,19 +37362,21 @@ class SettingsFrame(tk.Frame):
 
     def _load_cats(self):
         from app.modules.logic import get_categories
-        try: _category_weekend_map(force=True)
+        try: _category_weekend_map(force=True); _category_chan_map(force=True)
         except Exception: pass
         self.cats_t.delete(*self.cats_t.get_children())
         for c in (get_categories() or []):
             _desc = (c.get('description','') or '').replace('[tariff:hour]','').replace('[tariff:night]','').strip()
             _tariff = '⏱год' if '[tariff:hour]' in (c.get('description','') or '') else '🌙ніч'
             _wk = _category_weekend_map().get(int(c['id'])) if _tariff != '⏱год' else None
-            _ptxt = f"{float(c['base_price'] or 0):.0f}₴ ({_tariff})" + (f" · вих. {_wk:.0f}₴" if _wk else "")
+            _chp = _category_chan_map().get(int(c['id']))
+            _ptxt = (f"{float(c['base_price'] or 0):.0f}₴ ({_tariff})" + (f" · вих. {_wk:.0f}₴" if _wk else "")
+                     + (f" · +чан {_chp:.0f}₴" if _chp else ""))
             self.cats_t.insert('','end',iid=c['id'],values=(c['id'],c['name'],_desc,_ptxt,c['capacity']))
 
     def _cat_dlg(self,p,cat=None):
         from app.modules.logic import save_category
-        win=dlg_win(self,"Категорія","520x420"); f=card(win); f.pack(fill='both',expand=True,padx=15,pady=15)
+        win=dlg_win(self,"Категорія","520x470"); f=card(win); f.pack(fill='both',expand=True,padx=15,pady=15)
         flds={}
 
         # Визначити тариф з тегу в описі (тег має пріоритет над назвою)
@@ -36720,6 +37435,20 @@ class SettingsFrame(tk.Frame):
         ctk.CTkLabel(r_wk,text="₴ (Сб, Нд; порожньо = як у будні)",font=('Segoe UI',10),text_color=C['text2']).pack(side='left',padx=6)
         flds['weekend_price'] = e_wk
 
+        # Ціна «+ Чан» (₴/год) — для бані з чаном: у вікнах заселення/бронювання бані
+        # з'являється галочка «+ Чан», яка підставляє цю ціну.
+        r_ch = row_frm(f)
+        ctk.CTkLabel(r_ch,text="+ Чан",font=('Segoe UI',11),text_color=C['text2'],width=130,anchor='w').pack(side='left')
+        e_ch = ent(r_ch,w=140)
+        try:
+            _ch0 = _category_chan_map(force=True).get(int(cat['id'])) if cat else None
+        except Exception:
+            _ch0 = None
+        if _ch0: e_ch.insert(0, '%g' % _ch0)
+        e_ch.pack(side='left')
+        ctk.CTkLabel(r_ch,text="₴/год з чаном (порожньо = без чана)",font=('Segoe UI',10),text_color=C['text2']).pack(side='left',padx=6)
+        flds['chan_price'] = e_ch
+
         def _on_tariff_change(*a):
             price_unit_lbl.configure(text="₴/год" if tariff_var.get()=='hour' else "₴/ніч")
         tariff_var.trace_add('write', _on_tariff_change)
@@ -36741,6 +37470,12 @@ class SettingsFrame(tk.Frame):
                 if _wk_val is not None and _wk_val < 0: raise ValueError
             except ValueError:
                 messagebox.showerror("","Ціна вихідних має бути числом"); return
+            try:
+                _ch_txt = flds['chan_price'].get().strip().replace(',', '.')
+                _ch_val = float(_ch_txt) if _ch_txt else None
+                if _ch_val is not None and _ch_val < 0: raise ValueError
+            except ValueError:
+                messagebox.showerror("","Ціна «+ Чан» має бути числом"); return
 
             # Зміна ціни діє З ДАТИ ЗМІНИ: чинні заселення (оплачені за старою ціною) не
             # перераховуються; продовження та прострочені ночі від цієї дати — за новою ціною.
@@ -36771,8 +37506,9 @@ class SettingsFrame(tk.Frame):
                                    (flds['name'].get().strip(),), fetch='one')
                         _cid = _rr['id'] if _rr else None
                     if _cid is not None:
-                        _qwk("UPDATE room_categories SET weekend_price=%s WHERE id=%s",
-                             (_wk_val if (_wk_val and tariff_var.get() != 'hour') else None, _cid), fetch=None)
+                        _qwk("UPDATE room_categories SET weekend_price=%s, chan_price=%s WHERE id=%s",
+                             (_wk_val if (_wk_val and tariff_var.get() != 'hour') else None,
+                              _ch_val if _ch_val else None, _cid), fetch=None)
                 except Exception as _ew:
                     log_error("зберігання ціни вихідних", _ew)
                 _invalidate_price_caches()
@@ -41565,3 +42301,15 @@ class SettingsFrame(tk.Frame):
         btn(bf,"📤 Експорт JSON",_do_export,C['accent'],160,height=38).pack(side='left',padx=(0,8))
         btn(bf,"📥 Імпорт JSON",_do_import,C['card2'],140,height=38).pack(side='left')
 
+
+
+class _MenuEditorFrame(SettingsFrame):
+    """Вкладка «Меню» з Налаштувань як самостійний фрейм (для вікна «Зміна меню» у Ресторані)."""
+    def __init__(self, parent, user):
+        tk.Frame.__init__(self, parent, bg=C['bg'])
+        self.user = user
+        self._ui_built = True
+        body = tk.Frame(self, bg=C['bg']); body.pack(fill='both', expand=True)
+        self._menu_tab(body)
+        try: self._load_svcs()
+        except Exception as e: log_error("_MenuEditorFrame load", e)
