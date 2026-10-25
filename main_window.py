@@ -10352,6 +10352,78 @@ _NAV_ICONS_3D_B64 = {
 # ══════════════════════════════════════════════════════
 _CHAT_TABLES_OK = False
 
+_support_tbl_ready = {'ok': False}
+
+
+def _support_ensure_table():
+    """Таблиця запитів на допомогу (support_requests). Створюється автоматично."""
+    if _support_tbl_ready['ok']:
+        return True
+    try:
+        from app.utils.db import query as _qs
+        _qs("""CREATE TABLE IF NOT EXISTS support_requests (
+                 id SERIAL PRIMARY KEY,
+                 created_at TIMESTAMP DEFAULT NOW(),
+                 from_user TEXT, from_name TEXT, pc_name TEXT,
+                 anydesk_id TEXT, message TEXT,
+                 status TEXT DEFAULT 'open',
+                 accepted_by TEXT, accepted_name TEXT, accepted_at TIMESTAMP,
+                 notified BOOLEAN DEFAULT FALSE,
+                 voice_room TEXT)""", fetch=None)
+        _qs("ALTER TABLE support_requests ADD COLUMN IF NOT EXISTS voice_room TEXT", fetch=None)
+        _support_tbl_ready['ok'] = True
+    except Exception as e:
+        try: log_error("support_requests: створення таблиці", e)
+        except Exception: pass
+    return _support_tbl_ready['ok']
+
+
+def _voice_call_url(room, name=''):
+    """Посилання на голосову кімнату (Jitsi Meet, у браузері, без встановлення; камера вимкнена)."""
+    from urllib.parse import quote
+    frag = ("config.startWithVideoMuted=true&config.startWithAudioMuted=false"
+            "&config.prejoinPageEnabled=false&config.prejoinConfig.enabled=false"
+            "&interfaceConfig.TOOLBAR_BUTTONS=%5B%22microphone%22%2C%22hangup%22%2C%22chat%22%5D")
+    if name:
+        frag += "&userInfo.displayName=" + quote('"' + name + '"')
+    return f"https://meet.jit.si/{room}#{frag}"
+
+
+def _open_url(url):
+    """Відкриває посилання в браузері за замовчуванням (без залежності від модуля webbrowser)."""
+    import os, sys
+    try:
+        if sys.platform.startswith('win'): os.startfile(url)
+        else:
+            import webbrowser as _wb; _wb.open(url)
+        return True
+    except Exception:
+        try:
+            import webbrowser as _wb2; _wb2.open(url); return True
+        except Exception:
+            return False
+
+
+def _find_anydesk():
+    """Шлях до AnyDesk.exe (папка tools поруч із програмою, Program Files або PATH) або None."""
+    import os, sys, shutil
+    try:
+        app_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) \
+            else os.path.dirname(os.path.abspath(__file__))
+    except Exception:
+        app_dir = os.getcwd()
+    cands = []
+    for d in (os.path.join(app_dir, 'tools'), os.path.join(os.path.dirname(app_dir), 'tools'),
+              os.path.join(app_dir, '..', '..', 'tools')):
+        cands += [os.path.join(d, 'AnyDesk.exe'), os.path.join(d, 'anydesk.exe')]
+    for pf in (os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'),
+               os.environ.get('ProgramFiles', r'C:\Program Files')):
+        cands.append(os.path.join(pf, 'AnyDesk', 'AnyDesk.exe'))
+    for c in cands:
+        if os.path.exists(c): return c
+    return shutil.which('AnyDesk')
+
+
 def _chat_ensure_tables():
     """Створює таблиці чату (один раз за запуск). Повертає True, якщо все готово."""
     global _CHAT_TABLES_OK
@@ -12295,6 +12367,8 @@ class HotelApp(ctk.CTk):
             self._support_btn.configure(image=_support_img('operator', 24), compound='left')
         except Exception:
             self._support_btn.configure(text="🎧 Підтримка")
+        try: self._support_btn_w0 = self._support_btn.cget('width')
+        except Exception: self._support_btn_w0 = 150
         self._support_btn.pack(side='right', padx=(4, 2), pady=7, after=self._db_badge)
         self._zx_wrap = tk.Frame(self._topbar, bg=C['bg'])
         self._close_shift_btn = btn_fit(self._zx_wrap, "🔴 Закрити зміну ▾", self._close_shift_menu, C['red'])
@@ -12351,9 +12425,176 @@ class HotelApp(ctk.CTk):
             import time as _t
             while getattr(self, '_chat_poller_started', False):
                 self._chat_poll_blocking()
+                try: self._support_poll_blocking()
+                except Exception as _es: log_error("support poll", _es)
                 _t.sleep(4)
         threading.Thread(target=_loop, daemon=True, name='chat-poller').start()
         log_info("Чат: фоновий опитувач запущено")
+
+    # ── 🆘 Запити допомоги: адміністратор одразу бачить сповіщення ───────────
+    def _support_send_request(self, message, anydesk_id='', voice=False):
+        """Створює запит на допомогу — усі адміністратори отримають сповіщення."""
+        import socket
+        from app.utils.db import query as _qs
+        if not _support_ensure_table():
+            raise RuntimeError("Не вдалося створити таблицю запитів")
+        u = self.user if isinstance(self.user, dict) else dict(self.user)
+        try: pc = socket.gethostname()
+        except Exception: pc = ''
+        # не дублюємо: якщо від цього користувача вже є відкритий запит — оновлюємо його
+        import uuid as _uu
+        room = ('HotelPMS-' + _uu.uuid4().hex[:10]) if voice else None
+        old = _qs("SELECT id FROM support_requests WHERE from_user=%s AND status='open' ORDER BY id DESC LIMIT 1",
+                  (u.get('username'),), fetch='one')
+        if old:
+            _qs("UPDATE support_requests SET message=%s, anydesk_id=%s, created_at=NOW(), "
+                "voice_room=COALESCE(%s, voice_room) WHERE id=%s",
+                (message, anydesk_id, room, old['id']), fetch=None)
+            return old['id']
+        r = _qs("""INSERT INTO support_requests (from_user, from_name, pc_name, anydesk_id, message, voice_room)
+                   VALUES (%s,%s,%s,%s,%s,%s) RETURNING id""",
+                (u.get('username'), u.get('full_name') or u.get('username'), pc, anydesk_id, message, room), fetch='one')
+        return r['id'] if r else None
+
+    def _support_poll_blocking(self):
+        """Фоновий опит: для адміністратора — нові відкриті запити; для всіх — відповіді на свої."""
+        u = self.user if isinstance(self.user, dict) else dict(self.user)
+        me = u.get('username')
+        if not me or not _support_ensure_table():
+            return
+        from app.utils.db import query as _qs
+        is_admin = (u.get('role') == 'admin')
+        open_rows = None
+        if is_admin:
+            open_rows = _qs("""SELECT id, from_user, from_name, pc_name, anydesk_id, message, created_at, voice_room
+                               FROM support_requests
+                               WHERE status='open' AND from_user<>%s AND created_at > NOW() - INTERVAL '8 hours'
+                               ORDER BY id""", (me,), fetch='all') or []
+        mine = _qs("""SELECT id, accepted_name, voice_room FROM support_requests
+                      WHERE from_user=%s AND status='accepted' AND COALESCE(notified,FALSE)=FALSE""",
+                   (me,), fetch='all') or []
+        if mine:
+            _qs("UPDATE support_requests SET notified=TRUE WHERE id = ANY(%s)", ([m['id'] for m in mine],), fetch=None)
+        self.after(0, lambda: self._support_apply(open_rows, mine))
+
+    def _support_apply(self, open_rows, accepted_mine):
+        # відповідь на мій запит
+        for m in (accepted_mine or []):
+            self._chat_toast("✅ Підтримка", f"Адміністратор {m.get('accepted_name') or ''} прийняв ваш запит"
+                             + (" — відкриваю голосовий дзвінок…" if m.get('voice_room') else " і підключається."), None)
+            if m.get('voice_room'):
+                try:
+                    _nm = (self.user or {}).get('full_name') or (self.user or {}).get('username') or ''
+                    _open_url(_voice_call_url(m['voice_room'], _nm))
+                except Exception as _ev: log_error("voice open", _ev)
+        if open_rows is None:
+            return
+        n = len(open_rows)
+        # значок на кнопці «Підтримка»
+        try:
+            b = self._support_btn
+            if n:
+                b.configure(text=f"Підтримка ({n})", fg_color=C['red'], hover_color=C['red'], width=170)
+            else:
+                b.configure(text="Підтримка", fg_color=C['card2'], hover_color=C['border'])
+                try: b.configure(width=self._support_btn_w0)
+                except Exception: pass
+        except Exception: pass
+        # нові запити → заметне вікно + звук
+        seen = getattr(self, '_support_seen', None)
+        if seen is None:
+            seen = self._support_seen = set()
+        for r in open_rows:
+            if r['id'] not in seen:
+                seen.add(r['id'])
+                self._support_alert(r)
+        alive_ids = {r['id'] for r in open_rows}
+        for w in list(getattr(self, '_support_alert_wins', {}).items()):
+            rid, win_ = w
+            if rid not in alive_ids:        # прийнято/закрито іншим адміністратором
+                try: win_.destroy()
+                except Exception: pass
+                self._support_alert_wins.pop(rid, None)
+
+    def _support_alert(self, r):
+        """Велике вікно «🆘 Потрібна допомога» поверх усього, зі звуком."""
+        try:
+            import winsound
+            for f_ in (880, 660, 880):
+                try: winsound.Beep(f_, 160)
+                except Exception: break
+        except Exception: pass
+        if not hasattr(self, '_support_alert_wins'): self._support_alert_wins = {}
+        t = tk.Toplevel(self)
+        self._support_alert_wins[r['id']] = t
+        t.title("🆘 Потрібна допомога")
+        t.configure(bg=C['red'])
+        try: t.attributes('-topmost', True)
+        except Exception: pass
+        inner = tk.Frame(t, bg=C['card2']); inner.pack(padx=3, pady=3)
+        tk.Label(inner, text="🆘  ПОТРІБНА ДОПОМОГА", font=('Segoe UI', 16, 'bold'),
+                 bg=C['card2'], fg=C['red']).pack(padx=24, pady=(16, 6))
+        tk.Label(inner, text=f"{r.get('from_name') or r.get('from_user')}", font=('Segoe UI', 14, 'bold'),
+                 bg=C['card2'], fg=C['text']).pack()
+        info = f"ПК: {r.get('pc_name') or '—'}   ·   {str(r.get('created_at'))[11:16]}"
+        tk.Label(inner, text=info, font=('Segoe UI', 10), bg=C['card2'], fg=C['text2']).pack(pady=(2, 8))
+        if r.get('message'):
+            tk.Label(inner, text=r['message'], font=('Segoe UI', 11), wraplength=380, justify='left',
+                     bg=C['card2'], fg=C['text']).pack(padx=20, pady=(0, 8))
+        if r.get('voice_room'):
+            tk.Label(inner, text="📞 Просить голосовий дзвінок через інтернет", font=('Segoe UI', 12, 'bold'),
+                     bg=C['card2'], fg=C['green']).pack(pady=(0, 6))
+        if r.get('anydesk_id'):
+            tk.Label(inner, text=f"AnyDesk ID: {r['anydesk_id']}", font=('Segoe UI', 13, 'bold'),
+                     bg=C['card2'], fg=C['yellow']).pack(pady=(0, 10))
+        row = tk.Frame(inner, bg=C['card2']); row.pack(pady=(0, 16))
+        def _later():
+            try: t.destroy()
+            except Exception: pass
+        ctk.CTkButton(row, text="✅ Прийняти і підключитись", width=230, height=38, fg_color=C['green'],
+                      command=lambda: (_later(), self._support_accept(r))).pack(side='left', padx=6)
+        ctk.CTkButton(row, text="Пізніше", width=100, height=38, fg_color=C['card'],
+                      command=_later).pack(side='left', padx=6)
+        t.update_idletasks()
+        w, h = t.winfo_reqwidth(), t.winfo_reqheight()
+        t.geometry(f"+{(self.winfo_screenwidth()-w)//2}+{(self.winfo_screenheight()-h)//3}")
+        try: t.lift(); t.focus_force()
+        except Exception: pass
+
+    def _support_accept(self, r):
+        """Адміністратор бере запит: статус «прийнято», ID у буфер, запуск AnyDesk на підключення."""
+        import subprocess
+        from app.utils.db import query as _qs
+        u = self.user if isinstance(self.user, dict) else dict(self.user)
+        try:
+            got = _qs("""UPDATE support_requests SET status='accepted', accepted_by=%s, accepted_name=%s,
+                           accepted_at=NOW() WHERE id=%s AND status='open' RETURNING id""",
+                      (u.get('username'), u.get('full_name') or u.get('username'), r['id']), fetch='one')
+        except Exception as e:
+            messagebox.showerror("Помилка БД", str(e)); return
+        if not got:
+            messagebox.showinfo("Підтримка", "Цей запит вже прийнято іншим адміністратором."); return
+        if r.get('voice_room'):
+            try: _open_url(_voice_call_url(r['voice_room'], u.get('full_name') or u.get('username') or 'Адміністратор'))
+            except Exception as e: log_error("support accept voice", e)
+        aid = str(r.get('anydesk_id') or '').strip()
+        if aid:
+            try: self.clipboard_clear(); self.clipboard_append(aid); self.update()
+            except Exception: pass
+            exe = _find_anydesk()
+            if exe:
+                try: subprocess.Popen([exe, aid])
+                except Exception as e: log_error("support accept anydesk", e)
+            else:
+                messagebox.showinfo("Підтримка", f"AnyDesk ID {aid} скопійовано в буфер.\nЗапустіть AnyDesk і вставте ID.")
+        else:
+            messagebox.showinfo("Підтримка", f"Запит прийнято. Зв'яжіться з {r.get('from_name') or r.get('from_user')} "
+                                             f"(ПК: {r.get('pc_name') or '—'}) — ID AnyDesk не вказано.")
+        try: self._support_poll_blocking_async()
+        except Exception: pass
+
+    def _support_poll_blocking_async(self):
+        threading.Thread(target=lambda: self._support_poll_blocking(), daemon=True).start()
 
     def _chat_poll_now(self):
         threading.Thread(target=self._chat_poll_blocking, daemon=True).start()
@@ -12579,7 +12820,7 @@ class HotelApp(ctk.CTk):
         me_name = (self.user or {}).get('full_name') or me
         is_admin = (self.user or {}).get('role') in ('admin',)
 
-        win = dlg_win(self, "Підтримка", "600x720")
+        win = dlg_win(self, "Підтримка", "620x860")
         hdr = tk.Frame(win, bg=C['bg']); hdr.pack(fill='x', padx=16, pady=(14, 6))
         _img = _support_img('operator', 56)
         if _img is not None:
@@ -12602,6 +12843,66 @@ class HotelApp(ctk.CTk):
                     import webbrowser as _wb2; _wb2.open(target)
                 except Exception:
                     messagebox.showerror("Помилка", f"Не вдалося відкрити: {target}\n{e1}", parent=win)
+
+        # ── 0. 🆘 Викликати адміністратора (він одразу отримає сповіщення зі звуком) ──
+        c0 = card(body); c0.pack(fill='x', pady=(0, 8))
+        lbl(c0, "🆘  Потрібна допомога прямо зараз?", 13, True, C['red']).pack(anchor='w', padx=12, pady=(10, 2))
+        r0 = tk.Frame(c0, bg=C['card']); r0.pack(fill='x', padx=12, pady=(0, 4))
+        e_call = ent(r0, "Що сталося? (необов'язково)", w=520); e_call.pack(side='left')
+        r0b = tk.Frame(c0, bg=C['card']); r0b.pack(fill='x', padx=12, pady=(2, 4))
+        call_state = lbl(c0, "Адміністратор одразу побачить сповіщення на своєму ПК (з ID для підключення).", 9, color=C['text2'])
+        def _call_admin():
+            try:
+                txt_ = e_call.get().strip()
+                if txt_ == "Що сталося? (необов'язково)": txt_ = ''
+                rid_ = self._support_send_request(txt_, id_var.get())
+                call_btn.configure(state='disabled', text="✅ Запит надіслано")
+                call_state.configure(text="Запит надіслано адміністраторам. Очікуйте — вони підключаться або зателефонують.",
+                                     text_color=C['green'])
+                win.after(60000, lambda: (call_btn.configure(state='normal', text="🆘 Викликати адміністратора")
+                                          if call_btn.winfo_exists() else None))
+            except Exception as e_:
+                log_error("support call", e_)
+                messagebox.showerror("Помилка", str(e_), parent=win)
+        call_btn = btn(r0b, "🆘 Викликати адміністратора", _call_admin, C['red'], 250, height=36)
+        call_btn.pack(side='left', padx=(0, 8))
+        def _call_voice():
+            try:
+                txt_ = e_call.get().strip()
+                if txt_ == "Що сталося? (необов'язково)": txt_ = ''
+                self._support_send_request(txt_ or "Прошу голосовий дзвінок", id_var.get(), voice=True)
+                voice_btn.configure(state='disabled', text="✅ Очікуємо адміністратора")
+                call_state.configure(text="Запит на голосовий дзвінок надіслано. Щойно адміністратор прийме — "
+                                          "дзвінок відкриється в браузері (дозвольте мікрофон).", text_color=C['green'])
+                win.after(60000, lambda: (voice_btn.configure(state='normal', text="📞 Голосовий дзвінок (інтернет)")
+                                          if voice_btn.winfo_exists() else None))
+            except Exception as e_:
+                log_error("support voice", e_)
+                messagebox.showerror("Помилка", str(e_), parent=win)
+        voice_btn = btn(r0b, "📞 Голосовий дзвінок (інтернет)", _call_voice, C['green'], 260, height=36)
+        voice_btn.pack(side='left', padx=2)
+        call_state.pack(anchor='w', padx=12, pady=(0, 10))
+
+        # (для адміністратора) відкриті запити від колег
+        if is_admin:
+            try:
+                from app.utils.db import query as _qrq
+                _support_ensure_table()
+                _reqs = _qrq("""SELECT id, from_user, from_name, pc_name, anydesk_id, message, created_at
+                               FROM support_requests WHERE status='open' AND from_user<>%s
+                                 AND created_at > NOW() - INTERVAL '8 hours' ORDER BY id""", (me,), fetch='all') or []
+            except Exception:
+                _reqs = []
+            if _reqs:
+                cr = card(body); cr.pack(fill='x', pady=(0, 8))
+                lbl(cr, f"📥  Запити допомоги ({len(_reqs)})", 13, True, C['yellow']).pack(anchor='w', padx=12, pady=(10, 2))
+                for rq in _reqs[:4]:
+                    rw = tk.Frame(cr, bg=C['card']); rw.pack(fill='x', padx=12, pady=3)
+                    lbl(rw, f"{rq.get('from_name') or rq.get('from_user')} · {str(rq.get('created_at'))[11:16]}"
+                            + (f" · {rq['message'][:40]}" if rq.get('message') else ''), 11).pack(side='left')
+                    btn(rw, "✅ Прийняти", lambda r_=rq: (win.destroy(), self._support_accept(r_)),
+                        C['green'], 120, height=28).pack(side='right')
+                lbl(cr, "", 4).pack()
 
         # ── 1. Голосовий зв'язок ──
         c1 = card(body); c1.pack(fill='x', pady=(0, 8))
@@ -27056,21 +27357,8 @@ class RestaurantFrame(tk.Frame):
             except Exception: pass
 
     def _open_menu_editor(self):
-        """Редактор меню прямо з Ресторану: додати / змінити (в т.ч. ціну) / видалити позиції,
-        категорії, штрих-коди — без переходу в Налаштування."""
-        ex = getattr(self, '_menu_editor_win', None)
-        try:
-            if ex is not None and ex.winfo_exists():
-                ex.deiconify(); ex.lift(); ex.focus_force(); return
-        except Exception: pass
-        win = dlg_win(self, "✏️ Зміна меню", "1180x700")
-        self._menu_editor_win = win
-        _MenuEditorFrame(win, self.user).pack(fill='both', expand=True, padx=10, pady=10)
-        def _on_close(e):
-            if e.widget is win:
-                try: self._reload_menu()
-                except Exception: pass
-        win.bind('<Destroy>', _on_close, add='+')
+        """Повноцінне вікно меню (те саме, що Налаштування → Меню) прямо з Ресторану."""
+        _open_menu_window(self, self.user, on_close=self._reload_menu)
 
     def _reload_menu(self):
         """Оновлює список меню з БД."""
@@ -36366,6 +36654,9 @@ class SettingsFrame(tk.Frame):
                         log_error(f"SettingsFrame tab '{name}'", e)
             else:
                 _tab_frames[name].pack(fill='both', expand=True)
+            # «Меню» відкривається в окремому повноцінному вікні
+            if name == "🍽 Меню":
+                self.after(60, lambda: _open_menu_window(self, self.user))
 
         # Перша вкладка
         _switch_settings_tab("🛏 Номери")
@@ -37805,150 +38096,13 @@ class SettingsFrame(tk.Frame):
         btn(f, "✖ Закрити", win.destroy, C['card2'], 120, height=34).pack(pady=(0,10))
 
     def _menu_tab(self,p):
+        """Вкладка «Меню»: редактор відкривається в окремому повноцінному вікні."""
         self._menu_p=p
-        tb=tk.Frame(p,bg=C['bg']); tb.pack(fill='x',pady=5)
-        def _add_smart():
-            sel=self.svcs_t.selection(); _cat=None
-            if sel:
-                _iid=sel[0]
-                if str(_iid).startswith('cat__'): _cat=str(_iid).replace('cat__','')
-                else:
-                    _par=self.svcs_t.parent(_iid)
-                    if _par and str(_par).startswith('cat__'): _cat=str(_par).replace('cat__','')
-            self._svc_dlg(p,preset_cat=_cat)
-        btn(tb,"➕ Додати",_add_smart,width=130).pack(side='left',padx=4)
-        btn(tb,"✏️ Ред.",lambda:self._svc_edit(p),C['card2'],100).pack(side='left',padx=4)
-        btn(tb,"🗑 Видалити",lambda:self._svc_del(p),C['red'],120).pack(side='left',padx=4)
-        btn(tb,"🏷 Категорії",lambda:self._menu_categories_dlg(),'#8e44ad',120).pack(side='left',padx=4)
-        btn(tb,"🔖 Штрих-коди",lambda:self._barcode_quick_dlg(p),'#e67e22',130).pack(side='left',padx=4)
-        refresh_btn(tb,lambda:self._load_svcs(),side='left',padx=4,pady=6)
-        btn(tb,"📥 Імпорт XLS",lambda:self._menu_import_xls(),C['green'],130).pack(side='left',padx=4)
-        btn(tb,"📤 Експорт XLS",lambda:self._menu_export_report_xls(),'#9b59b6',130).pack(side='left',padx=4)
-        btn(tb,"📤 XLS для імпорту",lambda:self._menu_export_xls(),'#7d3c98',150).pack(side='left',padx=4)
-        btn(tb,"🖨 Друк / HTML",lambda:self._menu_print_html(),'#2980b9',130).pack(side='left',padx=4)
-        btn(tb,"🔧 Кракозябри",lambda:self._menu_fix_mojibake(),'#e67e22',140).pack(side='left',padx=4)
-        ff,self.svcs_t=mktree(p,('id','name','cat','price','unit','qty','stock','barcode','act'),14,[50,220,100,80,60,80,80,140,50])
-        for c,h in zip(('id','name','cat','price','unit','qty','stock','barcode','act'),
-                        ['ID','Назва / Категорія','Категорія','Ціна','Од.','К-сть','Залишок','Штрих-код','Акт.']):
-            self.svcs_t.heading(c,text=h,command=lambda _c=c: None)
-        self.svcs_t.column('name',anchor='w'); self.svcs_t.column('barcode',anchor='w')
-        self.svcs_t.column('cat',width=0,stretch=False)
-        ff.pack(fill='both',expand=True)
-        def _on_click(event):
-            iid=self.svcs_t.identify_row(event.y)
-            if iid and str(iid).startswith('cat__'):
-                self.svcs_t.item(iid,open=not self.svcs_t.item(iid,'open'))
-        self.svcs_t.bind('<ButtonRelease-1>',_on_click)
-        _EDITABLE={'name':'name','price':'price','unit':'unit','qty':'quantity'}
-        def _inline_edit(iid,col_name):
-            from app.utils.db import get_conn as _gc_ie
-            db_col=_EDITABLE[col_name]
-            try:
-                with _gc_ie() as _c:
-                    with _c.cursor() as _cur:
-                        _cur.execute(f"SELECT {db_col} FROM services WHERE id=%s",(int(iid),))
-                        _r=_cur.fetchone()
-            except Exception as _ex:
-                messagebox.showerror("Помилка",str(_ex)); return
-            if not _r: return
-            _cur_val=_r[0]
-            if col_name=='price': _cur_val=('%g'%float(_cur_val or 0))
-            elif col_name=='qty': _cur_val=str(int(float(_cur_val or 0)))
-            else: _cur_val=str(_cur_val or '')
-            bb=self.svcs_t.bbox(iid,col_name)
-            if not bb: return
-            x,y,w,h=bb
-            ed=tk.Entry(self.svcs_t,bg=C['card2'],fg=C['text'],insertbackground=C['text'],
-                        relief='flat',font=('Segoe UI',10),
-                        justify='left' if col_name=='name' else 'center',
-                        highlightthickness=1,highlightbackground=C['accent'],highlightcolor=C['accent'])
-            ed.place(x=x,y=y,width=w,height=h)
-            ed.insert(0,_cur_val); ed.select_range(0,'end'); ed.focus_set()
-            _done=[False]
-            def _close():
-                if _done[0]: return
-                _done[0]=True
-                try: ed.destroy()
-                except Exception: pass
-            def _commit(_e=None):
-                if _done[0]: return 'break'
-                txt=ed.get().strip()
-                if txt==_cur_val: _close(); return 'break'
-                try:
-                    if col_name=='name':
-                        if not txt: raise ValueError("Назва не може бути порожньою")
-                        val=_fix_mojibake(txt)
-                    elif col_name=='price':
-                        val=float(txt.replace(',','.').replace('₴','').strip() or 0)
-                        if val<0: raise ValueError("Ціна не може бути від'ємною")
-                    elif col_name=='qty':
-                        val=int(float(txt.replace(',','.') or 0))
-                        if val<0: raise ValueError("Кількість не може бути від'ємною")
-                    else:
-                        val=txt or 'шт'
-                except ValueError as _ve:
-                    msg=str(_ve)
-                    if msg.startswith('could not convert') or msg.startswith('invalid literal'):
-                        msg="Введіть число"
-                    messagebox.showwarning("",msg); ed.focus_set(); return 'break'
-                _close()
-                try:
-                    with _gc_ie() as _c:
-                        with _c.cursor() as _cur:
-                            _cur.execute(f"UPDATE services SET {db_col}=%s WHERE id=%s",(val,int(iid)))
-                            _cur.execute("""SELECT COALESCE(s.quantity,0),
-                                CASE WHEN COALESCE(s.quantity,0)=0 THEN NULL
-                                     ELSE GREATEST(0, COALESCE(s.quantity,0) - COALESCE(
-                                        (SELECT SUM(roi.quantity) FROM restaurant_order_items roi
-                                         JOIN restaurant_orders ro ON ro.id=roi.order_id
-                                         WHERE roi.service_id=s.id AND ro.status NOT IN ('cancelled')),0)) END
-                                FROM services s WHERE s.id=%s""",(int(iid),))
-                            _q,_stk=_cur.fetchone()
-                        _c.commit()
-                except Exception as _ex:
-                    messagebox.showerror("Помилка збереження",str(_ex)); return 'break'
-                vals=list(self.svcs_t.item(iid,'values'))
-                _cols=list(self.svcs_t['columns'])
-                if col_name=='name': vals[_cols.index('name')]=val
-                elif col_name=='price': vals[_cols.index('price')]=f"{float(val):.0f}₴" if float(val)==int(val) else f"{float(val):.2f}₴"
-                elif col_name=='unit': vals[_cols.index('unit')]=val
-                _qi=int(float(_q or 0))
-                vals[_cols.index('qty')]=_qi if _qi>0 else '—'
-                vals[_cols.index('stock')]='—' if _stk is None else (f"⚠️{int(_stk)}" if int(_stk)<5 else str(int(_stk)))
-                self.svcs_t.item(iid,values=vals)
-                return 'break'
-            ed.bind('<Return>',_commit); ed.bind('<KP_Enter>',_commit)
-            ed.bind('<FocusOut>',_commit)
-            ed.bind('<Escape>',lambda e:(_close(),'break')[1])
-        def _on_dbl(event):
-            if self.svcs_t.identify_region(event.x,event.y)!='cell': return
-            iid=self.svcs_t.identify_row(event.y)
-            if not iid or str(iid).startswith('cat__'): return
-            _cols=list(self.svcs_t['columns'])
-            try: col_name=_cols[int(self.svcs_t.identify_column(event.x)[1:])-1]
-            except Exception: col_name=None
-            if col_name in _EDITABLE:
-                _inline_edit(iid,col_name); return
-            vals=self.svcs_t.item(iid,'values')
-            if vals: self._open_svc_card(iid,vals)
-        self.svcs_t.bind('<Double-ButtonRelease-1>',_on_dbl)
-        _ctx=tk.Menu(p,tearoff=0,bg=C['card2'],fg=C['text'],activebackground=C['accent'],relief='flat')
-        def _ctx_popup(event):
-            iid=self.svcs_t.identify_row(event.y)
-            if not iid: return
-            self.svcs_t.selection_set(iid); _ctx.delete(0,'end')
-            if str(iid).startswith('cat__'):
-                _cat=str(iid).replace('cat__','')
-                _ctx.add_command(label=f"➕ Додати товар в '{_cat}'",command=lambda:self._svc_dlg(p,preset_cat=_cat))
-                _ctx.add_command(label=f"🔖 Штрих-код в '{_cat}'",command=lambda:self._barcode_quick_dlg(p,preset_cat=_cat))
-            else:
-                _ctx.add_command(label="✏️ Редагувати",command=lambda:self._svc_edit(p))
-                _ctx.add_command(label="🔖 Штрих-код",command=lambda _i=iid:self._set_barcode_for(p,int(_i)))
-                _ctx.add_command(label="🗑 Видалити",command=lambda:self._svc_del(p))
-            try: _ctx.tk_popup(event.x_root,event.y_root)
-            finally: _ctx.grab_release()
-        self.svcs_t.bind('<Button-3>',_ctx_popup)
-        self.after(70,self._load_svcs)
+        box=card(p); box.pack(fill='x',padx=6,pady=20)
+        lbl(box,"🍽  Меню ресторану / бару",20,True).pack(anchor='w',padx=20,pady=(20,4))
+        lbl(box,"Редактор меню відкрито в окремому вікні: прайс-лист із прямим редагуванням, додаванням і видаленням позицій,\n"
+                "імпорт/експорт XLS, штрих-коди, категорії та друк.",11,color=C['text2']).pack(anchor='w',padx=20)
+        btn(box,"🍽  Відкрити меню",lambda:_open_menu_window(self,self.user),C['green'],240,height=44).pack(anchor='w',padx=20,pady=20)
 
     # ── вбудований xlsx-writer/reader (без зовнішніх бібліотек) ─────────
     @staticmethod
@@ -38663,6 +38817,11 @@ class SettingsFrame(tk.Frame):
         btn(sc, '✕  Закрити', win.destroy, C['card2'], 140, height=36).pack(pady=(8,4))
 
     def _load_svcs(self, expand_cat=None):
+        _sheet=getattr(self,'_menu_sheet',None)
+        try:
+            if _sheet is not None and _sheet.winfo_exists():
+                _sheet._load(); return
+        except Exception: pass
         _was_open=set()
         for _iid in self.svcs_t.get_children():
             if self.svcs_t.item(_iid,'open'): _was_open.add(_iid)
@@ -42388,12 +42547,357 @@ class SettingsFrame(tk.Frame):
 
 
 class _MenuEditorFrame(SettingsFrame):
-    """Вкладка «Меню» з Налаштувань як самостійний фрейм (для вікна «Зміна меню» у Ресторані)."""
+    """Невидимий «носій» методів SettingsFrame (імпорт/експорт XLS, штрих-коди, категорії, друк)
+    для окремого вікна меню. Сам нічого не малює."""
     def __init__(self, parent, user):
         tk.Frame.__init__(self, parent, bg=C['bg'])
         self.user = user
         self._ui_built = True
-        body = tk.Frame(self, bg=C['bg']); body.pack(fill='both', expand=True)
-        self._menu_tab(body)
-        try: self._load_svcs()
-        except Exception as e: log_error("_MenuEditorFrame load", e)
+        self._menu_sheet = None
+        self._menu_p = parent
+
+
+class _MenuSheetFrame(tk.Frame):
+    """«Зміна меню» як прайс-лист: плоска таблиця, категорії — рядки-заголовки, позиції під ними.
+    Усе редагується прямо в таблиці (подвійний клік), нова позиція додається рядком, без окремих вікон."""
+    _CL = {'restaurant': 'Ресторан', 'bar': 'Бар', 'minibar': 'Міні-бар', 'laundry': 'Прання',
+           'transfer': 'Трансфер', 'штрафи': 'Штрафи', 'бані': 'Бані', 'бесідки': 'Бесідки',
+           'other': 'Інше', 'до_кави': 'До кави', 'до_пива': 'До пива', 'до_чаю': 'До чаю',
+           'кава-чай': 'Кава/Чай', 'кухня': 'Кухня', 'напої': 'Напої', 'молочка': 'Молочка'}
+    _COLS = ('name', 'unit', 'price', 'qty')
+    _DB = {'name': 'name', 'unit': 'unit', 'price': 'price', 'qty': 'quantity'}
+
+    def __init__(self, parent, user, extras=None):
+        super().__init__(parent, bg=C['bg'])
+        self.user = user
+        self._extras = extras
+        self._new_seq = 0
+        self._extra_cats = []          # нові категорії без позицій (створюються при першому додаванні)
+        self._build()
+        self.after(60, self._load)
+
+    # ── відображення ──
+    def _label(self, key):
+        return self._CL.get(key, str(key).replace('_', ' ').capitalize())
+
+    def _build(self):
+        # ── Шапка-«панель інструментів»: заголовок, пошук, кнопки згруповані в два ряди ──
+        bar = card(self); bar.pack(fill='x', pady=(0, 8))
+        top = tk.Frame(bar, bg=C['card']); top.pack(fill='x', padx=14, pady=(12, 6))
+        tl = tk.Frame(top, bg=C['card']); tl.pack(side='left')
+        lbl(tl, "🍽  Меню ресторану / бару", 20, True).pack(anchor='w')
+        self._sub = lbl(tl, "", 11, color=C['text2']); self._sub.pack(anchor='w')
+        self._search = ent(top, "🔍 Пошук позиції…", w=280)
+        self._search.pack(side='right')
+        self._search.bind('<KeyRelease>', lambda e: self._fill())
+
+        def _sep(parent_):
+            tk.Frame(parent_, bg=C['border'], width=1, height=30).pack(side='left', padx=8, pady=2)
+        row1 = tk.Frame(bar, bg=C['card']); row1.pack(fill='x', padx=14, pady=(2, 6))
+        btn(row1, "➕ Додати позицію", self._add_item, C['green'], 180, height=36).pack(side='left', padx=(0, 4))
+        btn(row1, "🗑 Видалити вибрані", self._delete_selected, C['red'], 180, height=36).pack(side='left', padx=4)
+        _sep(row1)
+        btn(row1, "🏷 Нова категорія", self._add_category, '#8e44ad', 170, height=36).pack(side='left', padx=4)
+        refresh_btn(row1, self._load, side='left', padx=4, pady=0)
+        lbl(row1, "Подвійний клік по клітинці — редагувати", 10, color=C['text2']).pack(side='right', padx=6)
+        if self._extras:
+            row2 = tk.Frame(bar, bg=C['card']); row2.pack(fill='x', padx=14, pady=(0, 12))
+            try: self._extras(row2)
+            except Exception as e: log_error("_MenuSheetFrame extras", e)
+        else:
+            tk.Frame(bar, bg=C['card'], height=6).pack()
+
+        # світлий «прайс-лист»
+        st = ttk.Style()
+        st.configure('MenuSheet.Treeview', background='#ffffff', fieldbackground='#ffffff',
+                     foreground='#111111', rowheight=28, font=('Segoe UI', 10), borderwidth=1)
+        st.configure('MenuSheet.Treeview.Heading', background='#eeeeee', foreground='#111111',
+                     font=('Segoe UI', 10, 'bold'), relief='solid')
+        st.map('MenuSheet.Treeview', background=[('selected', '#cfe3ff')], foreground=[('selected', '#000000')])
+        wrap = tk.Frame(self, bg=C['bg']); wrap.pack(fill='both', expand=True)
+        vs = ttk.Scrollbar(wrap, orient='vertical'); vs.pack(side='right', fill='y')
+        self.tree = ttk.Treeview(wrap, columns=self._COLS, show='headings', style='MenuSheet.Treeview',
+                                 selectmode='extended', yscrollcommand=vs.set)
+        vs.config(command=self.tree.yview)
+        for c_, h_, w_, a_ in (('name', 'Назва', 520, 'w'), ('unit', 'Од.', 90, 'center'),
+                               ('price', 'Ціна', 110, 'center'), ('qty', 'К-сть', 100, 'center')):
+            self.tree.heading(c_, text=h_); self.tree.column(c_, width=w_, anchor=a_, minwidth=60)
+        self.tree.tag_configure('cat', background='#cfd8e3', foreground='#000000', font=('Segoe UI', 10, 'bold'))
+        self.tree.tag_configure('odd', background='#f7f7f7')
+        self.tree.tag_configure('even', background='#ffffff')
+        self.tree.tag_configure('off', foreground='#999999')
+        self.tree.pack(side='left', fill='both', expand=True)
+        self.tree.bind('<Double-1>', self._on_dbl)
+        self.tree.bind('<Delete>', lambda e: self._delete_selected())
+        self._data = []
+
+    # ── дані ──
+    def _load(self):
+        try:
+            from app.utils.db import get_conn as _gc
+            with _gc() as _c:
+                with _c.cursor() as _cur:
+                    try:
+                        _cur.execute("ALTER TABLE services ADD COLUMN IF NOT EXISTS quantity NUMERIC DEFAULT 0")
+                        _c.commit()
+                    except Exception: pass
+                    _cur.execute("""SELECT id, name, category, price, unit, COALESCE(quantity,0), COALESCE(active,TRUE)
+                                    FROM services WHERE name NOT LIKE '__cat_placeholder_%%'
+                                    ORDER BY category, name""")
+                    self._data = [dict(zip(('id', 'name', 'category', 'price', 'unit', 'quantity', 'active'), r))
+                                  for r in _cur.fetchall()]
+        except Exception as e:
+            log_error("_MenuSheetFrame._load", e)
+            messagebox.showerror("Помилка БД", str(e)); self._data = []
+        self._fill()
+
+    @staticmethod
+    def _fmt_price(v):
+        v = float(v or 0)
+        return f"{v:.0f}₴" if v == int(v) else f"{v:.2f}₴"
+
+    def _fill(self):
+        import datetime as _d
+        q = (self._search.get() or '').strip().lower()
+        if q.startswith('🔍'): q = ''
+        sel_cat = None
+        self.tree.delete(*self.tree.get_children())
+        groups = {}
+        for it in self._data:
+            if q and q not in str(it['name']).lower():
+                continue
+            groups.setdefault(it['category'] or 'other', []).append(it)
+        for k in self._extra_cats:
+            groups.setdefault(k, [])
+        total = 0
+        for cat, items in groups.items():
+            self.tree.insert('', 'end', iid=f'cat::{cat}', values=(self._label(cat), '', '', ''), tags=('cat',))
+            for i, it in enumerate(items):
+                total += 1
+                qty = int(float(it['quantity'] or 0))
+                tags = ('odd' if i % 2 else 'even',) + (() if it['active'] else ('off',))
+                self.tree.insert('', 'end', iid=str(it['id']), tags=tags,
+                                 values=(it['name'], it['unit'] or 'шт', self._fmt_price(it['price']),
+                                         qty if qty > 0 else '—'))
+        self._sub.configure(text=f"Прайс-лист на {_d.date.today().strftime('%d.%m.%Y')} | Позицій: {total}")
+
+    # ── допоміжне ──
+    def _cat_of(self, iid):
+        """Категорія (ключ) для вибраного рядка: заголовок або позиція."""
+        if str(iid).startswith('cat::'): return str(iid)[5:]
+        if str(iid).startswith('new::'): return getattr(self, '_new_cat', {}).get(iid)
+        for it in self._data:
+            if str(it['id']) == str(iid): return it['category'] or 'other'
+        return None
+
+    def _row_index(self, iid):
+        return list(self.tree.get_children('')).index(iid)
+
+    # ── додавання ──
+    def _add_category(self):
+        win = dlg_win(self, "Нова категорія", "420x200")
+        f = card(win); f.pack(fill='both', expand=True, padx=12, pady=12)
+        lbl(f, "Назва категорії:", 12, True).pack(anchor='w', padx=12, pady=(14, 4))
+        e = ent(f, "напр. Десерти", w=340); e.pack(padx=12); e.focus_set()
+        def _ok(_e=None):
+            name = e.get().strip()
+            if not name: return
+            key = name.lower().replace(' ', '_')
+            if key not in self._extra_cats and not any((it['category'] or '') == key for it in self._data):
+                self._extra_cats.append(key)
+            win.destroy(); self._fill()
+            try:
+                self.tree.selection_set(f'cat::{key}'); self.tree.see(f'cat::{key}')
+            except Exception: pass
+        e.bind('<Return>', _ok)
+        btn(f, "✅ Створити", _ok, C['green'], 160, height=34).pack(pady=14)
+
+    def _add_item(self):
+        sel = self.tree.selection()
+        cat = self._cat_of(sel[0]) if sel else None
+        if not cat:
+            messagebox.showinfo("", "Виберіть категорію або позицію в потрібній категорії,\nщоб додати туди нову позицію."); return
+        cat_iid = f'cat::{cat}'
+        # місце: в кінець блоку категорії
+        kids = list(self.tree.get_children(''))
+        pos = kids.index(cat_iid) + 1
+        while pos < len(kids) and not str(kids[pos]).startswith('cat::'): pos += 1
+        self._new_seq += 1
+        iid = f'new::{self._new_seq}'
+        if not hasattr(self, '_new_cat'): self._new_cat = {}
+        self._new_cat[iid] = cat
+        self.tree.insert('', pos, iid=iid, values=('', 'шт', '0₴', '—'), tags=('even',))
+        self.tree.selection_set(iid); self.tree.see(iid)
+        self.after(60, lambda: self._edit(iid, 'name'))
+
+    # ── видалення ──
+    def _delete_selected(self):
+        ids = [i for i in self.tree.selection() if not str(i).startswith(('cat::', 'new::'))]
+        if not ids:
+            messagebox.showinfo("", "Виберіть позиції для видалення (Ctrl/Shift — кілька)"); return
+        if not messagebox.askyesno("Видалити?", f"Видалити позицій: {len(ids)}?\nЦю дію не можна відмінити.", icon='warning'):
+            return
+        try:
+            from app.utils.db import get_conn as _gc
+            with _gc() as _c:
+                with _c.cursor() as _cur:
+                    for i in ids:
+                        try: _cur.execute("DELETE FROM restaurant_order_items WHERE service_id=%s", (int(i),))
+                        except Exception: pass
+                        _cur.execute("DELETE FROM services WHERE id=%s", (int(i),))
+                _c.commit()
+                try:
+                    for i in ids:
+                        _mirror_ref_write(_c, "DELETE FROM restaurant_order_items WHERE service_id=%s; "
+                                              "DELETE FROM services WHERE id=%s", (int(i), int(i)))
+                except Exception: pass
+        except Exception as e:
+            log_error("_MenuSheetFrame delete", e)
+            messagebox.showerror("Помилка", str(e)); return
+        self._load()
+
+    # ── редагування в клітинці ──
+    def _on_dbl(self, ev):
+        t = self.tree
+        if t.identify_region(ev.x, ev.y) != 'cell': return
+        iid = t.identify_row(ev.y)
+        if not iid or str(iid).startswith('cat::'): return
+        try: col = self._COLS[int(t.identify_column(ev.x)[1:]) - 1]
+        except Exception: return
+        self._edit(iid, col)
+
+    def _edit(self, iid, col):
+        t = self.tree
+        if not t.exists(iid): return
+        bb = t.bbox(iid, col)
+        if not bb: return
+        x, y, w, h = bb
+        is_new = str(iid).startswith('new::')
+        cur_vals = list(t.item(iid, 'values'))
+        idx = self._COLS.index(col)
+        raw = str(cur_vals[idx])
+        if col == 'price': raw = raw.replace('₴', '').strip()
+        if col == 'qty' and raw == '—': raw = '0'
+        if is_new and col in ('price', 'qty') and raw in ('0', '—'): raw = ''
+        ed = tk.Entry(t, bg='#ffffff', fg='#000000', insertbackground='#000000', relief='solid', bd=1,
+                      font=('Segoe UI', 10), justify='left' if col == 'name' else 'center')
+        ed.place(x=x, y=y, width=w, height=h)
+        ed.insert(0, raw); ed.select_range(0, 'end'); ed.focus_set()
+        done = [False]
+        def _close():
+            if done[0]: return
+            done[0] = True
+            try: ed.destroy()
+            except Exception: pass
+        def _cancel(_e=None):
+            _close()
+            if is_new and not str(t.item(iid, 'values')[0]).strip():
+                try: t.delete(iid)
+                except Exception: pass
+            return 'break'
+        def _commit(_e=None, next_col=None):
+            if done[0]: return 'break'
+            txt = ed.get().strip()
+            try:
+                if col == 'name':
+                    if not txt: raise ValueError("Назва не може бути порожньою")
+                    val = _fix_mojibake(txt)
+                elif col == 'price':
+                    val = float(txt.replace(',', '.').replace('₴', '') or 0)
+                    if val < 0: raise ValueError("Ціна не може бути від'ємною")
+                elif col == 'qty':
+                    val = int(float(txt.replace(',', '.') or 0))
+                    if val < 0: raise ValueError("Кількість не може бути від'ємною")
+                else:
+                    val = txt or 'шт'
+            except ValueError as ve:
+                msg = str(ve)
+                if msg.startswith(('could not convert', 'invalid literal')): msg = "Введіть число"
+                if is_new and col == 'name' and not txt: return _cancel()
+                messagebox.showwarning("", msg); ed.focus_set(); return 'break'
+            _close()
+            self._save_cell(iid, col, val, next_col)
+            return 'break'
+        ed.bind('<Return>', lambda e: _commit(e, 'price' if (is_new and col == 'name') else None))
+        ed.bind('<KP_Enter>', lambda e: _commit(e, 'price' if (is_new and col == 'name') else None))
+        ed.bind('<Tab>', lambda e: _commit(e, self._COLS[min(idx + 1, len(self._COLS) - 1)]))
+        ed.bind('<FocusOut>', lambda e: _commit(e))
+        ed.bind('<Escape>', _cancel)
+
+    def _save_cell(self, iid, col, val, next_col=None):
+        t = self.tree
+        try:
+            from app.utils.db import get_conn as _gc
+            with _gc() as _c:
+                with _c.cursor() as _cur:
+                    if str(iid).startswith('new::'):
+                        if col != 'name': return
+                        cat = self._new_cat.get(iid, 'other')
+                        _cur.execute("INSERT INTO services(name,category,price,unit,active,quantity) "
+                                     "VALUES(%s,%s,0,'шт',TRUE,0) RETURNING id", (val, cat))
+                        new_id = _cur.fetchone()[0]
+                        _c.commit()
+                        self._data.append({'id': new_id, 'name': val, 'category': cat, 'price': 0,
+                                           'unit': 'шт', 'quantity': 0, 'active': True})
+                        vals = list(t.item(iid, 'values')); vals[0] = val
+                        pos = t.index(iid); t.delete(iid)
+                        t.insert('', pos, iid=str(new_id), values=vals, tags=('even',))
+                        t.selection_set(str(new_id))
+                        if next_col:
+                            self.after(40, lambda: self._edit(str(new_id), next_col))
+                        return
+                    _cur.execute(f"UPDATE services SET {self._DB[col]}=%s WHERE id=%s", (val, int(iid)))
+                _c.commit()
+        except Exception as e:
+            log_error("_MenuSheetFrame save", e)
+            messagebox.showerror("Помилка збереження", str(e)); return
+        for it in self._data:
+            if str(it['id']) == str(iid):
+                it[self._DB[col] if col != 'qty' else 'quantity'] = val
+                if col == 'name': it['name'] = val
+        vals = list(t.item(iid, 'values')); idx = self._COLS.index(col)
+        vals[idx] = (self._fmt_price(val) if col == 'price' else (val if col != 'qty' else (val if val > 0 else '—')))
+        t.item(iid, values=vals)
+        if next_col and next_col != col:
+            self.after(40, lambda: self._edit(iid, next_col))
+
+
+_menu_window_ref = {'win': None}
+
+
+def _open_menu_window(parent, user, on_close=None):
+    """Повноцінне окреме вікно меню (прайс-лист із прямим редагуванням + панель кнопок зверху)."""
+    ex = _menu_window_ref.get('win')
+    try:
+        if ex is not None and ex.winfo_exists():
+            ex.deiconify(); ex.lift(); ex.focus_force(); return ex
+    except Exception: pass
+    win = dlg_win(parent, "🍽 Меню", "1320x800")
+    _menu_window_ref['win'] = win
+    try: win.state('zoomed')
+    except Exception: pass
+    helper = _MenuEditorFrame(win, user)
+
+    def _extras(tb):
+        btn(tb, "🏷 Категорії", lambda: helper._menu_categories_dlg(), '#8e44ad', 130, height=34).pack(side='left', padx=(0, 4))
+        btn(tb, "🔖 Штрих-коди", lambda: helper._barcode_quick_dlg(win), '#e67e22', 140, height=34).pack(side='left', padx=4)
+        tk.Frame(tb, bg=C['border'], width=1, height=28).pack(side='left', padx=8)
+        btn(tb, "📥 Імпорт XLS", lambda: helper._menu_import_xls(), C['green'], 140, height=34).pack(side='left', padx=4)
+        btn(tb, "📤 Експорт XLS", lambda: helper._menu_export_report_xls(), '#9b59b6', 140, height=34).pack(side='left', padx=4)
+        btn(tb, "📤 XLS для імпорту", lambda: helper._menu_export_xls(), '#7d3c98', 170, height=34).pack(side='left', padx=4)
+        tk.Frame(tb, bg=C['border'], width=1, height=28).pack(side='left', padx=8)
+        btn(tb, "🖨 Друк / HTML", lambda: helper._menu_print_html(), '#2980b9', 140, height=34).pack(side='left', padx=4)
+        btn(tb, "🔧 Кракозябри", lambda: helper._menu_fix_mojibake(), '#d35400', 140, height=34).pack(side='left', padx=4)
+
+    sheet = _MenuSheetFrame(win, user, extras=_extras)
+    helper._menu_sheet = sheet
+    sheet.pack(fill='both', expand=True, padx=12, pady=12)
+
+    def _on_destroy(e):
+        if e.widget is win:
+            _menu_window_ref['win'] = None
+            if on_close:
+                try: on_close()
+                except Exception: pass
+    win.bind('<Destroy>', _on_destroy, add='+')
+    return win
