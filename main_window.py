@@ -1158,6 +1158,43 @@ def _room_chan_price(room_id):
     return 0.0
 
 
+def _room_category_id(room):
+    """id категорії номера (з dict або з БД)."""
+    cid = room.get('category_id') if hasattr(room, 'get') else None
+    if cid is None:
+        try:
+            from app.utils.db import query as _qr
+            r = _qr("SELECT category_id FROM rooms WHERE id=%s", (room['id'],), fetch='one')
+            cid = r['category_id'] if r else None
+        except Exception:
+            cid = None
+    return int(cid) if cid is not None else None
+
+
+def _stay_night_prices(room, base_price, check_in, nights):
+    """Ціни кожної ночі проживання з урахуванням ціни вихідних категорії (Сб, Нд)."""
+    if hasattr(check_in, 'date') and callable(getattr(check_in, 'date')):
+        check_in = check_in.date()
+    n = max(int(nights or 1), 1)
+    cid = _room_category_id(room)
+    if cid is None:
+        return [float(base_price)] * n
+    return [float(_night_price(cid, base_price, check_in + timedelta(days=i))) for i in range(n)]
+
+
+def _describe_stay_prices(prices, base_price):
+    """Короткий опис суми: «2 ніч × 500₴ + 1 вих. × 600₴»."""
+    n = len(prices)
+    wk = [p for p in prices if abs(p - base_price) > 0.001]
+    if not wk:
+        return f"{n} ніч × {base_price:.0f}₴"
+    wd_n = n - len(wk)
+    parts = []
+    if wd_n: parts.append(f"{wd_n} буд. × {base_price:.0f}₴")
+    parts.append(f"{len(wk)} вих. × {wk[0]:.0f}₴")
+    return " + ".join(parts)
+
+
 def _stay_nights_total(cat_id, stored_price, check_in, nights):
     """Сума за n ночей від check_in з урахуванням ціни вихідних (по кожній ночі окремо)."""
     if hasattr(check_in, 'date') and callable(getattr(check_in, 'date')):
@@ -7167,6 +7204,47 @@ def _dlg_remember_size(win, key):
         pass
 
 
+_open_dialogs = []          # відкриті діалогові вікна (щоб тримати їх над головним вікном)
+_dlg_root_bound = {'ok': False}
+
+
+def _raise_open_dialogs(*_a):
+    """Піднімає всі відкриті (не згорнуті) діалоги над головним вікном."""
+    alive = []
+    for w_ in list(_open_dialogs):
+        try:
+            if not w_.winfo_exists():
+                continue
+            alive.append(w_)
+            if w_.state() == 'normal':
+                w_.lift()
+        except Exception:
+            pass
+    _open_dialogs[:] = alive
+
+
+def _register_dialog(w, root=None):
+    """Реєструє вікно: його можна згортати/розгортати (є в панелі завдань), але воно лишається
+    над головним вікном, поки не закрите. Можна тримати відкритими кілька вікон одночасно."""
+    try:
+        if w not in _open_dialogs:
+            _open_dialogs.append(w)
+        if not _dlg_root_bound['ok']:
+            r = root or w.winfo_toplevel()
+            r = getattr(r, 'master', None) or r
+            try: r = tk._default_root or r
+            except Exception: pass
+            def _on_focus(e, _r=r):
+                try:
+                    if str(e.widget) == str(_r):
+                        _r.after(40, _raise_open_dialogs)
+                except Exception: pass
+            r.bind('<FocusIn>', _on_focus, add='+')
+            _dlg_root_bound['ok'] = True
+    except Exception:
+        pass
+
+
 def dlg_win(parent, title, size="500x400", modal=True):
     w = ctk.CTkToplevel(parent)
     w.title(title)
@@ -7205,7 +7283,9 @@ def dlg_win(parent, title, size="500x400", modal=True):
         x = max(0, min(x, sw - ww))
         y = max(0, min(y, sh - wh))
         w.geometry(f"{ww}x{wh}+{x}+{y}")
-        w.transient(root)
+        # БЕЗ transient: вікно має кнопки згортання/розгортання й свій значок у панелі завдань,
+        # тож можна відкрити кілька вікон одночасно; над головним вікном його тримає _register_dialog.
+        _register_dialog(w, root)
         w.resizable(True, True)
         w.minsize(min(ww, 300), min(wh, 200))
         # Зберігати розмір при кожній зміні вікна
@@ -14891,6 +14971,7 @@ class CleaningFrame(tk.Frame):
         btn(ff,"✅ Вільний",lambda: self._bulk_status('free'),C['green'],110).pack(side='left',padx=3,pady=8)
         btn(ff,"🔧 Ремонт",lambda: self._bulk_status('repair'),C['gray'],110).pack(side='left',padx=3,pady=8)
         btn(ff,"🔒 Заблоковано",lambda: self._bulk_status('blocked'),C['red'],140).pack(side='left',padx=3,pady=8)
+        btn(ff,"🧹 Прибирання",lambda: self._bulk_status('cleaning'),C['yellow'],140).pack(side='left',padx=3,pady=8)
 
         # Таблиця
         main=tk.Frame(self,bg=C['bg']); main.pack(fill='both',expand=True,padx=15,pady=5)
@@ -15135,7 +15216,9 @@ class CleaningFrame(tk.Frame):
             _now = _dtb.datetime.now()
             for t in targets:
                 _cl_append({'room': str(_rn(t['number'])).replace('№', '').strip(), 'cleaner': '',
-                            'started': _now.strftime('%d.%m.%Y %H:%M'), 'finished': _now.strftime('%d.%m.%Y %H:%M'),
+                            'started': _now.strftime('%d.%m.%Y %H:%M'),
+                            # «Прибирання» — запис лишається відкритим (кінець проставиться після завершення)
+                            'finished': '' if new_st == 'cleaning' else _now.strftime('%d.%m.%Y %H:%M'),
                             'new_status': new_st, 'note': 'Масова зміна статусу',
                             'logged_at': _now.strftime('%d.%m.%Y %H:%M:%S')})
             try: _invalidate_rooms_cache()
@@ -17352,7 +17435,7 @@ def _open_checkin_existing(parent, b, room, on_save=None):
 
     # 🎁 Безкоштовне проживання (може бути вже позначене раніше)
     _fs0_c = _free_stay_map([b['id']])
-    fs_card_c = card(sc); fs_card_c.pack(fill='x', padx=12, pady=5)
+    fs_card_c = card(sc)   # розміщується нижче: одразу після «Здачі»
     _fs_fr_c, free_var_c, e_free_cm_c = _free_stay_widget(
         fs_card_c, init_on=(int(b['id']) in _fs0_c),
         init_comment=_fs0_c.get(int(b['id']), ''),
@@ -17447,6 +17530,7 @@ def _open_checkin_existing(parent, b, room, on_save=None):
 
     # ── Блок здачі ──
     _ch_card = card(sc); _ch_card.pack(fill='x', padx=12, pady=5)
+    fs_card_c.pack(fill='x', padx=12, pady=5, after=_ch_card)   # 🎁 Безкоштовне проживання — після Здачі
     _ch_inner = tk.Frame(_ch_card, bg=C['card']); _ch_inner.pack(fill='x', padx=12, pady=8)
     _ch_r1 = tk.Frame(_ch_inner, bg=C['card']); _ch_r1.pack(fill='x', pady=4)
     ctk.CTkLabel(_ch_r1, text="💵 Отримано від клієнта:", font=('Segoe UI',12),
@@ -17476,7 +17560,7 @@ def _open_checkin_existing(parent, b, room, on_save=None):
     _e_recv.bind('<KeyRelease>', _upd_ch)
     e_dep.bind('<KeyRelease>', lambda e: (_upd_razom(), _upd_ch()))
     def _on_meth_ci(*_):
-        if meth_var.get() == 'cash': _ch_card.pack(fill='x', padx=12, pady=5)
+        if meth_var.get() == 'cash': _ch_card.pack(fill='x', padx=12, pady=5, before=fs_card_c)
         else: _ch_card.pack_forget()
         _upd_ch()
     meth_var.trace_add('write', _on_meth_ci)
@@ -18173,11 +18257,7 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
     lbl(df,"Дорослих:",11,color=C['text2']).grid(row=2,column=0,sticky='w',pady=3)
     e_adults = ent(df, w=60); e_adults.insert(0,'1'); e_adults.grid(row=2,column=1,padx=8,pady=3,sticky='w')
 
-    # 🎁 Безкоштовне проживання (вміст створюється нижче)
-    fs_card_n = card(sc); fs_card_n.pack(fill='x', padx=12, pady=5)
-    lbl(fs_card_n, "🎁  Безкоштовне проживання", 13, True).pack(anchor='w', padx=12, pady=(10,0))
-
-    # Оплата
+    # Оплата (порядок знизу: Оплата → Здача → 🎁 Безкоштовне проживання → 🏷 Знижка → 🏨 Hotels → Нотатка)
     p_card = card(sc); p_card.pack(fill='x', padx=12, pady=5)
     lbl(p_card, "💰  Розрахунок", 13, True).pack(anchor='w', padx=12, pady=(10,5))
     default_price = 0.0
@@ -18222,7 +18302,9 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
     pf = tk.Frame(p_card, bg=C['card']); pf.pack(fill='x', padx=12, pady=(0,6))
 
     lbl(pf,"Ціна/ніч:",12).grid(row=0,column=0,sticky='w',pady=4)
-    lbl(pf, f"{default_price:.0f} ₴/ніч", 12, True, C['accent']).grid(row=0,column=1,sticky='w',padx=15,pady=4)
+    lbl_price_n = lbl(pf, f"{default_price:.0f} ₴/ніч", 12, True, C['accent'])
+    lbl_price_n.grid(row=0,column=1,sticky='w',padx=15,pady=4)
+    _stay_cache = {'prices': []}
 
     lbl(pf,"Сума за номер:",12).grid(row=1,column=0,sticky='w',pady=4)
     lbl_total = lbl(pf, "", 13, True, C['green']); lbl_total.grid(row=1,column=1,padx=15,pady=4,sticky='w')
@@ -18235,7 +18317,13 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
             ci = date.fromisoformat(e_in.get().strip())
             co = date.fromisoformat(e_out.get().strip())
             n = max((co-ci).days, 1)
-            base = 0.0 if _is_free_now() else default_price * n
+            _prices = _stay_night_prices(room, default_price, ci, n)   # з урахуванням ціни вихідних
+            _stay_cache['prices'] = _prices
+            try:
+                _first = _prices[0]
+                lbl_price_n.configure(text=f"{_first:.0f} ₴/ніч" + (" (вихідний)" if abs(_first-default_price) > 0.001 else ""))
+            except Exception: pass
+            base = 0.0 if _is_free_now() else sum(_prices)
             try:
                 svc_total = sum(float(sv.get('total', 0)) for sv in _get_room_svcs())
             except (NameError, Exception):
@@ -18245,7 +18333,7 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
             if _is_free_now():
                 lbl_total.configure(text=f"{grand:.0f}₴  (🎁 проживання безкоштовне{svc_str})")
             else:
-                lbl_total.configure(text=f"{grand:.0f}₴  ({n} ніч × {default_price:.0f}₴{svc_str})")
+                lbl_total.configure(text=f"{grand:.0f}₴  ({_describe_stay_prices(_prices, default_price)}{svc_str})")
         except: lbl_total.configure(text="?")
     _update_total()
     e_in.bind('<FocusOut>', _update_total); e_out.bind('<FocusOut>', _update_total)
@@ -18376,17 +18464,17 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
     e_out.bind('<FocusOut>', _update_total_ext)
     win.after(200, _upd_razom_new)
 
-    lbl(pf,"Нотатка:",12).grid(row=6,column=0,sticky='w',pady=4)
-    e_note = ent(pf, "", w=300); e_note.grid(row=6,column=1,padx=(15,0),pady=4,sticky='w')
+    lbl(pf,"Нотатка:",12).grid(row=9,column=0,sticky='w',pady=4)
+    e_note = ent(pf, "", w=300); e_note.grid(row=9,column=1,padx=(15,0),pady=4,sticky='w')
 
-    lbl(pf,"",12).grid(row=7,column=0,sticky='w',pady=4)
+    lbl(pf,"",12).grid(row=8,column=0,sticky='w',pady=4)
     var_hotels_ci = ctk.BooleanVar(value=False)
     ctk.CTkCheckBox(pf, text="🏨 Hotels (заселення з каналу Hotels)",
                      variable=var_hotels_ci, font=('Segoe UI',11),
-                     fg_color=C['accent'], text_color=C['text']).grid(row=7,column=1,padx=(15,0),pady=4,sticky='w')
+                     fg_color=C['accent'], text_color=C['text']).grid(row=8,column=1,padx=(15,0),pady=4,sticky='w')
 
-    # ── Знижка (з обов'язковим коментарем-причиною) ─────────────────────
-    disc_frame = tk.Frame(p_card, bg=C['card']); disc_frame.pack(fill='x', padx=12, pady=(4,10))
+    # ── Знижка (з обов'язковим коментарем-причиною) — одразу після «Безкоштовного проживання» ──
+    disc_frame = tk.Frame(pf, bg=C['card']); disc_frame.grid(row=7,column=0,columnspan=2,sticky='w',pady=(4,4))
     ctk.CTkLabel(disc_frame, text="🏷 Знижка:", font=('Segoe UI',11),
                  text_color=C['text2']).pack(side='left', padx=(0,6))
     e_discount = ent(disc_frame, "0", w=80); e_discount.pack(side='left')
@@ -18412,8 +18500,8 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
 
     # ── 🎁 Безкоштовне проживання ───────────────────────────────────────
     _fs_fr_n, free_var_n, e_free_cm_n = _free_stay_widget(
-        fs_card_n, on_change=lambda: (_update_total(), _upd_razom_new(), _upd_chg()))
-    _fs_fr_n.pack(fill='x', padx=12, pady=(6,10))
+        pf, on_change=lambda: (_update_total(), _upd_razom_new(), _upd_chg()))
+    _fs_fr_n.grid(row=6, column=0, columnspan=2, sticky='ew', pady=(6,4))   # одразу після «Здачі»
     _free_ref['var'] = free_var_n
 
     # ── Додаткові послуги ───────────────────────────────────────────────
@@ -18449,9 +18537,10 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
             co = date.fromisoformat(e_out.get().strip())
             if co <= ci: raise ValueError
         except: messagebox.showerror("","Невірні дати"); return
-        price = default_price
         nights = (co - ci).days
-        total  = price * nights
+        _prices_save = _stay_night_prices(room, default_price, ci, nights)
+        total  = sum(_prices_save)                       # сума за ночі з урахуванням вихідних
+        price = round(total / max(nights, 1), 2)         # середня ціна/ніч (як у синхронізації цін)
         try: dep = float(e_dep.get() or 0)
         except: dep = 0.0
         try: discount = max(float(e_discount.get() or 0), 0.0)
@@ -18483,7 +18572,7 @@ def _open_checkin_dlg(parent, room, click_date, on_save=None):
         nights_cnt = (co - ci).days
         # Знижка діє за кожну добу проживання (на весь період), а не одноразово:
         # якщо знижка == ціні/добу, проживання повністю безкоштовне, без боргу.
-        room_total_amt = max(price * nights_cnt - discount * nights_cnt, 0)
+        room_total_amt = max(total - discount * nights_cnt, 0)
         if _free_on:
             room_total_amt = 0.0   # 🎁 безкоштовне проживання
         _disc_note = f"Знижка: {discount:.0f}₴ ({discount_comment})  " if discount > 0 else ""
@@ -22175,7 +22264,7 @@ class BookingDetailDlg(ctk.CTkToplevel):
         BookingDetailDlg._open_dlgs[bid] = self
         self.bid = bid; self.on_close = on_close
         # Вікно «прив'язане» до головного: завжди поверх нього, поки його не закрито
-        try: self.transient(parent.winfo_toplevel())
+        try: _register_dialog(self, parent.winfo_toplevel())
         except Exception: pass
         self.configure(fg_color=C['bg'])
         self.title(f"📋 Бронювання #{bid}")
@@ -29436,19 +29525,15 @@ def _open_sauna_checkin_dlg(parent, room, on_save=None, booking=None):
                             lambda: e_hours.get(), _set_hours_ci,
                             on_change=lambda: _update_total())
 
-    # Оплата
-    # 🎁 Безкоштовне проживання (окрема картка над розрахунком)
-    fs_card_h = card(sc); fs_card_h.pack(fill='x', padx=12, pady=5)
-    lbl(fs_card_h, "🎁  Безкоштовне відвідування", 13, True).pack(anchor='w', padx=12, pady=(10,0))
-    _fs0_h = _free_stay_map([booking.get('id')]) if (booking and booking.get('id')) else {}
-    _fs_fr_h, free_var_h, e_free_cm_h = _free_stay_widget(
-        fs_card_h, init_on=bool(_fs0_h), init_comment=(list(_fs0_h.values())[0] if _fs0_h else ''),
-        on_change=lambda: _update_total(), visit=True)
-    _fs_fr_h.pack(fill='x', padx=12, pady=(6,10))
-
+    # Оплата. Порядок знизу: Оплата → 🎁 Безкоштовне відвідування → 🏷 Знижка → Нотатка → РАЗОМ
     p_card = card(sc); p_card.pack(fill='x', padx=12, pady=5)
     lbl(p_card, "💰  Розрахунок", 13, True).pack(anchor='w', padx=12, pady=(10,5))
     pf = tk.Frame(p_card, bg=C['card']); pf.pack(fill='x', padx=12, pady=(0,6))
+    _fs0_h = _free_stay_map([booking.get('id')]) if (booking and booking.get('id')) else {}
+    _fs_fr_h, free_var_h, e_free_cm_h = _free_stay_widget(
+        pf, init_on=bool(_fs0_h), init_comment=(list(_fs0_h.values())[0] if _fs0_h else ''),
+        on_change=lambda: _update_total(), visit=True)
+    _fs_fr_h.grid(row=4, column=0, columnspan=2, sticky='ew', pady=(6,4))
 
     # Аванс з бронювання
     _adv_amount = 0.0
@@ -29460,8 +29545,9 @@ def _open_sauna_checkin_dlg(parent, room, on_save=None, booking=None):
         except Exception: pass
 
     lbl(pf,"Ціна/год:",12).grid(row=0,column=0,sticky='w',pady=4)
-    lbl_price = lbl(pf,f"{default_price:.0f} ₴/год",12,True,C['accent'])
-    lbl_price.grid(row=0,column=1,sticky='w',padx=15,pady=4)
+    _price_cell = tk.Frame(pf, bg=C['card']); _price_cell.grid(row=0,column=1,sticky='w',padx=15,pady=4)
+    lbl_price = lbl(_price_cell,f"{default_price:.0f} ₴/год",12,True,C['accent'])
+    lbl_price.pack(anchor='w')
     # 🛁 «+ Чан»: ціна з чаном береться з категорії (Налаштування → Категорії → «+ Чан»)
     _base_price = default_price
     _chan_price = _room_chan_price(room['id'])
@@ -29477,9 +29563,9 @@ def _open_sauna_checkin_dlg(parent, room, on_save=None, booking=None):
             lbl_price.configure(text=f"{default_price:.0f} ₴/год")
             try: _update_total()
             except NameError: pass
-        ctk.CTkCheckBox(pf, text=f"🛁 + Чан ({_chan_price:.0f}₴/год)", variable=chan_var,
+        ctk.CTkCheckBox(_price_cell, text=f"🛁 + Чан ({_chan_price:.0f}₴/год)", variable=chan_var,
                         command=_on_chan, font=('Segoe UI',12,'bold'), text_color=C['yellow'],
-                        fg_color=C['accent']).grid(row=0,column=2,sticky='w',padx=8)
+                        fg_color=C['accent']).pack(anchor='w', pady=(4,0))
         if chan_var.get():
             default_price = _chan_price
             lbl_price.configure(text=f"{default_price:.0f} ₴/год")
@@ -29591,11 +29677,11 @@ def _open_sauna_checkin_dlg(parent, room, on_save=None, booking=None):
                            fg_color=clr,text_color=C['text'],
                            font=('Segoe UI',11)).pack(side='left',padx=6)
 
-    lbl(pf,"Нотатка:",12).grid(row=4,column=0,sticky='w',pady=4)
-    e_note = ent(pf,"",w=280); e_note.grid(row=4,column=1,padx=(15,0),pady=4,sticky='w')
+    lbl(pf,"Нотатка:",12).grid(row=6,column=0,sticky='w',pady=4)
+    e_note = ent(pf,"",w=280); e_note.grid(row=6,column=1,padx=(15,0),pady=4,sticky='w')
 
     # ── Знижка (з обов'язковим коментарем-причиною) — як при заселенні номерів ──
-    disc_frame_h = tk.Frame(p_card, bg=C['card']); disc_frame_h.pack(fill='x', padx=12, pady=(4,10))
+    disc_frame_h = tk.Frame(pf, bg=C['card']); disc_frame_h.grid(row=5, column=0, columnspan=2, sticky='w', pady=(4,4))
     ctk.CTkLabel(disc_frame_h, text="🏷 Знижка:", font=('Segoe UI',11),
                  text_color=C['text2']).pack(side='left', padx=(0,6))
     e_discount_h = ent(disc_frame_h, "0", w=80); e_discount_h.pack(side='left')
@@ -29908,19 +29994,15 @@ def _open_sauna_booking_dlg(parent, room, on_save=None):
                              on_change=lambda: _upd())
 
     # ── 🎁 Безкоштовне проживання ───────────────────────
-    fs_card_b = card(sc); fs_card_b.pack(fill='x', padx=12, pady=5)
-    lbl(fs_card_b, "🎁  Безкоштовне відвідування", 13, True).pack(anchor='w', padx=12, pady=(10,0))
-    _fs_fr_b, free_var_b, e_free_cm_b = _free_stay_widget(fs_card_b, on_change=lambda: _upd(), visit=True)
-    _fs_fr_b.pack(fill='x', padx=12, pady=(6,10))
-
-    # ── Оплата ──────────────────────────────────────────
+    # ── Оплата (порядок: … Метод оплати → 🎁 Безкоштовне відвідування → Нотатка) ──
     p_card = card(sc); p_card.pack(fill='x', padx=12, pady=5)
     lbl(p_card, "💰  Оплата", 13, True).pack(anchor='w', padx=12, pady=(10,5))
     pf = tk.Frame(p_card, bg=C['card']); pf.pack(fill='x', padx=12, pady=(0,10))
 
     lbl(pf,"Ціна/год:",11,color=C['text2']).grid(row=0,column=0,sticky='w',pady=4)
-    lbl_price2 = lbl(pf,f"{default_price:.0f} ₴/год",12,True,C['accent'])
-    lbl_price2.grid(row=0,column=1,padx=15,sticky='w')
+    _price_cell2 = tk.Frame(pf, bg=C['card']); _price_cell2.grid(row=0,column=1,padx=15,sticky='w')
+    lbl_price2 = lbl(_price_cell2,f"{default_price:.0f} ₴/год",12,True,C['accent'])
+    lbl_price2.pack(anchor='w')
     # 🛁 «+ Чан» — ціна з чаном з категорії
     _base_price2 = default_price
     _chan_price2 = _room_chan_price(room['id'])
@@ -29932,9 +30014,9 @@ def _open_sauna_booking_dlg(parent, room, on_save=None):
             lbl_price2.configure(text=f"{default_price:.0f} ₴/год")
             try: _upd()
             except NameError: pass
-        ctk.CTkCheckBox(pf, text=f"🛁 + Чан ({_chan_price2:.0f}₴/год)", variable=chan_var2,
+        ctk.CTkCheckBox(_price_cell2, text=f"🛁 + Чан ({_chan_price2:.0f}₴/год)", variable=chan_var2,
                         command=_on_chan2, font=('Segoe UI',12,'bold'), text_color=C['yellow'],
-                        fg_color=C['accent']).grid(row=0,column=2,sticky='w',padx=8)
+                        fg_color=C['accent']).pack(anchor='w', pady=(4,0))
 
     lbl(pf,"Сума:",11,color=C['text2']).grid(row=1,column=0,sticky='w',pady=4)
     lbl_total2 = lbl(pf,"",13,True,C['green']); lbl_total2.grid(row=1,column=1,padx=15,sticky='w')
@@ -29961,8 +30043,10 @@ def _open_sauna_booking_dlg(parent, room, on_save=None):
         ctk.CTkRadioButton(mf,text=txt,variable=meth_var,value=val,
                            font=('Segoe UI',11),text_color=col).pack(side='left',padx=6)
 
-    lbl(pf,"Нотатка:",11,color=C['text2']).grid(row=5,column=0,sticky='w',pady=4)
-    e_note2 = ent(pf,"",w=280); e_note2.grid(row=5,column=1,padx=(15,0),pady=4,sticky='w')
+    _fs_fr_b, free_var_b, e_free_cm_b = _free_stay_widget(pf, on_change=lambda: _upd(), visit=True)
+    _fs_fr_b.grid(row=5, column=0, columnspan=2, sticky='ew', pady=(6,4))
+    lbl(pf,"Нотатка:",11,color=C['text2']).grid(row=6,column=0,sticky='w',pady=4)
+    e_note2 = ent(pf,"",w=280); e_note2.grid(row=6,column=1,padx=(15,0),pady=4,sticky='w')
 
     def _upd(*a):
         try:
