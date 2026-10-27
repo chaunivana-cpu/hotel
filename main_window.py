@@ -7285,7 +7285,17 @@ def dlg_win(parent, title, size="500x400", modal=True):
         w.geometry(f"{ww}x{wh}+{x}+{y}")
         # БЕЗ transient: вікно має кнопки згортання/розгортання й свій значок у панелі завдань,
         # тож можна відкрити кілька вікон одночасно; над головним вікном його тримає _register_dialog.
-        _register_dialog(w, root)
+        try:
+            _app_root = tk._default_root
+        except Exception:
+            _app_root = None
+        if _app_root is not None and root is not _app_root:
+            # Вікно відкрите ІЗ іншого діалогу (напр. «Категорії» з вікна меню): прив'язуємо до нього,
+            # щоб воно завжди було над ним і не «зникало» під великим вікном.
+            try: w.transient(root)
+            except Exception: pass
+        else:
+            _register_dialog(w, root)
         w.resizable(True, True)
         w.minsize(min(ww, 300), min(wh, 200))
         # Зберігати розмір при кожній зміні вікна
@@ -10355,6 +10365,47 @@ _CHAT_TABLES_OK = False
 _support_tbl_ready = {'ok': False}
 
 
+_clip_fix_done = {'ok': False}
+
+
+def _install_clipboard_fix(root):
+    """Ctrl+C/V/X/A працюють у полях введення за БУДЬ-ЯКОЇ розкладки (укр/рос/англ) + меню правої кнопки."""
+    if _clip_fix_done['ok']:
+        return
+    _clip_fix_done['ok'] = True
+
+    def _ctrl_keys(e):
+        w = e.widget
+        kc = getattr(e, 'keycode', 0)
+        try:
+            if kc == 86:   w.event_generate('<<Paste>>')
+            elif kc == 67: w.event_generate('<<Copy>>')
+            elif kc == 88: w.event_generate('<<Cut>>')
+            elif kc == 65:
+                if w.winfo_class() == 'Text': w.tag_add('sel', '1.0', 'end-1c')
+                else: w.select_range(0, 'end'); w.icursor('end')
+            else: return None
+        except Exception:
+            return None
+        return 'break'
+
+    def _ctx_menu(e):
+        w = e.widget
+        m = tk.Menu(w, tearoff=0, font=('Segoe UI', 10))
+        m.add_command(label="Вирізати", command=lambda: w.event_generate('<<Cut>>'))
+        m.add_command(label="Копіювати", command=lambda: w.event_generate('<<Copy>>'))
+        m.add_command(label="Вставити", command=lambda: w.event_generate('<<Paste>>'))
+        try: m.tk_popup(e.x_root, e.y_root)
+        finally: m.grab_release()
+
+    for cls in ('Entry', 'Text', 'TEntry'):
+        try:
+            root.bind_class(cls, '<Control-KeyPress>', _ctrl_keys, add='+')
+            root.bind_class(cls, '<Button-3>', _ctx_menu, add='+')
+        except Exception:
+            pass
+
+
 def _support_ensure_table():
     """Таблиця запитів на допомогу (support_requests). Створюється автоматично."""
     if _support_tbl_ready['ok']:
@@ -10371,6 +10422,7 @@ def _support_ensure_table():
                  notified BOOLEAN DEFAULT FALSE,
                  voice_room TEXT)""", fetch=None)
         _qs("ALTER TABLE support_requests ADD COLUMN IF NOT EXISTS voice_room TEXT", fetch=None)
+        _qs("CREATE TABLE IF NOT EXISTS support_settings (k TEXT PRIMARY KEY, v TEXT)", fetch=None)
         _support_tbl_ready['ok'] = True
     except Exception as e:
         try: log_error("support_requests: створення таблиці", e)
@@ -10378,8 +10430,28 @@ def _support_ensure_table():
     return _support_tbl_ready['ok']
 
 
+def _support_setting_get(key, default=None):
+    """Спільне (в БД) налаштування підтримки — однакове на всіх ПК."""
+    try:
+        if not _support_ensure_table(): return default
+        from app.utils.db import query as _qg
+        r = _qg("SELECT v FROM support_settings WHERE k=%s", (key,), fetch='one')
+        return r['v'] if r and r.get('v') not in (None, '') else default
+    except Exception:
+        return default
+
+
+def _support_setting_set(key, value):
+    from app.utils.db import query as _qg
+    _support_ensure_table()
+    _qg("""INSERT INTO support_settings(k, v) VALUES (%s, %s)
+           ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v""", (key, value), fetch=None)
+
+
 def _voice_call_url(room, name=''):
     """Посилання на голосову кімнату (Jitsi Meet, у браузері, без встановлення; камера вимкнена)."""
+    if str(room).lower().startswith(('http://', 'https://')):
+        return str(room)          # постійна кімната (власне посилання) — відкриваємо як є
     from urllib.parse import quote
     frag = ("config.startWithVideoMuted=true&config.startWithAudioMuted=false"
             "&config.prejoinPageEnabled=false&config.prejoinConfig.enabled=false"
@@ -12362,6 +12434,8 @@ class HotelApp(ctk.CTk):
         self._db_badge.pack(side='right', padx=4, pady=7)
 
         # ── Підтримка (завжди) та «Закрити зміну ▾» (X/Z-звіти; лише на Дашборді) ──
+        try: _install_clipboard_fix(self)
+        except Exception: pass
         self._support_btn = btn_fit(self._topbar, "Підтримка", self._support_dlg, C['card2'], pad=22 + 28)
         try:
             self._support_btn.configure(image=_support_img('operator', 24), compound='left')
@@ -12443,7 +12517,10 @@ class HotelApp(ctk.CTk):
         except Exception: pc = ''
         # не дублюємо: якщо від цього користувача вже є відкритий запит — оновлюємо його
         import uuid as _uu
-        room = ('HotelPMS-' + _uu.uuid4().hex[:10]) if voice else None
+        room = None
+        if voice:
+            # постійна кімната (одноразова авторизація адміністратора) або нова Jitsi-кімната
+            room = _support_setting_get('voice_url') or ('HotelPMS-' + _uu.uuid4().hex[:10])
         old = _qs("SELECT id FROM support_requests WHERE from_user=%s AND status='open' ORDER BY id DESC LIMIT 1",
                   (u.get('username'),), fetch='one')
         if old:
@@ -12818,7 +12895,7 @@ class HotelApp(ctk.CTk):
         import os, sys, shutil, subprocess, threading
         me = (self.user or {}).get('username', '')
         me_name = (self.user or {}).get('full_name') or me
-        is_admin = (self.user or {}).get('role') in ('admin',)
+        is_admin = (self.user or {}).get('role') in ('admin', 'manager')
 
         win = dlg_win(self, "Підтримка", "620x860")
         hdr = tk.Frame(win, bg=C['bg']); hdr.pack(fill='x', padx=16, pady=(14, 6))
@@ -12828,8 +12905,26 @@ class HotelApp(ctk.CTk):
         _t = tk.Frame(hdr, bg=C['bg']); _t.pack(side='left', padx=12)
         lbl(_t, "Служба підтримки", 17, True).pack(anchor='w')
         lbl(_t, "Голосовий зв'язок та віддалений доступ до цього ПК", 10, color=C['text2']).pack(anchor='w')
+        if is_admin:
+            # ⚙ Контакти і постійна кімната — одразу вгорі, без прокрутки
+            btn(hdr, "⚙ Контакти і кімната", lambda: _edit_contacts(), C['card2'], 190, height=34).pack(side='right')
 
-        body = tk.Frame(win, bg=C['bg']); body.pack(fill='both', expand=True, padx=12, pady=(0, 6))
+        # Нижня панель (Контакти / Закрити) — завжди видима; вміст по центру прокручується
+        bot = tk.Frame(win, bg=C['bg']); bot.pack(side='bottom', fill='x', padx=12, pady=(4, 10))
+        _wrap = tk.Frame(win, bg=C['bg']); _wrap.pack(fill='both', expand=True, padx=(12, 4), pady=(0, 2))
+        _cv = tk.Canvas(_wrap, bg=C['bg'], highlightthickness=0)
+        _vs = ttk.Scrollbar(_wrap, orient='vertical', command=_cv.yview)
+        _cv.configure(yscrollcommand=_vs.set)
+        _vs.pack(side='right', fill='y'); _cv.pack(side='left', fill='both', expand=True)
+        body = tk.Frame(_cv, bg=C['bg'])
+        _bid = _cv.create_window((0, 0), window=body, anchor='nw')
+        body.bind('<Configure>', lambda e: _cv.configure(scrollregion=_cv.bbox('all')))
+        _cv.bind('<Configure>', lambda e: _cv.itemconfigure(_bid, width=e.width))
+        def _wheel(e):
+            try: _cv.yview_scroll(int(-1 * (e.delta / 120)), 'units')
+            except Exception: pass
+        win.bind('<MouseWheel>', _wheel)
+        _cv.bind('<MouseWheel>', _wheel)
 
         def _open(target):
             # webbrowser у зібраному exe (PyInstaller) може бути відсутній — тому лише як запасний варіант
@@ -12913,6 +13008,12 @@ class HotelApp(ctk.CTk):
         contacts_box = tk.Frame(c1, bg=C['card']); contacts_box.pack(fill='x', padx=12, pady=(2, 6))
 
         def _contacts():
+            try:
+                import json as _js
+                _raw = _support_setting_get('contacts')
+                if _raw:
+                    return list(_js.loads(_raw))
+            except Exception: pass
             try: return list(_load_app_settings().get('support_contacts') or [])
             except Exception: return []
 
@@ -12938,26 +13039,64 @@ class HotelApp(ctk.CTk):
         _render_contacts()
 
         def _edit_contacts():
-            ew = dlg_win(win, "Контакти підтримки", "560x340")
+            # Новий заголовок → нове (достатнє) збережене розмір вікна; старий кеш був замалий
+            ew = dlg_win(win, "Контакти і кімната підтримки", "640x560")
             fe = card(ew); fe.pack(fill='both', expand=True, padx=12, pady=12)
-            lbl(fe, "Один контакт на рядок:  Ім'я | телефон | @telegram", 11, True).pack(anchor='w', padx=10, pady=(10, 2))
-            lbl(fe, "Приклад:  Іван | +380671234567 | @ivan_admin   (telegram не обов'язковий)", 9,
-                color=C['text2']).pack(anchor='w', padx=10)
-            t = tk.Text(fe, height=8, bg=C['card2'], fg=C['text'], font=('Segoe UI', 11), relief='flat',
+            # «Зберегти» — закріплено внизу, завжди видно
+            _sv = tk.Frame(fe, bg=C['card']); _sv.pack(side='bottom', fill='x', pady=(0, 10))
+
+            # 1) Постійна кімната — вгорі, щоб одразу було видно, куди вставляти посилання
+            lbl(fe, "📞  Постійна кімната для голосових дзвінків", 13, True).pack(anchor='w', padx=14, pady=(12, 2))
+            # (lbl() не підтримує wraplength/justify — саме це раніше обривало побудову вікна після заголовка)
+            tk.Label(fe, text="Посилання на кімнату (напр. https://whereby.com/hotelbochka). Авторизація потрібна лише один раз. "
+                              "Порожньо = нова Jitsi-кімната щоразу.", font=('Segoe UI', 9), bg=C['card'], fg=C['text2'],
+                     wraplength=580, justify='left').pack(anchor='w', padx=14)
+            fr_room = tk.Frame(fe, bg=C['card']); fr_room.pack(fill='x', padx=14, pady=(6, 10))
+            e_room = ent(fr_room, "https://whereby.com/назва-вашої-кімнати", w=430); e_room.pack(side='left')
+            def _paste_room():
+                try:
+                    txt_ = ew.clipboard_get().strip()
+                except Exception:
+                    messagebox.showinfo("", "У буфері обміну немає тексту. Скопіюйте посилання й спробуйте ще раз.", parent=ew); return
+                e_room.delete(0, 'end'); e_room.insert(0, txt_)
+            btn(fr_room, "📋 Вставити", _paste_room, C['accent'], 120, height=32).pack(side='left', padx=8)
+            _cur_room = _support_setting_get('voice_url')
+            if _cur_room: e_room.insert(0, _cur_room)
+
+            # 2) Контакти для зв'язку
+            lbl(fe, "👥  Контакти адміністраторів", 13, True).pack(anchor='w', padx=14, pady=(6, 2))
+            lbl(fe, "Один контакт на рядок:  Ім'я | телефон | @telegram    (напр.  Іван | +380671234567 | @ivan_admin)",
+                9, color=C['text2']).pack(anchor='w', padx=14)
+            t = tk.Text(fe, height=4, bg=C['card2'], fg=C['text'], font=('Segoe UI', 11), relief='flat',
                         insertbackground=C['text'])
-            t.pack(fill='both', expand=True, padx=10, pady=8)
+            t.pack(fill='x', padx=14, pady=8)
             t.insert('1.0', '\n'.join(f"{c.get('name','')} | {c.get('phone','')} | {c.get('telegram','')}" for c in _contacts()))
+
             def _save():
                 out = []
                 for line in t.get('1.0', 'end').splitlines():
                     parts = [x.strip() for x in line.split('|')]
                     if not parts or not parts[0]: continue
+                    # посилання випадково вставлено в контакти — це поле кімнати, а не контакт
+                    if parts[0].lower().startswith(('http://', 'https://')) or \
+                       (len(parts) > 2 and parts[2].lower().startswith(('http://', 'https://'))):
+                        messagebox.showwarning("", "Схоже, посилання вставлено в «Контакти».\n"
+                                                   "Вставте його у верхнє поле «Постійна кімната».", parent=ew); return
                     out.append({'name': parts[0], 'phone': parts[1] if len(parts) > 1 else '',
                                 'telegram': parts[2] if len(parts) > 2 else ''})
-                try: _save_app_settings({'support_contacts': out})
+                _ru = e_room.get().strip()
+                if _ru and not _ru.lower().startswith(('http://', 'https://')):
+                    messagebox.showwarning("", "Посилання має починатись з https://", parent=ew); return
+                try:
+                    import json as _js2
+                    _support_setting_set('contacts', _js2.dumps(out, ensure_ascii=False))
+                    _support_setting_set('voice_url', _ru)
+                    try: _save_app_settings({'support_contacts': out})
+                    except Exception: pass
                 except Exception as e: messagebox.showerror("Помилка", str(e), parent=ew); return
                 ew.destroy(); _render_contacts()
-            btn(fe, "💾 Зберегти", _save, C['green'], 160, height=36).pack(pady=(0, 8))
+            btn(_sv, "💾 Зберегти", _save, C['green'], 200, height=38).pack()
+
 
         # ── 2. Віддалений доступ ──
         c2 = card(body); c2.pack(fill='x', pady=(0, 8))
@@ -13083,7 +13222,6 @@ class HotelApp(ctk.CTk):
         else:
             lbl(c3, "Інших адміністраторів у системі немає.", 10, color=C['text2']).pack(anchor='w', padx=12, pady=(0, 10))
 
-        bot = tk.Frame(win, bg=C['bg']); bot.pack(fill='x', padx=12, pady=(0, 10))
         if is_admin:
             btn(bot, "⚙ Контакти", _edit_contacts, C['card2'], 130, height=32).pack(side='left')
         btn(bot, "Закрити", win.destroy, C['card2'], 120, height=32).pack(side='right')
@@ -42587,25 +42725,24 @@ class _MenuSheetFrame(tk.Frame):
         tl = tk.Frame(top, bg=C['card']); tl.pack(side='left')
         lbl(tl, "🍽  Меню ресторану / бару", 20, True).pack(anchor='w')
         self._sub = lbl(tl, "", 11, color=C['text2']); self._sub.pack(anchor='w')
+        lbl(tl, "Додати — у вибрану категорію · подвійний клік по клітинці — редагувати", 9, color=C['text2']).pack(anchor='w')
+        # праворуч: спочатку пошук, за ним (правіше) — оновлення сторінки
+        refresh_btn(top, self._load, side='right', padx=(6, 0), pady=0)
         self._search = ent(top, "🔍 Пошук позиції…", w=280)
         self._search.pack(side='right')
         self._search.bind('<KeyRelease>', lambda e: self._fill())
 
         def _sep(parent_):
-            tk.Frame(parent_, bg=C['border'], width=1, height=30).pack(side='left', padx=8, pady=2)
-        row1 = tk.Frame(bar, bg=C['card']); row1.pack(fill='x', padx=14, pady=(2, 6))
-        btn(row1, "➕ Додати позицію", self._add_item, C['green'], 180, height=36).pack(side='left', padx=(0, 4))
-        btn(row1, "🗑 Видалити вибрані", self._delete_selected, C['red'], 180, height=36).pack(side='left', padx=4)
-        _sep(row1)
-        btn(row1, "🏷 Нова категорія", self._add_category, '#8e44ad', 170, height=36).pack(side='left', padx=4)
-        refresh_btn(row1, self._load, side='left', padx=4, pady=0)
-        lbl(row1, "Подвійний клік по клітинці — редагувати", 10, color=C['text2']).pack(side='right', padx=6)
+            tk.Frame(parent_, bg=C['border'], width=1, height=28).pack(side='left', padx=6, pady=2)
+        # ОДИН ряд кнопок: компактні (ширина за текстом), згруповані роздільниками
+        row1 = tk.Frame(bar, bg=C['card']); row1.pack(fill='x', padx=14, pady=(2, 12))
+        btn_fit(row1, "➕ Додати", self._add_item, C['green'], pad=26, size=10, height=36).pack(side='left', padx=(0, 3))
+        btn_fit(row1, "🗑 Видалити", self._delete_selected, C['red'], pad=26, size=10, height=36).pack(side='left', padx=3)
+        btn_fit(row1, "🏷 Нова категорія", self._add_category, '#8e44ad', pad=26, size=10, height=36).pack(side='left', padx=3)
         if self._extras:
-            row2 = tk.Frame(bar, bg=C['card']); row2.pack(fill='x', padx=14, pady=(0, 12))
-            try: self._extras(row2)
+            _sep(row1)
+            try: self._extras(row1)
             except Exception as e: log_error("_MenuSheetFrame extras", e)
-        else:
-            tk.Frame(bar, bg=C['card'], height=6).pack()
 
         # світлий «прайс-лист»
         st = ttk.Style()
@@ -42879,15 +43016,17 @@ def _open_menu_window(parent, user, on_close=None):
     helper = _MenuEditorFrame(win, user)
 
     def _extras(tb):
-        btn(tb, "🏷 Категорії", lambda: helper._menu_categories_dlg(), '#8e44ad', 130, height=34).pack(side='left', padx=(0, 4))
-        btn(tb, "🔖 Штрих-коди", lambda: helper._barcode_quick_dlg(win), '#e67e22', 140, height=34).pack(side='left', padx=4)
-        tk.Frame(tb, bg=C['border'], width=1, height=28).pack(side='left', padx=8)
-        btn(tb, "📥 Імпорт XLS", lambda: helper._menu_import_xls(), C['green'], 140, height=34).pack(side='left', padx=4)
-        btn(tb, "📤 Експорт XLS", lambda: helper._menu_export_report_xls(), '#9b59b6', 140, height=34).pack(side='left', padx=4)
-        btn(tb, "📤 XLS для імпорту", lambda: helper._menu_export_xls(), '#7d3c98', 170, height=34).pack(side='left', padx=4)
-        tk.Frame(tb, bg=C['border'], width=1, height=28).pack(side='left', padx=8)
-        btn(tb, "🖨 Друк / HTML", lambda: helper._menu_print_html(), '#2980b9', 140, height=34).pack(side='left', padx=4)
-        btn(tb, "🔧 Кракозябри", lambda: helper._menu_fix_mojibake(), '#d35400', 140, height=34).pack(side='left', padx=4)
+        def _b(text, cmd, color):
+            btn_fit(tb, text, cmd, color, pad=26, size=10, height=36).pack(side='left', padx=3)
+        _b("🏷 Категорії", lambda: helper._menu_categories_dlg(), '#8e44ad')
+        _b("🔖 Штрих-коди", lambda: helper._barcode_quick_dlg(win), '#e67e22')
+        tk.Frame(tb, bg=C['border'], width=1, height=28).pack(side='left', padx=6, pady=2)
+        _b("📥 Імпорт XLS", lambda: helper._menu_import_xls(), C['green'])
+        _b("📤 Експорт XLS", lambda: helper._menu_export_report_xls(), '#9b59b6')
+        _b("📤 Шаблон XLS", lambda: helper._menu_export_xls(), '#7d3c98')
+        tk.Frame(tb, bg=C['border'], width=1, height=28).pack(side='left', padx=6, pady=2)
+        _b("🖨 Друк", lambda: helper._menu_print_html(), '#2980b9')
+        _b("🔧 Кракозябри", lambda: helper._menu_fix_mojibake(), '#d35400')
 
     sheet = _MenuSheetFrame(win, user, extras=_extras)
     helper._menu_sheet = sheet
