@@ -489,7 +489,14 @@ class OfflineSyncManager:
     def start(self):
         """Запускає фоновий потік автосинхронізації."""
         if self._thread and self._thread.is_alive():
-            return
+            if self._stop_evt.is_set():
+                # попередня сесія щойно зупинила менеджер — дочекаємось виходу старого потоку
+                self._thread.join(timeout=3)
+                if self._thread.is_alive():
+                    self._stop_evt.clear()      # старий потік ще живий — просто залишаємо його працювати
+                    return
+            else:
+                return
         self._stop_evt.clear()
         self._thread = _thr.Thread(target=self._bg_loop, daemon=True, name='OfflineSyncBG')
         self._thread.start()
@@ -1079,9 +1086,16 @@ def _ensure_weekend_col():
     if _wk_col_ready['ok']:
         return
     try:
+        if _db_col_info('room_categories', 'weekend_price') and _db_col_info('room_categories', 'chan_price'):
+            _wk_col_ready['ok'] = True
+            return
+    except Exception:
+        pass
+    try:
         from app.utils.db import get_conn as _gcw
         with _gcw() as _cw:
             with _cw.cursor() as _cuw:
+                _cuw.execute("SET LOCAL lock_timeout = 1500")
                 _cuw.execute("ALTER TABLE room_categories ADD COLUMN IF NOT EXISTS weekend_price NUMERIC(10,2)")
                 _cuw.execute("ALTER TABLE room_categories ADD COLUMN IF NOT EXISTS chan_price NUMERIC(10,2)")
                 try:
@@ -7429,8 +7443,61 @@ def field_row(parent, label_text, entry_widget=None, width=140):
     return f
 
 # ══════════════════════════════════════════════════════
+def _db_col_info(table, column):
+    """(data_type, character_maximum_length) колонки або None. Читає каталог — без блокувань таблиці."""
+    try:
+        from app.utils.db import query as _qi
+        r = _qi("SELECT data_type, character_maximum_length FROM information_schema.columns "
+                "WHERE table_name=%s AND column_name=%s LIMIT 1", (table, column), fetch='one')
+        return (r['data_type'], r['character_maximum_length']) if r else None
+    except Exception:
+        return None
+
+
+def _ddl_nonblocking(sql, lock_ms=1500):
+    """Виконує DDL із lock_timeout: якщо таблицю тримає інша сесія — пропускаємо, а не вішаємо
+    весь застосунок (ALTER TABLE чекає ACCESS EXCLUSIVE і блокує всі наступні запити до таблиці)."""
+    try:
+        from app.utils.db import get_conn as _gcd
+        with _gcd() as _cd:
+            with _cd.cursor() as _cu:
+                _cu.execute(f"SET LOCAL lock_timeout = {int(lock_ms)}")
+                _cu.execute(sql)
+            _cd.commit()
+        return True
+    except Exception as e:
+        try: log_info(f"[DDL] пропущено ({str(e).splitlines()[0][:90]}): {sql[:70]}")
+        except Exception: pass
+        return False
+
+
+def _teardown_session(root_win):
+    """Зупиняє фонові потоки старої сесії й скидає з'єднання з БД, щоб вони не тримали блокувань
+    і не заважали новій сесії (раніше після закриття зміни програма «висла»)."""
+    try: root_win._chat_poller_started = False        # зупиняє опитувач чату/підтримки
+    except Exception: pass
+    try: _sync_mgr.stop()
+    except Exception: pass
+    try:
+        from app.utils import db as _dbm
+        if hasattr(_dbm, '_reset_all_pools'):
+            _dbm._reset_all_pools()
+        else:
+            for _b, _p in list(getattr(_dbm, '_pools', {}).items()):
+                if _p is not None:
+                    try: _p.closeall()
+                    except Exception: pass
+                    _dbm._pools[_b] = None
+    except Exception:
+        pass
+
+
 def _relogin(root_win):
     """Закрити поточну сесію і показати вікно авторизації."""
+    try:
+        _teardown_session(root_win)
+    except Exception:
+        pass
     try:
         root_win.destroy()
     except Exception:
@@ -12023,19 +12090,27 @@ class HotelApp(ctk.CTk):
             self._migrate_sqlite_cache()
             return
         from app.utils.db import query
-        try: query("ALTER TABLE rooms ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'free'", fetch=None)
+        # ALTER TABLE бере блокування ACCESS EXCLUSIVE і ставить у чергу ВСІ запити до таблиці —
+        # раніше це виконувалось при кожному вході й «підвішувало» програму після закриття зміни.
+        # Тепер: перевіряємо каталог (без блокувань) і змінюємо лише якщо справді потрібно, з lock_timeout.
+        if _db_col_info('rooms', 'status') is None:
+            _ddl_nonblocking("ALTER TABLE rooms ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'free'")
+        try:
+            _nul = query("SELECT 1 FROM rooms WHERE status IS NULL LIMIT 1", fetch='one')
+            if _nul: query("UPDATE rooms SET status='free' WHERE status IS NULL", fetch=None)
         except Exception: pass
-        try: query("UPDATE rooms SET status='free' WHERE status IS NULL", fetch=None)
-        except Exception: pass
-        try: query("ALTER TABLE rooms ADD COLUMN IF NOT EXISTS deposit_amount NUMERIC(10,2) DEFAULT 0", fetch=None)
-        except Exception: pass
+        if _db_col_info('rooms', 'deposit_amount') is None:
+            _ddl_nonblocking("ALTER TABLE rooms ADD COLUMN IF NOT EXISTS deposit_amount NUMERIC(10,2) DEFAULT 0")
         # Видалити обмеження CHECK яке забороняє нові категорії (бані, бесідки, штрафи)
-        try: query("ALTER TABLE services DROP CONSTRAINT IF EXISTS services_category_check", fetch=None)
+        try:
+            _cons = query("SELECT conname FROM pg_constraint WHERE conrelid='services'::regclass "
+                          "AND conname IN ('services_category_check','services_cat_check')", fetch='all') or []
+            for _c in _cons:
+                _ddl_nonblocking(f"ALTER TABLE services DROP CONSTRAINT IF EXISTS {_c['conname']}")
         except Exception: pass
-        try: query("ALTER TABLE services DROP CONSTRAINT IF EXISTS services_cat_check", fetch=None)
-        except Exception: pass
-        try: query("ALTER TABLE services ALTER COLUMN category TYPE VARCHAR(100)", fetch=None)
-        except Exception: pass
+        _ci = _db_col_info('services', 'category')
+        if _ci is not None and (_ci[1] is None or int(_ci[1]) < 100):
+            _ddl_nonblocking("ALTER TABLE services ALTER COLUMN category TYPE VARCHAR(100)")
         # ── ВИПРАВЛЕННЯ: Міграція локального SQLite-кешу ────────────────────
         # Якщо основна БД вже має deposit_amount, а локальний SQLite — ні,
         # кеш виводить WARNING при кожній синхронізації. Виправляємо тут.
@@ -12725,6 +12800,14 @@ class HotelApp(ctk.CTk):
             log_error("chat poll", e)
 
     def _chat_apply(self, total, info, first):
+        # Вікно вже закрито (вихід/нова зміна) — зупиняємо опитувач, а не сиплемо помилками
+        try:
+            if not self.winfo_exists():
+                self._chat_poller_started = False
+                return
+        except Exception:
+            self._chat_poller_started = False
+            return
         # 1) лічильник у меню (окремо — щоб його збій не блокував сповіщення)
         try:
             on_chat = (self.active == 'chat')
@@ -31064,12 +31147,17 @@ class ReportsFrame(tk.Frame):
         if not is_admin:
             lbl(tb,"🔐 Receptionist: тільки X/Z-звіт",11,color=C['yellow']).pack(side='left',padx=10)
         btn(tb,"🖨 Друкувати",self._print_report,C['card2'],140).pack(side='right',padx=10,pady=10)
+        # «Закрити зміну» — зверху, поруч із «Друкувати» (заповнюється з Z-звіту)
+        self._close_slot=tk.Frame(tb,bg=C['card']); self._close_slot.pack(side='right',padx=6)
 
-        cf=ctk.CTkFrame(self,fg_color=C['card']); cf.pack(fill='x',padx=15,pady=3)
+        if is_admin:
+            cf=tb          # адміністратор: дати, тип звіту й Excel — в одному рядку із заголовком «Звіти»
+        else:
+            cf=ctk.CTkFrame(self,fg_color=C['card']); cf.pack(fill='x',padx=15,pady=3)
 
         if is_admin:
             # Адмін бачить всі звіти + фільтр дат
-            lbl(cf,"З:",11,color=C['text2']).pack(side='left',padx=(10,3),pady=8)
+            lbl(cf,"З:",11,color=C['text2']).pack(side='left',padx=(24,3),pady=8)
             self.e_from=ent(cf,w=120); self.e_from.insert(0,str(date.today().replace(day=1)))
             self.e_from.pack(side='left',padx=(0,8))
             lbl(cf,"По:",11,color=C['text2']).pack(side='left',padx=(0,3))
@@ -31078,17 +31166,23 @@ class ReportsFrame(tk.Frame):
             self.rep_type=ctk.StringVar(value='Дохід')
             ctk.CTkOptionMenu(cf,
                 values=['Дохід','Завантаженість','Послуги','Ресторан','Платежі','Заїзди','Виїзди','Переселення','Прибирання','Зміни','X-звіт','Z-звіт'],
-                variable=self.rep_type,width=160,fg_color=C['card2'],button_color=C['accent']).pack(side='left',padx=8)
-            btn(cf,"📊 Показати",self._show,width=130).pack(side='left',padx=5,pady=8)
+                variable=self.rep_type,width=160,fg_color=C['card2'],button_color=C['accent'],
+                command=lambda _v: self._show()).pack(side='left',padx=8)   # вибір типу звіту одразу показує його
             btn(cf,"📥 Excel",self._export_excel_report,'#27ae60',100).pack(side='left',padx=5,pady=8)
+            # зміна дати (Enter або вихід із поля) теж одразу оновлює звіт
+            for _e in (self.e_from, self.e_to):
+                _e.bind('<Return>', lambda ev: self._show())
+                _e.bind('<FocusOut>', lambda ev: self._show_if_dates_changed())
+            # Пошук по таблиці звіту — в цьому ж рядку (заповнюється для Завантаженості, Послуг, Ресторану, Заїздів, Виїздів, Переселення)
+            self._search_slot=tk.Frame(cf,bg=C['card']); self._search_slot.pack(side='left',padx=(10,0))
         else:
             # Receptionist — тільки X/Z звіт за сьогодні, без вибору дат
             self.e_from=None; self.e_to=None
             self.rep_type=ctk.StringVar(value='X-звіт')
             lbl(cf,"Звіт зміни:",12,True).pack(side='left',padx=(12,6),pady=10)
             ctk.CTkOptionMenu(cf,values=['X-звіт','Z-звіт'],
-                variable=self.rep_type,width=140,fg_color=C['card2'],button_color=C['accent']).pack(side='left',padx=4)
-            btn(cf,"📊 Показати",self._show,width=130).pack(side='left',padx=8,pady=10)
+                variable=self.rep_type,width=140,fg_color=C['card2'],button_color=C['accent'],
+                command=lambda _v: self._show()).pack(side='left',padx=4)
             lbl(cf,f"Дата: {date.today().strftime('%d.%m.%Y')}",11,color=C['text2']).pack(side='left',padx=10)
 
         # Контейнер з прокруткою через Canvas — працює на Windows і Linux
@@ -31125,6 +31219,15 @@ class ReportsFrame(tk.Frame):
         self.result.bind('<Enter>', lambda e: _rebind_safe(self.result))
         # Запустити після рендеру через after
         self.after(100, self._show)
+
+    def _show_if_dates_changed(self):
+        """Оновлює звіт при виході з поля дати, лише якщо дату справді змінили."""
+        try:
+            cur = (self.e_from.get().strip(), self.e_to.get().strip(), self.rep_type.get())
+        except Exception:
+            return
+        if getattr(self, '_last_shown_key', None) != cur:
+            self._show()
 
     def _export_excel_report(self):
         """Вигрузка поточного звіту в Excel."""
@@ -31405,6 +31508,16 @@ class ReportsFrame(tk.Frame):
     def _show(self):
         from app.modules.logic import (report_revenue,report_occupancy,report_services,
                                         report_payments,report_arrivals,report_departures)
+        try:
+            for _w in self._close_slot.winfo_children(): _w.destroy()
+        except Exception: pass
+        try:
+            for _w in self._search_slot.winfo_children(): _w.destroy()
+        except Exception: pass
+        try:
+            self._last_shown_key = ((self.e_from.get().strip() if self.e_from else ''),
+                                    (self.e_to.get().strip() if self.e_to else ''), self.rep_type.get())
+        except Exception: pass
         # Видалити віджети Дохід-звіту якщо були (картки, таблиця в result_wrap)
         for w in self.result_wrap.winfo_children():
             if w not in (self._canvas, self._vbar):
@@ -32404,7 +32517,8 @@ class ReportsFrame(tk.Frame):
         hdr=card(self.result); hdr.pack(fill='x',padx=15,pady=(5,3))
         lbl(hdr,f"📊 {rt}  |  {df.strftime('%d.%m.%Y')} — {dt.strftime('%d.%m.%Y')}",
             13,True,C['accent']).pack(anchor='w',padx=12,pady=8)
-        lbl(hdr,f"Записів: {len(rows or [])}",11,color=C['text2']).pack(anchor='w',padx=12,pady=(0,8))
+        _hdr_count = lbl(hdr,f"Записів: {len(rows or [])}",11,color=C['text2'])
+        _hdr_count.pack(anchor='w',padx=12,pady=(0,8))
 
         if not rows:
             lbl(self.result,"Немає даних за вказаний період",13,color=C['text2']).pack(pady=30)
@@ -32415,13 +32529,15 @@ class ReportsFrame(tk.Frame):
 
         # Таблиця — формат 1С: панель пошуку/керування + компактна сітка.
         table_box = card(self.result); table_box.pack(fill='both', expand=True, padx=15, pady=5)
-        table_toolbar = tk.Frame(table_box, bg=C['card']); table_toolbar.pack(fill='x', padx=10, pady=(8,5))
-        lbl(table_toolbar, '🔎 Пошук:', 10, color=C['text2']).pack(side='left', padx=(2,6))
-        _report_search = ctk.CTkEntry(table_toolbar, height=32, width=260,
-                                      placeholder_text='Номер, гість, статус, сума…')
-        _report_search.pack(side='left', padx=(0,8))
-        _report_count = lbl(table_toolbar, f'Рядків: {len(rows)}', 10, color=C['text2'])
-        _report_count.pack(side='left', padx=4)
+        # Пошук — у верхньому рядку сторінки (поруч із вибором типу звіту), а не над таблицею
+        _slot = getattr(self, '_search_slot', None)
+        if _slot is None:
+            _slot = tk.Frame(table_box, bg=C['card']); _slot.pack(fill='x', padx=10, pady=(8,5))
+        lbl(_slot, '🔎', 13, color=C['text2']).pack(side='left', padx=(0,4))
+        _report_search = ctk.CTkEntry(_slot, height=32, width=200,
+                                      placeholder_text='Пошук: номер, гість, сума…')
+        _report_search.pack(side='left')
+        _report_count = _hdr_count
         frm=tk.Frame(table_box,bg=C['bg']); frm.pack(fill='both',expand=True,padx=8,pady=(0,8))
         ff,tree=mktree(frm,cols,22,widths)
         for c,h in zip(cols,headers): tree.heading(c,text=h)
@@ -32474,7 +32590,7 @@ class ReportsFrame(tk.Frame):
                 _apply_report_filter(_report_search.get())
                 try:
                     visible = len(tree.get_children(''))
-                    _report_count.configure(text=f'Рядків: {visible} / {len(rows)}')
+                    _report_count.configure(text=f'Записів: {visible} / {len(rows)}')
                 except Exception:
                     pass
             _report_search.bind('<KeyRelease>', _on_report_search)
@@ -32768,7 +32884,7 @@ class ReportsFrame(tk.Frame):
         self.after(300, self._rebind_report_scroll)
 
     def _render_close_shift_ui(self, parent, cash_total, card_total, transfer_total,
-                                 grand_total, tx_count, today, shift_id=None):
+                                 grand_total, tx_count, today, shift_id=None, compact=False):
         """Кнопка й логіка реального закриття зміни (перевірка синхронізації,
         UPDATE shifts, запис у z_reports.json, друк, вікно підсумків).
         Винесено в окремий метод, щоб працювати однаково і в табличному
@@ -32781,6 +32897,10 @@ class ReportsFrame(tk.Frame):
             (today,), fetch='one')
 
         if already:
+            if compact:
+                lbl(parent, f"✅ Зміну {today.strftime('%d.%m.%Y')} вже закрито", 12,
+                    color=C['green']).pack(side='right', padx=8, pady=10)
+                return
             warn = card(parent); warn.pack(fill='x', padx=5, pady=5)
             lbl(warn, f"✅  Зміну {today.strftime('%d.%m.%Y')} вже закрито.",
                 13, color=C['green']).pack(padx=15, pady=12)
@@ -32898,6 +33018,9 @@ class ReportsFrame(tk.Frame):
                 log_error("close_shift: друк звіту", _epr)
                 _after_shift_receipt_closed2()
 
+        if compact:
+            btn(parent, "🔴  Закрити зміну", close_shift, C['red'], 190, height=36).pack(side='right', padx=4, pady=8)
+            return
         act = ctk.CTkFrame(parent, fg_color='transparent'); act.pack(fill='x', padx=5, pady=8)
         btn(act, "🔴  Закрити зміну", close_shift, C['red'], 180).pack(side='left', padx=4)
         warn = card(parent); warn.pack(fill='x', padx=5, pady=5)
@@ -33518,7 +33641,8 @@ class ReportsFrame(tk.Frame):
         title = f"{icon}  {report_type} — {today.strftime('%d.%m.%Y')} {'(ЗАКРИВАЮЧИЙ)' if is_z else '(ПРОМІЖНИЙ)'}"
 
         hdr = card(self.result); hdr.pack(fill='x', pady=5)
-        lbl(hdr, title, 16, True, title_color).pack(anchor='w', padx=15, pady=(12,4))
+        title_row = tk.Frame(hdr, bg=C['card']); title_row.pack(fill='x')   # заголовок + кнопки друку/Excel в одному рядку
+        lbl(title_row, title, 16, True, title_color).pack(side='left', padx=15, pady=(12,4))
         lbl(hdr, f"📅  {shift_info}", 12, color=C['yellow']).pack(anchor='w', padx=15, pady=(0,4))
         lbl(hdr, f"Сформовано: {__import__('datetime').datetime.now().strftime('%d.%m.%Y %H:%M:%S')}",
             11, color=C['text2']).pack(anchor='w', padx=15, pady=(0,10))
@@ -33878,15 +34002,25 @@ class ReportsFrame(tk.Frame):
             self._do_print_report_fn = _do_print_shift_table
             self._current_shift_detail_export_fn = _do_export_shift_table_excel
 
-            btns_row = tk.Frame(tbl_card, bg=C['card']); btns_row.pack(fill='x', padx=12, pady=(0,10))
-            btn(btns_row, "🖨 Друкувати цю зміну", _do_print_shift_table, C['card2'], 190).pack(side='left', padx=4)
-            btn(btns_row, "📊 Excel цієї зміни", _do_export_shift_table_excel, '#27ae60', 170).pack(side='left', padx=4)
+            # Кнопки — у рядку із заголовком «Z-звіт — … (ЗАКРИВАЮЧИЙ)», праворуч
+            btn(title_row, "📊 Excel цієї зміни", _do_export_shift_table_excel, '#27ae60', 170, height=34).pack(side='right', padx=(4, 14), pady=(8, 4))
+            btn(title_row, "🖨 Друкувати цю зміну", _do_print_shift_table, C['card2'], 190, height=34).pack(side='right', padx=4, pady=(8, 4))
 
+            # Таблиця без власної прокрутки: показуємо всі рядки, а гортає ОДНА головна смуга сторінки
+            try:
+                tv_sh.configure(height=max(len(tv_sh.get_children()), 1))
+                for _w in ff_sh.winfo_children():
+                    if isinstance(_w, ttk.Scrollbar): _w.grid_remove()
+                tv_sh.bind('<MouseWheel>', lambda e: (self._canvas.yview_scroll(int(-1*(e.delta/120)), 'units'), 'break')[1])
+            except Exception as _e_ns:
+                log_error("table no-inner-scroll", _e_ns)
             ff_sh.pack(fill='both', expand=True, padx=10, pady=(0,10))
 
             if allow_close and is_z:
-                self._render_close_shift_ui(self.result, cash_total, card_total, transfer_total,
-                                             grand_total, tx_count, today, shift_id)
+                # кнопка «Закрити зміну» — у верхній панелі сторінки
+                self._render_close_shift_ui(getattr(self, '_close_slot', self.result), cash_total, card_total,
+                                             transfer_total, grand_total, tx_count, today, shift_id,
+                                             compact=hasattr(self, '_close_slot'))
 
             return
 
